@@ -1051,11 +1051,11 @@ class DAGPhmm(object):
         sted.append(self.range_length)
         self.arrayRangeDict.append(sted)
         self.vnum = self.DAG.sequenceNum
-        vtuple = np.load(Viterbi_DAG_Path / 'v_id.npy').tolist()
-        self.all_source = {tu[1] for tu in vtuple}            
-        self.vlist = [tu[1] for tu in vtuple]               
-        self.v2id_dict = dict(vtuple)                         
-        self.id2v_dict = {value: key for key, value in self.v2id_dict.items()}            
+        self.vtuple = np.load(Viterbi_DAG_Path / 'v_id.npy').tolist()
+        self.all_source = {tu[1] for tu in self.vtuple}            
+        self.vlist = [tu[1] for tu in self.vtuple]               
+        self.v2id_dict = dict(self.vtuple)                         
+        self.id2v_dict = {value: key for key, value in self.vtuple}            
         self.pool_num = max(threads // 2, 1)                
         self.graphStartNodes = set()
         self.graphEndNodes = set()
@@ -1120,11 +1120,11 @@ class DAGPhmm(object):
         self.DAG.fragmentReduce()          
         self.DAG.queryGraph.calculateStateRange(ref_node_list)            
         self.vnum = self.DAG.sequenceNum          
-        vtuple = np.load(Viterbi_DAG_Path/'v_id.npy').tolist()
-        self.all_source = {tu[1] for tu in vtuple}              
-        self.vlist = [tu[1] for tu in vtuple]          
-        self.v2id_dict = dict(vtuple)              
-        self.id2v_dict = {value: key for key, value in self.v2id_dict.items()}              
+        self.vtuple = np.load(Viterbi_DAG_Path/'v_id.npy').tolist()
+        self.all_source = {tu[1] for tu in self.vtuple}              
+        self.vlist = [tu[1] for tu in self.vtuple]          
+        self.v2id_dict = dict(self.vtuple)              
+        self.id2v_dict = {value: key for key, value in self.vtuple}              
         self.pool_num = max(threads, 1)            
         self.DAG.totalNodes = self.DAG.totalNodes                      
         self.graphStartNodes = self.DAG.startNodeSet          
@@ -1556,9 +1556,10 @@ class DAGPhmm(object):
         doneList[:] = np.full(self.DAG.totalNodes, 1)                
         lock = Lock()         
         v_dict = {}
+        
         all_v = sorted(self.all_source, key=lambda x: (int(x.split("_")[0]), int(x.split("_")[-1])))
-        namelist = []            
-        namedict = {}              
+        namelist = []
+        namedict = {}
         v_num = len(all_v)
         for i in range(v_num):            
             gid = int(all_v[i].split('_')[0])
