@@ -1,4 +1,4 @@
-#Environment Configuration
+# Environment Configuration
 
 1.Create a new conda virtual environment with Python 3.9:
 
@@ -18,7 +18,7 @@ conda activate myenv
 pip install -r requirements.txt
 
 
-#DAPG-TPHMM
+# DAPG-TPHMM
 DAPG-TPHMM, which is for FTO-DAPG construction and DAPG-TPHMM model training and alignment on the obtained FTO-DAPG.
 
 DAPG-TPHMM usage:
