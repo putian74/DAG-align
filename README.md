@@ -1,45 +1,80 @@
 # Environment Configuration
 
-1.Create a new conda virtual environment with Python 3.9:
+## 1. Create a new conda virtual environment with Python 3.9
 
-<BASH>
+```bash
 conda create -n myenv python=3.9
+```
 
+## 2. Activate the environment
 
-2.Activate the environment:
-
-<BASH>
+```bash
 conda activate myenv
+```
 
+## 3. Install required dependencies
 
-3.Install required dependencies:
-
-<BASH>
+```bash
 pip install -r requirements.txt
-
+```
 
 # DAPG-TPHMM
-DAPG-TPHMM, which is for FTO-DAPG construction and DAPG-TPHMM model training and alignment on the obtained FTO-DAPG.
 
-DAPG-TPHMM usage:
-<BASH>
+DAPG-TPHMM is used for FTO-DAPG construction and model training/alignment on the obtained FTO-DAPG.
+
+## Usage
+
+```bash
 python3 DAPG_TPHMM/DAG_Ali.py [Fastapath] [outputpath] [fragment length] [threads]
+```
 
-Fastapath is a directory for a single FASTA format sequence file to be processed, which implied that user need to place all sequences into a single FASTA file.
-outputpath is a directory for saving the output specified by the user.
-fragment length is the length of sequence fragment utilized for FTO-DAPG construction, the recommended value is in the range of 32~128
-threads is the number of threads to be utilized by DAPG-TPHMM, 24 is recommended for parallel training of six different super parameter sets.
-The sum of pairs score and entropy for each of 6 MSA is saved in the outputpath/report.txt 
-Alignment results (FASTA format) are saved to "outputpath/bestAlign.fasta". The file size is larger than the initial FASTA sequence file due to gap insertions.
+### Parameters
 
-DAPG-TPHMM splits the input FASTA file into 1000-sequence subsets, and construct a basic FTO-DAPG for each of which. These FTO-DAPGs are subsequently merged into the full graph through iterative two-to-one merging operation. The DAPG-TPHMM training is carried out on the full graph and Viterbi performed on 4000-sequence subgraphs. Six sets of results from different super parameter combinations (described below) are saved in the outputpath/V_result/alizips/ directory. Each set includes graphs (for each sequence subsets, the full graph and intermediate ones ) and MSA for all sequences.
+| Parameter         | Description                                                  |
+| ----------------- | ------------------------------------------------------------ |
+| `Fastapath`       | Directory path of a single FASTA format sequence file (all sequences must be in one file) |
+| `outputpath`      | Directory path for saving output files                       |
+| `fragment length` | Length of sequence fragments for FTO-DAPG construction (recommended: 32~128) |
+| `threads`         | Number of threads (recommended: 24 for parallel training of 6 super parameter sets) |
 
-6 sets of super parameters are listed below (other parameter initialization is the same for all sets)
+### Output Results
+- **Scores**: Sum of pairs score and entropy for each of 6 MSAs are saved in `outputpath/report.txt`
+- **Alignments**: Alignment results (FASTA format) saved to `outputpath/bestAlign.fasta` (contains inserted gaps)
 
-parameter set		tr1	tr2	tr3	tr4	tr5	tr6
-global LW threshold	0.01	0.01	0.01	0.001	0.001	0.001
-Tail LW threshold	0.01	0.01	0.01	0.01	0.01	0.01
-Match Emission
-smoothing constant	exp(-3)	exp(-5)	exp(-7)	exp(-3)	exp(-5)	exp(-7)
+---
 
-Genome ID for the total genome dataset and SLSW/LLSW accuracy test sets are presented in the Data.zip. Unzip and see sequence_names.txt for genome ID of the total set, see S/LLSW_?_5000.txt for genome ID included in each S/LLSW set, with ? in the range [1,24].
+## Workflow
+1. **Graph Construction**:
+   - Splits input FASTA file into **1000-sequence subsets**
+   - Builds a basic FTO-DAPG for each subset
+   - Merges these FTO-DAPGs into a full graph through iterative two-to-one merging
+
+2. **Training & Alignment**:
+   - DAPG-TPHMM training is performed on the full graph
+   - Viterbi alignment is run on **4000-sequence subgraphs**
+   - 6 sets of results from different super parameter combinations are saved in `outputpath/V_result/alizips/`, including:
+     - Graphs for all sequence subsets (full graph + intermediates)
+     - MSA results for all sequences
+
+---
+
+## Super Parameter Sets
+| Parameter Set | Global LW Threshold | Tail LW Threshold | Match Emission Smoothing Constant |
+| ------------- | ------------------- | ----------------- | --------------------------------- |
+| tr1           | 0.01                | 0.01              | exp(-3)                           |
+| tr2           | 0.01                | 0.01              | exp(-5)                           |
+| tr3           | 0.01                | 0.01              | exp(-7)                           |
+| tr4           | 0.001               | 0.01              | exp(-3)                           |
+| tr5           | 0.001               | 0.01              | exp(-5)                           |
+| tr6           | 0.001               | 0.01              | exp(-7)                           |
+
+*Note: Other parameters are initialized identically across all sets.*
+
+---
+
+## Dataset Information
+- Genome IDs for the total genome dataset and SLSW/LLSW test sets are available in `Data.zip`
+- Files to check:
+  - Total dataset: `sequence_names.txt`
+  - S/LLSW test sets: `SLSW_?_5000.txt` or `LLSW_?_5000.txt` (where `?` ranges from 1 to 24)
+
