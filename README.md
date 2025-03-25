@@ -18,6 +18,11 @@ conda activate myenv
 pip install -r requirements.txt
 ```
 
+## 4. Unzip Application Files
+
+```bash
+unzip DAPG_TPHMM-main.zip -d .
+```
 # DAPG-TPHMM
 
 DAPG-TPHMM is used for FTO-DAPG construction and model training/alignment on the obtained FTO-DAPG.
