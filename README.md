@@ -35,7 +35,7 @@ python3 DAPG_TPHMM/DAG_Ali.py [Fastapath] [outputpath] [fragment length] [thread
 | `Fastapath`       | Directory path of a single FASTA format sequence file (all sequences must be in one file) |
 | `outputpath`      | Directory path for saving output files                       |
 | `fragment length` | Length of sequence fragments for FTO-DAPG construction (recommended: 32~128) |
-| `threads`         | Number of threads (recommended: 24 for parallel training of 6 super parameter sets) |
+| `threads`         | Number of threads (recommended: 36 for parallel training of 6 super parameter sets) |
 
 ### Output Results
 - **Scores**: Sum of pairs score and entropy for each of 6 MSAs are saved in `outputpath/report.txt`
