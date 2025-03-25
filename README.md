@@ -25,7 +25,7 @@ DAPG-TPHMM is used for FTO-DAPG construction and model training/alignment on the
 ## Usage
 
 ```bash
-python3 DAPG_TPHMM/DAG_Ali.py [Fastapath] [outputpath] [fragment length] [threads]
+python DAPG_TPHMM/DAG_Ali.py [Fastapath] [outputpath] [fragment length] [threads]
 ```
 
 ### Parameters
