@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import numpy as np
 import warnings
@@ -129,40 +130,7 @@ class DAGPhmm(object):
             np.append(beta_D[1:] + M2D_array[stateRangeStart:stateRangeEnd-1], -np.inf)          
         )
         return beta_D, beta_I, beta_M, nextBeta_M, nextBeta_I            
-    @jit(nopython=True)
-    def get_intersection(content_source, sourcelist, source_matrix, originalfragmentLength):
 
-        minthr = originalfragmentLength - 1                 
-        tuples_setA = set()
-        for x in content_source.T:                                      
-            tuples_setA.add((x[0], x[1]))               
-        tuples_setB = set()
-        size_now = 0          
-        for v in sourcelist:
-            col_size = v.shape[1]             
-            source_matrix[:, size_now:size_now+col_size] = v            
-            size_now += col_size            
-        sourcelist_T = source_matrix.T                    
-        overflow_mask = sourcelist_T[:, 1] > minthr            
-        sourcelist_T[overflow_mask, 1] -= np.uint64(1)              
-        for x in sourcelist_T:               
-            tuples_setB.add((x[0], x[1]))            
-        nct = tuples_setA & tuples_setB
-        if nct:              
-            return np.array(list(nct)).T                     
-        else:                
-            return np.empty((0, 1), dtype=np.uint64)                 
-    @jit(nopython=True)
-    def get_intersection_no_fork(sourcelist,source_matrix,originalfragmentLength):
-        originalfragmentLength-=1
-        size_now=0
-        for v in sourcelist:
-            size = v.shape[1]
-            source_matrix[:,size_now:size_now+size]=v
-            size_now+=size
-        condition = source_matrix[1,:] > originalfragmentLength
-        source_matrix[1,condition] -= np.uint64(1)
-        return source_matrix
     @jit(nopython=True)
     def update_state(laststate_local, range_length, nowstate, nowstateindex, delta_index_start, decrease_list):
 
@@ -221,7 +189,7 @@ class DAGPhmm(object):
                 linearPath = self.linearPath_list[index]             
                 node = linearPath[0]             
                 arrayRangeStart, arrayRangeEnd = self.arrayRangeDict[node]
-                baseID = self.allBaseDict[self.DAG.nodeList[node].fragment[-1]]
+                baseID = self.allBaseDict[self.DAG.fragments[node][-1]]
                 alpha_M, alpha_I, alpha_D = alpha_head_dict[baseID]
                 stateRangeStart, stateRangeEnd = self.stateRangeDict[2*node:2*node+2]
                 alpha_Matrix_M[arrayRangeStart:arrayRangeEnd-1] = alpha_M[stateRangeStart:stateRangeEnd]
@@ -269,7 +237,7 @@ class DAGPhmm(object):
             Match_num = self.Match_num
             for node in nodelist:
                 arrayRangeStart,arrayRangeEnd=self.arrayRangeDict[node]
-                baseID = self.allBaseDict[self.DAG.nodeList[node].fragment[-1]]
+                baseID = self.allBaseDict[self.DAG.fragments[node][-1]]
                 Me = self.Me_Matrix_degenerate_base[baseID]
                 Ie = self.Ie_Matrix_degenerate_base[baseID]
                 partennodes = self.DAG.queryGraph.findParentNodes(node)
@@ -380,7 +348,7 @@ class DAGPhmm(object):
         last_alpha_D_list = []
         for fnode in self.graphEndNodes:
             _arrayRangeStart, _arrayRangeEnd = self.arrayRangeDict[fnode]
-            weight = np.log(self.DAG.nodeList[fnode].weight/self.sequenceNum)
+            weight = np.log(self.DAG.weights[fnode]/self.sequenceNum)
             _stateRangeStart = self.stateRangeDict[2*fnode]
             _stateRangeEnd = self.stateRangeDict[2*fnode+1]
             temp_alpha_M = np.full(self.Match_num, -np.inf)
@@ -411,7 +379,7 @@ class DAGPhmm(object):
                 linearPath = self.linearPath_list[index]
                 node = linearPath.pop()               
                 arrayRangeStart,arrayRangeEnd=self.arrayRangeDict[node]
-                weight = np.log(self.DAG.nodeList[node].weight/self.sequenceNum)
+                weight = np.log(self.DAG.weights[node]/self.sequenceNum)
                 beta_M, beta_I, beta_D = beta_head
                 stateRangeStart, stateRangeEnd = self.stateRangeDict[2*node:2*node+2]
                 arrayLength = stateRangeEnd-stateRangeStart
@@ -478,7 +446,7 @@ class DAGPhmm(object):
                     _arrayRangeStart, _arrayRangeEnd = self.arrayRangeDict[fnode[1]]
                     weight = fnode[0]            
                     fathernode_leftlimit, fathernode_rightlimit = self.stateRangeDict[2*fnode[1]:2*fnode[1]+2]
-                    lo = self.allBaseDict[self.DAG.nodeList[fnode[1]].fragment]        
+                    lo = self.allBaseDict[self.DAG.fragments[fnode[1]]]        
                     nextBeta_M_List[i][fathernode_leftlimit:fathernode_rightlimit] = (
                         beta_Matrix_M[_arrayRangeStart:_arrayRangeEnd-1] + 
                         self.Me_Matrix_degenerate_base[lo][fathernode_leftlimit:fathernode_rightlimit] + 
@@ -592,7 +560,7 @@ class DAGPhmm(object):
             _arrayRangeStart, _arrayRangeEnd = self.arrayRangeDict[fnode]
             fathernode_leftlimit = self.stateRangeDict[2*fnode]
             fathernode_rightlimit = self.stateRangeDict[2*fnode+1]
-            lo = self.allBaseDict[self.DAG.nodeList[fnode].fragment]          
+            lo = self.allBaseDict[self.DAG.fragments[fnode]]          
             if fathernode_rightlimit > maxright:
                 maxright = fathernode_rightlimit
             nextBeta_M_List[i][fathernode_leftlimit:fathernode_rightlimit] = (
@@ -683,7 +651,7 @@ class DAGPhmm(object):
                 else:
                     stateRangeEnd = self.maxrange
                 arrayRangeStart,arrayRangeEnd = self.arrayRangeDict[node]
-                baseID = self.allBaseDict[self.DAG.nodeList[node].fragment]
+                baseID = self.allBaseDict[self.DAG.fragments[node]]
                 alpha_M = alpha_Matrix_M[arrayRangeStart:arrayRangeEnd-1]
                 alpha_I = alpha_Matrix_I[arrayRangeStart:arrayRangeEnd]
                 alpha_D = alpha_Matrix_D[arrayRangeStart:arrayRangeEnd-1]
@@ -714,7 +682,7 @@ class DAGPhmm(object):
                 stateRangeStart = self.stateRangeDict[2*node]
                 stateRangeEnd = self.stateRangeDict[2*node+1]
                 arrayRangeStart,arrayRangeEnd = self.arrayRangeDict[node]
-                baseID = self.allBaseDict[self.DAG.nodeList[node].fragment]
+                baseID = self.allBaseDict[self.DAG.fragments[node]]
                 alpha_M = alpha_Matrix_M[arrayRangeStart:arrayRangeEnd-1]
                 alpha_I = alpha_Matrix_I[arrayRangeStart:arrayRangeEnd]
                 alpha_D = alpha_Matrix_D[arrayRangeStart:arrayRangeEnd-1]
@@ -992,7 +960,7 @@ class DAGPhmm(object):
         parameterDict['insert_emission'] = self.Ie_Matrix
         np.save(self.train_DAG_Path/'ini/{}_pc_{}.npy'.format(self.parameterName,self.train_times),parameterDict)
     def init_train_data(self, Viterbi_DAG_Path, ref_node_list, ref_seq, modify_dict, kill_degenerate_base=True, windows_length=100, threads=3):
-        
+        st = datetime.now()
         self.windows_length = windows_length
         self.head_length = modify_dict['head_length']             
         self.tail_length = modify_dict['tail_length']             
@@ -1012,21 +980,25 @@ class DAGPhmm(object):
         self.trProbAdds_mend = modify_dict['trProbAdds_mend']            
         self.trProbAdds_mi_tail = modify_dict['trProbAdds_mi_tail']                
         self.DAG = load_DAG(Viterbi_DAG_Path)
-        for node in self.DAG.nodeList:
-            node.Source = set([node.id])
+        ed = datetime.now()
+        self.DAG.SourceList = [{nodeid} for nodeid in range(self.DAG.totalNodes)]
+
         new_ref_list = ['x'] * (len(ref_node_list)-1)
         ref_node_set = set(ref_node_list[1:])
-        for node in self.DAG.nodeList:
-            co_set = node.Source & ref_node_set
+        for nodeid in range(self.DAG.totalNodes):
+            co_set = self.DAG.SourceList[nodeid] & ref_node_set
             if co_set:
                 idx = ref_node_list[1:].index(co_set.pop())
-                new_ref_list[idx] = node.id              
+                new_ref_list[idx] = nodeid             
         ref_node_list = ['x'] * (len(ref_seq)-len(new_ref_list)) + new_ref_list
         self.DAG.fragmentReduce()
         range_List = self.DAG.queryGraph.calculateStateRange(ref_node_list)
         if kill_degenerate_base:
-            idmapping = self.DAG.removeDegenerateBasePaths()
-            idmapping = {value: key for key, value in idmapping.items()}
+            try:
+                idmapping = self.DAG.removeDegenerateBasePaths()
+                idmapping = {value: key for key, value in idmapping.items()}
+            except:
+                idmapping = {i: i for i in range(self.DAG.totalNodes)}
         else:
             idmapping = {i: i for i in range(self.DAG.totalNodes)}
         self.maxrange = 0                          
@@ -1051,19 +1023,20 @@ class DAGPhmm(object):
         sted.append(self.range_length)
         self.arrayRangeDict.append(sted)
         self.vnum = self.DAG.sequenceNum
-        self.vtuple = np.load(Viterbi_DAG_Path / 'v_id.npy').tolist()
-        self.all_source = {tu[1] for tu in self.vtuple}            
-        self.vlist = [tu[1] for tu in self.vtuple]               
-        self.v2id_dict = dict(self.vtuple)                         
-        self.id2v_dict = {value: key for key, value in self.vtuple}            
+        vtuple = np.load(Viterbi_DAG_Path / 'v_id.npy').tolist()
+        self.all_source = {tu[1] for tu in vtuple}            
+        self.vlist = [tu[1] for tu in vtuple]               
+        self.v2id_dict = dict(vtuple)                         
+        self.id2v_dict = {value: key for key, value in vtuple}          
         self.pool_num = max(threads // 2, 1)                
         self.graphStartNodes = set()
         self.graphEndNodes = set()
-        for node in self.DAG.nodeList:
-            if self.DAG.queryGraph.findParentNodes(node.id) == []:
-                self.graphStartNodes.add(node.id)
-            if self.DAG.queryGraph.findChildNodes(node.id) == []:
-                self.graphEndNodes.add(node.id)
+        for nodeid in range(self.DAG.totalNodes):
+            if self.DAG.queryGraph.findParentNodes(nodeid) == []:
+                self.graphStartNodes.add(nodeid)
+            if self.DAG.queryGraph.findChildNodes(nodeid) == []:
+                self.graphEndNodes.add(nodeid)
+        ed = datetime.now()
         self.DAG.startNodeSet = self.graphStartNodes
         self.DAG.endNodeSet = self.graphEndNodes
         self.linearPath_list, self.linearPath_link, nodeID_linearPathID_Dict = build_coarse_grained_graph(
@@ -1071,9 +1044,103 @@ class DAGPhmm(object):
         self.DAG.CG_DAG = DAGStru(len(self.linearPath_list), self.linearPath_link)
         self.DAG.CG_DAG.calculateCoordinates()            
         self.sequenceNum = self.DAG.sequenceNum
-    def fit(self, Viterbi_DAG_Path, ref_node_list, ref_seq, modify_dict, kill_degenerate_base=True, windows_length=100, threads=3):
+        ed = datetime.now()
 
-        self.init_train_data(Viterbi_DAG_Path, ref_node_list, ref_seq, modify_dict, kill_degenerate_base, windows_length, threads)
+    def init_train_data_with_DAG(self, Viterbi_DAG_Path, ref_node_list, ref_seq, modify_dict,DAG, kill_degenerate_base=True, windows_length=100, threads=3):
+        st = datetime.now()
+        self.windows_length = windows_length
+        self.head_length = modify_dict['head_length']             
+        self.tail_length = modify_dict['tail_length']             
+        self.emProbAdds_Match = modify_dict['emProbAdds_Match']                    
+        self.emProbAdds_Match_head = modify_dict['emProbAdds_Match_head']              
+        self.emProbAdds_Match_tail = modify_dict['emProbAdds_Match_tail']              
+        self.trProbAdds_mm = modify_dict['trProbAdds_mm']               
+        self.trProbAdds_md = modify_dict['trProbAdds_md']                
+        self.trProbAdds_mi = modify_dict['trProbAdds_mi']               
+        self.trProbAdds_PiM = modify_dict['trProbAdds_PiM']               
+        self.trProbAdds_PiI = modify_dict['trProbAdds_PiI']               
+        self.trProbAdds_PiD = modify_dict['trProbAdds_PiD']               
+        self.trProbAdds_im = modify_dict['trProbAdds_im']               
+        self.trProbAdds_ii = modify_dict['trProbAdds_ii']               
+        self.trProbAdds_iend = modify_dict['trProbAdds_iend']           
+        self.trProbAdds_ii_tail = modify_dict['trProbAdds_ii_tail']                
+        self.trProbAdds_mend = modify_dict['trProbAdds_mend']            
+        self.trProbAdds_mi_tail = modify_dict['trProbAdds_mi_tail']
+
+        self.DAG = DAG
+        ed = datetime.now()
+        
+
+        ref_node_list = ['x']*(len(ref_seq)-len(ref_node_list)) + ref_node_list
+        new_ref_list = ['x'] * (len(ref_node_list))
+        ref_node_set = set(ref_node_list[1:])                 
+        for nodeid in range(self.DAG.totalNodes):
+            co_set = set([nodeid]) & ref_node_set                 
+            if co_set:
+                idx = ref_node_list[1:].index(co_set.pop())
+                
+                new_ref_list[idx-int(self.DAG.offsetArray[nodeid])] = nodeid
+        ref_node_list = new_ref_list
+        
+        range_List = self.DAG.queryGraph.calculateStateRange(ref_node_list)
+
+        if kill_degenerate_base:
+            try:
+                idmapping = self.DAG.removeDegenerateBasePaths()
+                idmapping = {value: key for key, value in idmapping.items()}
+            except:
+                idmapping = {i: i for i in range(self.DAG.totalNodes)}
+        else:
+            idmapping = {i: i for i in range(self.DAG.totalNodes)}
+
+        self.maxrange = 0                          
+        self.stateRangeDict = []                              
+        self.range_length = 0                   
+        self.arrayRangeDict = []                    
+        for index in range(self.DAG.totalNodes):
+            node = idmapping[index]
+
+            start = max(0, range_List[node][0] - self.windows_length)
+            end = min(len(ref_node_list), range_List[node][1] + self.windows_length)
+            self.stateRangeDict.extend([start, end])
+            sted = [self.range_length]
+            self.range_length += (end - start + 1)
+            sted.append(self.range_length)
+            self.arrayRangeDict.append(sted)
+            if (end - start + 1) > self.maxrange:
+                self.maxrange = end - start + 1
+        self.maxrange = min(self.Match_num,self.maxrange)
+        sted = [self.range_length]
+        self.range_length += (self.maxrange + 1)
+        sted.append(self.range_length)
+        self.arrayRangeDict.append(sted)
+        self.vnum = self.DAG.sequenceNum
+        vtuple = np.load(Viterbi_DAG_Path / 'v_id.npy').tolist()
+        self.all_source = {tu[1] for tu in vtuple}            
+        self.vlist = [tu[1] for tu in vtuple]               
+        self.v2id_dict = dict(vtuple)                         
+        self.id2v_dict = {value: key for key, value in vtuple}          
+        self.pool_num = max(threads // 2, 1)                
+        self.graphStartNodes = set()
+        self.graphEndNodes = set()
+        for nodeid in range(self.DAG.totalNodes):
+            if self.DAG.queryGraph.findParentNodes(nodeid) == []:
+                self.graphStartNodes.add(nodeid)
+            if self.DAG.queryGraph.findChildNodes(nodeid) == []:
+                self.graphEndNodes.add(nodeid)
+        ed = datetime.now()
+        self.DAG.startNodeSet = self.graphStartNodes
+        self.DAG.endNodeSet = self.graphEndNodes
+        self.linearPath_list, self.linearPath_link, nodeID_linearPathID_Dict = build_coarse_grained_graph(
+            self.DAG.queryGraph, self.DAG.edgeWeightDict)
+        self.DAG.CG_DAG = DAGStru(len(self.linearPath_list), self.linearPath_link)
+        self.DAG.CG_DAG.calculateCoordinates()            
+        self.sequenceNum = self.DAG.sequenceNum
+        ed = datetime.now()
+
+    def fit(self):
+
+        # self.init_train_data(Viterbi_DAG_Path, ref_node_list, ref_seq, modify_dict, kill_degenerate_base, windows_length, threads)
         oriprob = -np.inf  
         shared_array_alphaM = Array('d', self.range_length)               
         alpha_Matrix_M = np.frombuffer(shared_array_alphaM.get_obj(), dtype=np.float64).reshape(self.range_length)
@@ -1098,8 +1165,7 @@ class DAGPhmm(object):
             prob = self.estep(alpha_Matrix_M, alpha_Matrix_I, alpha_Matrix_D,
                             beta_Matrix_M, beta_Matrix_D, beta_Matrix_I,
                             left_beta_Matrix_M, left_beta_Matrix_I)
-            if prob > -0.5 or (prob - oriprob) < 1:
-                break
+
             self.mstep()  
             break
             oriprob = prob  
@@ -1108,23 +1174,92 @@ class DAGPhmm(object):
         self.Viterbi_result_path = Viterbi_result_path
         self.windows_length = windows_length
         self.Viterbi_DAG_Path = Viterbi_DAG_Path
+
         self.DAG = load_DAG(Viterbi_DAG_Path, load_onmfile=True)
+        self.DAG.fragmentReduce()
+        self.linearPath_list, self.linearPath_link, nodeID_linearPathID_Dict = build_coarse_grained_graph(
+            self.DAG.queryGraph, self.DAG.edgeWeightDict)
+        self.DAG.CG_DAG = DAGStru(len(self.linearPath_list), self.linearPath_link)
+        self.DAG.CG_DAG.calculateCoordinates() 
+
         new_ref_list = ['x'] * (len(ref_node_list)-1)
         ref_node_set = set(ref_node_list[1:])                 
-        for node in self.DAG.nodeList:
-            co_set = set([node.id]) & ref_node_set                 
+        for nodeid in range(self.DAG.totalNodes):
+            co_set = set([nodeid]) & ref_node_set                 
             if co_set:
                 idx = ref_node_list[1:].index(co_set.pop())                
-                new_ref_list[idx] = node.id                
+                new_ref_list[idx-int(self.DAG.offsetArray[nodeid])] = nodeid                
         ref_node_list = ['x']*(len(ref_seq)-len(new_ref_list)) + new_ref_list
-        self.DAG.fragmentReduce()          
+                  
         self.DAG.queryGraph.calculateStateRange(ref_node_list)            
         self.vnum = self.DAG.sequenceNum          
-        self.vtuple = np.load(Viterbi_DAG_Path/'v_id.npy').tolist()
-        self.all_source = {tu[1] for tu in self.vtuple}              
-        self.vlist = [tu[1] for tu in self.vtuple]          
-        self.v2id_dict = dict(self.vtuple)              
-        self.id2v_dict = {value: key for key, value in self.vtuple}              
+        vtuple = np.load(Viterbi_DAG_Path/'v_id.npy').tolist()
+        self.all_source = {tu[1] for tu in vtuple}              
+        self.vlist = [tu[1] for tu in vtuple]          
+        self.v2id_dict = dict(vtuple)              
+        self.id2v_dict = {value: key for key, value in vtuple}              
+        self.pool_num = max(threads, 1)            
+        self.DAG.totalNodes = self.DAG.totalNodes                      
+        self.graphStartNodes = self.DAG.startNodeSet          
+        self.graphEndNodes = self.DAG.endNodeSet          
+        self.sequenceNum = self.DAG.sequenceNum            
+        self.maxrange = 0            
+        self.stateRangeDict = []                                     
+        self.range_length = 0                      
+        self.arrayRangeDict = []                  
+        for node in range(self.DAG.totalNodes):
+            min_pos = self.DAG.queryGraph.ref_coor[node][0] - self.windows_length
+            max_pos = self.DAG.queryGraph.ref_coor[node][1] + self.windows_length
+            self.stateRangeDict.extend([
+                max(0, min_pos), 
+                min(len(ref_node_list), max_pos)
+            ])
+            sted = [self.range_length]
+            self.range_length += (self.stateRangeDict[-1] - self.stateRangeDict[-2] + 1)
+            sted.append(self.range_length)
+            self.arrayRangeDict.append(sted)
+            current_range = self.stateRangeDict[-1] - self.stateRangeDict[-2]
+            if current_range > self.maxrange:
+                self.maxrange = current_range
+
+        self.maxrange = min(self.Match_num,self.maxrange)
+        sted = [self.range_length]
+        self.range_length += self.maxrange      
+        sted.append(self.range_length)
+        self.arrayRangeDict.append(sted)
+        if polyA == True:
+            self.M2I_array[-1] = np.log(0.1)                      
+            self.M2E = np.log(0.9)                            
+                      
+        self.ref_seq = ref_seq
+
+    def init_viterbi_data_withDAG(self, Viterbi_DAG_Path, Viterbi_result_path, ref_node_list, ref_seq,DAG,coarseDAGinfo,coarseDAG, polyA=False, windows_length=100, threads=3):
+
+        self.Viterbi_result_path = Viterbi_result_path
+        self.windows_length = windows_length
+        self.Viterbi_DAG_Path = Viterbi_DAG_Path
+        
+        self.DAG = DAG
+        self.linearPath_list, self.linearPath_link = coarseDAGinfo
+        self.DAG.CG_DAG = coarseDAG
+
+        ref_node_list = ['x']*(len(ref_seq)-len(ref_node_list)) + ref_node_list
+        new_ref_list = ['x'] * (len(ref_node_list))
+        ref_node_set = set(ref_node_list[1:])                 
+        for nodeid in range(self.DAG.totalNodes):
+            co_set = set([nodeid]) & ref_node_set                 
+            if co_set:
+                idx = ref_node_list[1:].index(co_set.pop())                
+                new_ref_list[idx-int(self.DAG.offsetArray[nodeid])] = nodeid
+        ref_node_list = new_ref_list
+                  
+        self.DAG.queryGraph.calculateStateRange(ref_node_list)            
+        self.vnum = self.DAG.sequenceNum          
+        vtuple = np.load(Viterbi_DAG_Path/'v_id.npy').tolist()
+        self.all_source = {tu[1] for tu in vtuple}              
+        self.vlist = [tu[1] for tu in vtuple]          
+        self.v2id_dict = dict(vtuple)              
+        self.id2v_dict = {value: key for key, value in vtuple}              
         self.pool_num = max(threads, 1)            
         self.DAG.totalNodes = self.DAG.totalNodes                      
         self.graphStartNodes = self.DAG.startNodeSet          
@@ -1158,12 +1293,10 @@ class DAGPhmm(object):
         if polyA == True:
             self.M2I_array[-1] = np.log(0.1)                      
             self.M2E = np.log(0.9)                            
-        self.linearPath_list, self.linearPath_link, nodeID_linearPathID_Dict = build_coarse_grained_graph(
-            self.DAG.queryGraph, self.DAG.edgeWeightDict)
-        self.DAG.CG_DAG = DAGStru(len(self.linearPath_list), self.linearPath_link)
-        self.DAG.CG_DAG.calculateCoordinates()               
+                      
         self.ref_seq = ref_seq
-    def Viterbi(self,seqiddb):
+
+    def Viterbi(self,seqiddb,threads=3):
 
         def write_hiddensates_head(indexlist):
 
@@ -1258,6 +1391,7 @@ class DAGPhmm(object):
                         for childernnode in children_nodes:
                             tmp_hiddenstates_dict[childernnode] = hidden_states[childernnode]
                         content_source = query_contend_sequence_id(node)
+                        content_source-=self.DAG.offsetArray[node]
                         new_tmp_state_dict = {}
                         for state in tmp_state_dict.keys():
                             sourcelist = []
@@ -1268,22 +1402,31 @@ class DAGPhmm(object):
                                 if isinstance(tmp_hiddenstates_dict[fn][fstate][0],str):
                                     source = query_contend_sequence_id(fn)
                                     if source.size!=0:
+                                        source-=1
                                         sourcelist.append(source)
-                                        allsize+=source.shape[1]
+                                        allsize+=source.shape[0]
                                 else:
-                                    sourcelist.append(tmp_hiddenstates_dict[fn][fstate][0])
-                                    allsize+=tmp_hiddenstates_dict[fn][fstate][0].shape[1]
-                            source_matrix = np.full((2,allsize),0,dtype=np.uint64)
+                                    source = tmp_hiddenstates_dict[fn][fstate][0]
+                                    source-=1
+                                    sourcelist.append(source)
+                                    allsize+=source.shape[0]
+                            source_matrix = np.full((allsize,),0,dtype=np.uint64)
+                            size_now = 0
+                            for v in sourcelist:
+                                col_size = v.shape[0]             
+                                source_matrix[size_now:size_now+col_size] = v            
+                                size_now += col_size
                             if sourcelist:
-                                nct = DAGPhmm.get_intersection(content_source,sourcelist,source_matrix,self.DAG.originalfragmentLength)
+                                # nct = DAGPhmm.get_intersection(content_source,source_matrix)
+                                nct = np.intersect1d(content_source, source_matrix)
                                 if nct.size!=0:
                                     if state[0]==2:
-                                        new_tmp_state_dict[state] = [nct.copy(order='C'),max(tmp_state_dict[state][1])]
+                                        new_tmp_state_dict[state] = [nct,max(tmp_state_dict[state][1])]
                                         lock.acquire()
                                         ali[state[1]] = max([new_tmp_state_dict[state][1],ali[state[1]]])
                                         lock.release()
                                     else:
-                                        new_tmp_state_dict[state] = [nct.copy(order='C'),0]
+                                        new_tmp_state_dict[state] = [nct,0]
                     else:
                         tmp_hiddenstates_dict={}
                         for childernnode in children_nodes:
@@ -1295,17 +1438,24 @@ class DAGPhmm(object):
                             for f in tmp_state_dict[state][0]:
                                 fn = f[0]
                                 fstate=f[1]
-                                sourcelist.append(tmp_hiddenstates_dict[fn][fstate][0])
-                                allsize+=tmp_hiddenstates_dict[fn][fstate][0].shape[1]
-                            source_matrix = np.full((2,allsize),0,dtype=np.uint64)
-                            nct = DAGPhmm.get_intersection_no_fork(sourcelist,source_matrix,self.DAG.originalfragmentLength)
+                                source = tmp_hiddenstates_dict[fn][fstate][0]
+                                source-=1
+                                sourcelist.append(source)
+                                allsize+=source.shape[0]
+                            source_matrix = np.full((allsize,),0,dtype=np.uint64)
+                            size_now = 0
+                            for v in sourcelist:
+                                col_size = v.shape[0]             
+                                source_matrix[size_now:size_now+col_size] = v            
+                                size_now += col_size
+                            # nct = DAGPhmm.get_intersection_no_fork(sourcelist,source_matrix,self.DAG.originalfragmentLength)
                             if state[0]==2:
-                                new_tmp_state_dict[state] = [nct,max(tmp_state_dict[state][1])]
+                                new_tmp_state_dict[state] = [source_matrix,max(tmp_state_dict[state][1])]
                                 lock.acquire()
                                 ali[state[1]] = max([new_tmp_state_dict[state][1],ali[state[1]]])
                                 lock.release()
                             else:
-                                new_tmp_state_dict[state] = [nct,0]
+                                new_tmp_state_dict[state] = [source_matrix,0]
                     if len(new_tmp_state_dict) == 1:
                         state = next(iter(new_tmp_state_dict))
                         new_tmp_state_dict[state] = ('', new_tmp_state_dict[state][1])
@@ -1346,7 +1496,7 @@ class DAGPhmm(object):
                 linearPath = self.linearPath_list[index]
                 node = linearPath[0]
                 arrayRangeStart,arrayRangeEnd = self.arrayRangeDict[node]
-                baseID = self.allBaseDict.get(self.DAG.nodeList[node].fragment[-1],14)
+                baseID = self.allBaseDict.get(self.DAG.fragments[node][-1],14)
                 values = delta_head_dict[baseID]
                 stateRangeStart=self.stateRangeDict[2*node]
                 stateRangeEnd=self.stateRangeDict[2*node+1]
@@ -1378,7 +1528,7 @@ class DAGPhmm(object):
             M2M_array = self.M2M_array
             for node in nodes:
                 arrayRangeStart,arrayRangeEnd = self.arrayRangeDict[node]
-                baseID = self.allBaseDict.get(self.DAG.nodeList[node].fragment[-1],14)
+                baseID = self.allBaseDict.get(self.DAG.fragments[node][-1],14)
                 partennodes = self.DAG.queryGraph.findParentNodes(node)
                 parentNodeWeightList=[]
                 alist = [self.DAG.edgeWeightDict[(lnode,node)] for lnode in partennodes]
@@ -1511,7 +1661,8 @@ class DAGPhmm(object):
                     goon_flag.value=0
                     break
         def query_contend_sequence_id(node):
-            return seqiddb.findSequenceSource(self.DAG.nodeList[node].Source,self.DAG.firstBitofONM,self.DAG.allBitofONM,self.DAG.firstBitofOSM,self.DAG.allBitofOSM)
+            return seqiddb.findSequenceSource(self.DAG.SourceList[node],self.DAG.firstBitofONM,self.DAG.allBitofONM,self.DAG.firstBitofOSM,self.DAG.allBitofOSM)
+        
         tmp_delta_M_mem = np.full(self.range_length, -np.inf)
         delta_M_mem_shm = shared_memory.SharedMemory(create=True, size=self.range_length*np.dtype(np.float64).itemsize)
         delta_M_mem = np.ndarray(self.range_length, dtype=np.float64, buffer=delta_M_mem_shm.buf)
@@ -1556,15 +1707,14 @@ class DAGPhmm(object):
         doneList[:] = np.full(self.DAG.totalNodes, 1)                
         lock = Lock()         
         v_dict = {}
-        
         all_v = sorted(self.all_source, key=lambda x: (int(x.split("_")[0]), int(x.split("_")[-1])))
-        namelist = []
-        namedict = {}
+        namelist = []            
+        namedict = {}              
         v_num = len(all_v)
         for i in range(v_num):            
             gid = int(all_v[i].split('_')[0])
             seqid = int(all_v[i].split('_')[1])
-            v_dict[save_numbers(gid, seqid, 32, 64)] = i  
+            v_dict[save_numbers(gid, seqid, 16, 32)] = i  
             namedict[i] = self.id2v_dict[all_v[i]]        
             namelist.append(self.id2v_dict[all_v[i]])          
         ali = Manager().dict()                    
@@ -1576,13 +1726,9 @@ class DAGPhmm(object):
         endnodes = []
         for node in self.graphEndNodes:
             endnodes.append(node)              
-        v_num = len(all_v)
-        for i in range(v_num):
-            gid = int(all_v[i].split('_')[0])
-            seqid = int(all_v[i].split('_')[1])
-            v_dict[save_numbers(gid, seqid, 32, 64)] = i
+        
         processlist = []
-        pool_num = self.pool_num                  
+        pool_num = threads                 
         for idx in range(pool_num):
             processlist.append(Process(
                 target=calculate_delta,
@@ -1636,7 +1782,7 @@ class DAGPhmm(object):
 
         def query_contend_sequence_id(node):
             return seqiddb.findSequenceSource(
-                self.DAG.nodeList[node].Source,
+                self.DAG.SourceList[node],
                 self.DAG.firstBitofONM,
                 self.DAG.allBitofONM,
                 self.DAG.firstBitofOSM,
@@ -1648,7 +1794,7 @@ class DAGPhmm(object):
             loacal_ali = ali.copy()
             spnode_statedict = {}
             for node in nodelist:
-                aa = self.DAG.nodeList[node].fragment
+                aa = self.DAG.fragments[node]
                 node_hidden_states = hidden_states[node]
                 for state in node_hidden_states.keys():
                     if state[0] == 2:
@@ -1664,8 +1810,10 @@ class DAGPhmm(object):
                         contentsource = query_contend_sequence_id(node)
                     else:
                         contentsource = node_hidden_states[state][0]
+
                     if contentsource.size != 0:
-                        content = vectorized_v_dict(contentsource[0])
+
+                        content = vectorized_v_dict(get_first_number(contentsource))
                         lock.acquire()
                         ali_matrix[sx, content] = self.allBaseDict.get(aa, 14) + 1
                         lock.release()
@@ -1677,7 +1825,7 @@ class DAGPhmm(object):
         for i in range(v_num):
             gid = int(all_v[i].split('_')[0])
             seqid = int(all_v[i].split('_')[1])
-            v_dict[save_numbers(gid, seqid, 32, 64)] = i            
+            v_dict[save_numbers(gid, seqid, 16, 32)] = i            
         lock = Lock()         
         sdict = {0:'A', 1:'T', 2:'C', 3:'G'}           
         seqdict = {'x': [], 'ref': []}            

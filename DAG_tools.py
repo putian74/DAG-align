@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import numpy as np
 import re
@@ -117,7 +118,6 @@ def remove_points_to_increase(lst, weights):
         cp_rg.append(lst[i])
     return cp_rg
 def Cyclic_Anchor_Combination_Detection(Block_list, Block_dif, Block_weight):
-
     cp_rg = []
     fixflag = 0
     block_num = len(Block_dif)                  
@@ -353,7 +353,8 @@ def sp_entro_zip_loaded(zip_ali,positive,negative):
         negative_score += n_score
         positive_score += p_score
         all_entropy += entropy
-    return positive_score,negative_score,all_entropy
+    scaled_sp  = 2*(positive_score+negative_score)/(sumnum*(sumnum-1)*length)
+    return scaled_sp,all_entropy
 def sp_entro_zip(inpath,positive,negative):
     Binpath = inpath
     zipaliandnamelist = np.load(Binpath,mmap_mode='r',allow_pickle=True)
@@ -369,7 +370,8 @@ def sp_entro_zip(inpath,positive,negative):
         negative_score += n_score
         positive_score += p_score
         all_entropy += entropy
-    return positive_score,negative_score,all_entropy
+    scaled_sp  = 2*(positive_score+negative_score)/(sumnum*(sumnum-1)*length)
+    return scaled_sp,all_entropy
 def save_fasta(gp_path,pc_name,save_path):
     print(save_path+'result.fastaa')
     draw_dict = {0:'-',1: 'A', 2: 'T', 3: 'C', 4: 'G', 5: 'R', 6: 'Y', 7: 'M', 8: 'K', 9: 'S', 10: 'W', 11: 'H', 12: 'B', 13: 'V', 14: 'D', 15: 'N'}
@@ -402,3 +404,80 @@ def save_fasta_with_ref(gp_path,pc_name,save_path):
     namelist.insert(0,'ref')
     seqlist = [SeqRecord(Seq(''.join(i)),id=namelist[idx],description='') for idx,i in tqdm(zip(xs,string_matrix))]
     SeqIO.write(seqlist,save_path,'fasta')
+
+
+def find_max_weight_combination(nested_list):
+
+    n = len(nested_list)
+    if n == 0:
+        return (-1, [], [])
+
+    dp = {i: [] for i in range(n)}
+    
+    for i in range(n):
+        if not nested_list[i]:
+            continue
+        candidates = []
+        max_local = max(item[2] for item in nested_list[i]) if nested_list[i] else -1
+        for item in nested_list[i]:
+            if item[2] == max_local:
+                candidates.append((item[2], item[1], -1, item))
+        if candidates:
+            best = max(candidates, key=lambda x: (x[0], x[1]))
+            dp[i].append(best)
+
+    for i in range(n):
+        if not dp.get(i):
+            continue
+        for j in range(i):
+            if not dp.get(j):
+                continue
+            for state_j in dp[j]:
+                weight_j, last_coord_j, _, elem_j = state_j
+                for item in nested_list[i]:
+                    item_id, item_coord, item_weight = item
+                    if item_coord > last_coord_j:
+                        new_weight = weight_j + item_weight
+                        existing = [s for s in dp[i] if s[0] >= new_weight and s[1] >= item_coord]
+                        if not existing:
+                            dp[i].append((new_weight, item_coord, j, item))
+        if dp[i]:
+            dp[i].sort(key=lambda x: (-x[0], -x[1]))
+            filtered = []
+            max_weight = dp[i][0][0]
+            max_coord = dp[i][0][1]
+            for s in dp[i]:
+                if s[0] == max_weight and s[1] <= max_coord:
+                    continue
+                if s[0] < max_weight and s[1] <= max_coord:
+                    continue
+                filtered.append(s)
+                if s[0] > max_weight:
+                    max_weight = s[0]
+                    max_coord = s[1]
+                elif s[0] == max_weight and s[1] > max_coord:
+                    max_coord = s[1]
+            dp[i] = filtered
+
+    max_weight = -1
+    best_path = []
+    for i in range(n):
+        for state in dp.get(i, []):
+            if state[0] > max_weight or (state[0] == max_weight and state[1] > best_path[-1][1] if best_path else False):
+                max_weight = state[0]
+                path = []
+                current = state
+                while current is not None:
+                    path.append((i if current[2] == -1 else current[2], current[3]))
+                    prev_idx = current[2]
+                    current = dp[prev_idx][0] if prev_idx != -1 and dp[prev_idx] else None
+                best_path = list(reversed(path))
+
+    result_ids = [-1] * n
+    result_coords = [-1] * n
+    for entry in best_path:
+        sub_idx, item = entry
+        result_ids[sub_idx] = item[0]
+        result_coords[sub_idx] = item[1]
+
+    return (max_weight if max_weight != -1 else -1, result_ids, result_coords)

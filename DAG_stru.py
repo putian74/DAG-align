@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import numpy as np
 from typing import Union, Dict, Set, KeysView, List
@@ -229,6 +230,76 @@ class DAGStru:
         self.maxlength = maxindex  
         mainend = indexdict[maxindex]
         self.longestPathNodeSet,_ = self.BFS_DAG(mainend, forward=False,filter=self.isConsecutive)
+    def find_max_weight_path(self):
+        max_weight = [float('-inf')] * self.totalNodes
+        max_path = {i: [] for i in range(self.totalNodes)}
+
+        degreeList = np.full(self.totalNodes, 0)
+        for _, link_target in self.currentEdgeSet:
+            degreeList[link_target] += 1
+        self.startNodeSet = set(np.where(degreeList == 0)[0])
+
+        for node in self.startNodeSet:
+            max_weight[node] = 0
+
+        def topological_sort():
+
+            in_degree = degreeList[:] 
+            stack = list(self.startNodeSet)  
+            topo_order = []  
+            
+            while stack:
+                node = stack.pop()
+                topo_order.append(node)
+                idx = self.forwardNodeList[node]
+                while idx != -1:
+                    neighbor = self.forwardEdgeList[idx][0]
+                    in_degree[neighbor] -= 1 
+                    if in_degree[neighbor] == 0:
+                        stack.append(neighbor)
+                    idx = self.forwardEdgeList[idx][1]
+            return topo_order
+
+        topo_order = topological_sort()
+
+        for node in topo_order:
+            idx = self.forwardNodeList[node]
+            while idx != -1:
+                neighbor, _, weight = self.forwardEdgeList[idx]
+                if max_weight[node] + weight > max_weight[neighbor]:
+                    max_weight[neighbor] = max_weight[node] + weight
+                    max_path[neighbor] = max_path[node].copy() + [node]
+                idx = self.forwardEdgeList[idx][1]
+
+        max_weight_value = max(max_weight)
+        max_node = max_weight.index(max_weight_value)
+        max_path_result = max_path[max_node] + [max_node]
+
+        return max_weight_value, max_path_result
+
+    def split_island(self):
+        islandID = np.full(self.totalNodes, 0)
+        idx = 1 
+        for stnode in self.startNodeSet:
+            sonnodes, andset = self.BFS_DAG([stnode], tagList=islandID)
+            sonnodes = np.array(list(sonnodes))  
+
+            andset -= {-1}
+
+            if len(andset) == 1:  
+                to_idx = andset.pop()
+                islandID[sonnodes] = to_idx 
+            elif len(andset) > 1:  
+                to_idx = min(andset)  
+                islandID[sonnodes] = to_idx 
+                andset -= {to_idx}
+                for i in andset:
+                    islandID[islandID == i] = to_idx
+            else:
+                islandID[sonnodes] = idx
+                idx += 1 
+                
+        return islandID
     def nonCyclic(self, nodes: list) -> bool:
 
         coors = [self.coordinateList[node] for node in nodes]
