@@ -56,12 +56,13 @@ def add_noise_and_normalize_matrix(log_probs_matrix: np.ndarray,noise_low: float
 
 def ini_paras(Ref_seq, emProbMatrix,insertRanges, ME, MD, MI, II, DM, pi_MID, outpath, parasName,perturbation=(0,0)):
 
-    assert np.exp(MD) + np.exp(MI) < 1.0 - 1e-6, 
-    assert np.exp(II) < 1.0 - 1e-6, 
-    assert np.exp(DM) < 1.0 - 1e-6, 
-    assert emProbMatrix.shape[0] == 4, 
-    assert emProbMatrix.shape[1] == len(Ref_seq), 
-    assert np.sum(pi_MID) > 1e-6, 
+    assert np.exp(MD) + np.exp(MI) < 1.0 - 1e-6, "MD+MI概率超过有效范围"
+    assert np.exp(II) < 1.0 - 1e-6, "II概率无效"
+    assert np.exp(DM) < 1.0 - 1e-6, "DM概率无效"
+    assert emProbMatrix.shape[0] == 4, "发射概率矩阵维度错误"
+    assert emProbMatrix.shape[1] == len(Ref_seq), "发射概率长度与参考序列不匹配"
+    
+    assert np.sum(pi_MID) > 1e-6, "初始概率和不能为0"
     
     n_positions = len(Ref_seq) + 1 
     pi_sum = np.sum(pi_MID)
