@@ -13,15 +13,6 @@ from queue import Empty
 import copy
 import argparse
 def add_noise_and_normalize(*log_probs, noise_low=0, noise_high=0):
-    """
-    对多个对数概率向量添加噪声并归一化，支持任意数量（≥1）的向量
-    Args:
-        *log_probs: 多个形状为 (N,) 的对数概率向量（至少传入一个）
-        noise_low, noise_high: 噪声取值范围，默认 [-0.1, 0.1]
-    Returns:
-        tuple: 和输入数量相同的归一化后的对数概率向量
-    """
-    # 检查输入是否非空且形状一致
     if len(log_probs) == 0:
         raise ValueError("At least one vector must be provided")
     shapes = [p.shape for p in log_probs]
@@ -29,44 +20,24 @@ def add_noise_and_normalize(*log_probs, noise_low=0, noise_high=0):
         raise ValueError("All vectors must be the same length")
     log_probs_matrix = np.stack(log_probs, axis=0)
 
-    # 生成噪声并添加
     noise = np.random.uniform(noise_low, noise_high, log_probs_matrix.shape)
     perturbed = log_probs_matrix + noise
     
-    # 归一化：确保每列指数和为1（对数值计算）
-    max_vals = np.max(perturbed, axis=0, keepdims=True)      # 每列最大值
-    shifted = perturbed - max_vals                          # 数值稳定
+    max_vals = np.max(perturbed, axis=0, keepdims=True) 
+    shifted = perturbed - max_vals    
     exp_shifted = np.exp(shifted)
     sum_exp = np.sum(exp_shifted, axis=0, keepdims=True)
-    log_sum_exp = np.log(sum_exp) + max_vals                # log-sum-exp
-    normalized = perturbed - log_sum_exp                    # 归一化后的对数概率
+    log_sum_exp = np.log(sum_exp) + max_vals  
+    normalized = perturbed - log_sum_exp   
     
-    # 拆分为多个向量返回（保持输入顺序）
     return tuple(normalized[i] for i in range(len(log_probs)))
-def add_noise_and_normalize_matrix(
-    log_probs_matrix: np.ndarray,
-    noise_low: float = 0,
-    noise_high: float = 0,
-    axis: int = 0
-) -> np.ndarray:
-    """
-    对输入矩阵的指定维度添加均匀噪声，并归一化为对数概率。
-    
-    Args:
-        log_probs_matrix: 输入矩阵，形状为 (d, n)，每个向量沿指定轴为对数概率
-        noise_low (optional): 噪声下界（默认-0.1）
-        noise_high (optional): 噪声上界（默认0.1）
-        axis (optional): 处理轴，0 表示按列处理，1 表示按行处理（默认0）
-    Returns:
-        处理后的矩阵，形状不变，沿指定轴的向量满足原始概率和为1
-    """
-    # 输入有效性检查
+def add_noise_and_normalize_matrix(log_probs_matrix: np.ndarray,noise_low: float = 0,noise_high: float = 0,axis: int = 0) -> np.ndarray:
+
     if log_probs_matrix.ndim != 2:
         raise ValueError("输入必须是二维矩阵")
     if axis not in (0, 1):
         raise ValueError("轴必须为 0（列）或 1（行）")
     
-    # 生成独立均匀噪声
     noise = np.random.uniform(
         low=noise_low,
         high=noise_high,
@@ -74,7 +45,6 @@ def add_noise_and_normalize_matrix(
     )
     perturbed = log_probs_matrix + noise
     
-    # 选择归一化轴并计算
     max_vals = np.max(perturbed, axis=axis, keepdims=True)
     shifted = perturbed - max_vals
     exp_shifted = np.exp(shifted)
@@ -85,106 +55,62 @@ def add_noise_and_normalize_matrix(
     return normalized
 
 def ini_paras(Ref_seq, emProbMatrix,insertRanges, ME, MD, MI, II, DM, pi_MID, outpath, parasName,perturbation=(0,0)):
-    """初始化HMM概率矩阵（优化内存和计算版本）
-    
-    参数:
-    Ref_seq (str/list): 参考序列，用于确定矩阵维度
-    emProbMatrix (np.ndarray): 发射概率矩阵，形状应为(4, N+1)
-    ME (float): 匹配结束概率（对数空间）
-    MD (float): 匹配->删除转移概率（对数空间）
-    MI (float): 匹配->插入转移概率（对数空间）
-    II (float): 插入->插入转移概率（对数空间）
-    DM (float): 删除->匹配转移概率（对数空间）
-    pi_MID (list): 初始概率 [匹配, 插入, 删除]（归一化前）
-    outpath (str): 输出文件路径
-    parasName (str): 参数名称标识符
-    
-    返回:
-    None: 将参数字典保存为.npy文件
-    
-    输出文件包含:
-    _mm (np.ndarray): 匹配状态转移概率
-    _md (np.ndarray): 匹配->删除转移概率
-    _mi (np.ndarray): 匹配->插入转移概率
-    _im (np.ndarray): 插入->匹配转移概率
-    _ii (np.ndarray): 插入->插入转移概率
-    _id (np.ndarray): 插入->删除转移概率（恒为-inf）
-    _dm (np.ndarray): 删除->匹配转移概率
-    _dd (np.ndarray): 删除->删除转移概率
-    _di (np.ndarray): 删除->插入转移概率（恒为-inf）
-    match_emission (np.ndarray): 匹配状态发射概率
-    insert_emission (np.ndarray): 插入状态发射概率
-    """
-    # ================= 数值检查 =================
-    # 检查转移概率有效性
-    assert np.exp(MD) + np.exp(MI) < 1.0 - 1e-6, "MD+MI概率超过有效范围"
-    assert np.exp(II) < 1.0 - 1e-6, "II概率无效"
-    assert np.exp(DM) < 1.0 - 1e-6, "DM概率无效"
-    # 检查发射概率矩阵维度
-    assert emProbMatrix.shape[0] == 4, "发射概率矩阵维度错误"
-    assert emProbMatrix.shape[1] == len(Ref_seq), "发射概率长度与参考序列不匹配"
-    
-    # 检查初始概率有效性
-    assert np.sum(pi_MID) > 1e-6, "初始概率和不能为0"
-    
-    # ================= 核心计算 =================
-    n_positions = len(Ref_seq) + 1  # 总位置数
-    pi_sum = np.sum(pi_MID)         # 初始概率归一化系数
 
-    # 预计算重复使用的值
-    mm_base = np.log(1 - np.exp(MD) - np.exp(MI))  # 匹配状态自转移概率基值
-    im_base = np.log(1 - np.exp(II))               # 插入->匹配转移概率基值
-    dd_base = np.log(1 - np.exp(DM))               # 删除自转移概率基值
+    assert np.exp(MD) + np.exp(MI) < 1.0 - 1e-6, 
+    assert np.exp(II) < 1.0 - 1e-6, 
+    assert np.exp(DM) < 1.0 - 1e-6, 
+    assert emProbMatrix.shape[0] == 4, 
+    assert emProbMatrix.shape[1] == len(Ref_seq), 
+    assert np.sum(pi_MID) > 1e-6, 
+    
+    n_positions = len(Ref_seq) + 1 
+    pi_sum = np.sum(pi_MID)
+
+    mm_base = np.log(1 - np.exp(MD) - np.exp(MI)) 
+    im_base = np.log(1 - np.exp(II))    
+    dd_base = np.log(1 - np.exp(DM))  
 
 
-    # 初始化匹配状态相关数组
-    _mi = np.full(n_positions, MI, dtype=np.float64)    # 匹配->插入
-    _md = np.full(n_positions, MD, dtype=np.float64)    # 匹配->删除
-    _mm = np.full(n_positions, mm_base, dtype=np.float64) # 匹配自转移
+    _mi = np.full(n_positions, MI, dtype=np.float64) 
+    _md = np.full(n_positions, MD, dtype=np.float64)   
+    _mm = np.full(n_positions, mm_base, dtype=np.float64) 
     hight_MI = np.logaddexp2(MI,np.log(0.1))
     for rg in insertRanges:
         for i in range(rg[0],rg[1]):
             _mi[i]=hight_MI
 
     _mi,_md,_mm = add_noise_and_normalize(_mi,_md,_mm,noise_low=perturbation[0],noise_high=perturbation[1])
-    # 设置初始状态概率（第0位置）
-    _mi[0] = np.log(pi_MID[1]/pi_sum)  # 初始插入概率
-    _md[0] = np.log(pi_MID[2]/pi_sum)  # 初始删除概率
-    _mm[0] = np.log(pi_MID[0]/pi_sum)  # 初始匹配概率
+    _mi[0] = np.log(pi_MID[1]/pi_sum)
+    _md[0] = np.log(pi_MID[2]/pi_sum) 
+    _mm[0] = np.log(pi_MID[0]/pi_sum)
 
-    # 设置终止状态概率（最后位置）
-    _mm[-1] = ME            # 匹配结束概率
-    _mi[-1] = np.log(1 - np.exp(ME))  # 终止位置禁止插入
+    _mm[-1] = ME      
+    _mi[-1] = np.log(1 - np.exp(ME))  
 
     _mm[-1],_mi[-1] = add_noise_and_normalize(_mm[-1],_mi[-1],noise_low=perturbation[0],noise_high=perturbation[1])
 
-    # 插入状态相关数组（优化计算顺序）
-    _ii = np.full(n_positions, II, dtype=np.float64)  # 插入自转移
-    _im = np.full(n_positions, im_base, dtype=np.float64)  # 插入->匹配
-    _id = np.full(n_positions, -np.inf, dtype=np.float64)  # 插入->删除（禁用）
+    _ii = np.full(n_positions, II, dtype=np.float64) 
+    _im = np.full(n_positions, im_base, dtype=np.float64)  
+    _id = np.full(n_positions, -np.inf, dtype=np.float64)  
 
     _ii,_im,_id = add_noise_and_normalize(_ii,_im,_id,noise_low=perturbation[0],noise_high=perturbation[1])
 
-    # 删除状态相关数组（优化内存布局）
-    _dm = np.full(n_positions, DM, dtype=np.float64)  # 删除->匹配
-    _dd = np.full(n_positions, dd_base, dtype=np.float64)  # 删除自转移
-    _di = np.full(n_positions, -np.inf, dtype=np.float64)  # 删除->插入（禁用）
+    _dm = np.full(n_positions, DM, dtype=np.float64) 
+    _dd = np.full(n_positions, dd_base, dtype=np.float64)  
+    _di = np.full(n_positions, -np.inf, dtype=np.float64)  
 
     _dm,_dd = add_noise_and_normalize(_dm,_dd,noise_low=perturbation[0],noise_high=perturbation[1])
 
-    # 设置删除状态边界条件
-    _dm[0] = _dd[0] = _dd[-1] = -np.inf  # 起始和终止位置禁止删除
-    _dm[-1] = 0  # 允许终止位置删除->匹配转移
+    _dm[0] = _dd[0] = _dd[-1] = -np.inf  
+    _dm[-1] = 0  
 
 
 
-    # ================= 发射概率处理 =================
-    _em = np.log(emProbMatrix.T + 1e-16)  # 转置并取对数（加极小值防止log(0)）
+    _em = np.log(emProbMatrix.T + 1e-16)  
     _em = add_noise_and_normalize_matrix(_em,axis=1)
     print(_em)
-    _ei = np.full((_em.shape[0]+1, _em.shape[1]), np.log(0.25), dtype=np.float64)  # 插入发射概率
+    _ei = np.full((_em.shape[0]+1, _em.shape[1]), np.log(0.25), dtype=np.float64) 
 
-    # ================= 结果打包 =================
     parameterDict = {
         "_mm": _mm, "_md": _md, "_mi": _mi,
         "_im": _im, "_id": _id, "_ii": _ii,
@@ -192,44 +118,13 @@ def ini_paras(Ref_seq, emProbMatrix,insertRanges, ME, MD, MI, II, DM, pi_MID, ou
         "match_emission": _em, "insert_emission": _ei
     }
 
-    # ================= 文件保存 =================
     np.save(outpath/"ini/init_{}.npy".format(parasName), parameterDict)
 
 
 def ref_graph_build(graph_path, thr=0.01,type=True, MissMatchScore=-5):
-    """
-    构建参考图数据结构，包含序列信息、节点列表、发射概率矩阵和初始状态概率
     
-    参数：
-    graph_path : str
-        参考图数据文件的路径（不包含后缀）
-        文件命名应为：路径/thr_{thr值}.npz
-    thr : float, 可选
-        用于构建参考图的阈值参数，默认0.001
-    MissMatchScore : int, 可选
-        错配得分，用于调整发射概率矩阵，默认-5
-    
-    返回：
-    ref_seq : str
-        参考序列字符串
-    ref_node_list : list
-        参考图节点列表，每个元素代表一个节点的特征信息
-    emProbMatrix : numpy.ndarray
-        发射概率矩阵，形状为(4, N)，N为参考序列长度
-        包含A/C/G/T四种碱基的概率分布，每列和为1
-    pi_MID : list
-        初始状态概率向量，固定返回[1, 1, 1]
-    
-    处理流程：
-    1. 加载预处理好的npz数据文件
-    2. 对发射概率矩阵进行得分调整和归一化
-    3. 返回处理后的数据结构
-    """
-    # 加载预处理好的参考图数据文件
-    # 文件包含三个键：ref_seq, ref_node_list, emProbMatrix
     ref_dict = np.load(graph_path/'thr_{}_{}.npz'.format(thr,type))
 
-    # 将字节字符串解码为普通字符串
     ref_seq = str(ref_dict['ref_seq'])
     ref_node_list = list(ref_dict['ref_node_list'])
     emProbMatrix = ref_dict['emProbMatrix']
