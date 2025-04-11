@@ -466,6 +466,3 @@ def merge_graph(graphfileA, graphfileB, newpath):
     del graphB
     gc.collect()
 
-if __name__ =='__main__':
-    # build_fragment_graph('/state1/FTO_results/sample.fasta','tts',16)
-    merge_graph('/state1/FTO_results/ttt/subgraphs/1','/state1/FTO_results/ttt/subgraphs/2','tt1')
