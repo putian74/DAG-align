@@ -884,6 +884,8 @@ class DAGInfo:
                 elif self.headtails[nodeid] == 3:
                     self.startFragmentNodeDict.setdefault(self.fragments[nodeid], []).append(nodeid)
                     self.endFragmentNodeDict.setdefault(self.fragments[nodeid], []).append(nodeid)
+                else:
+                    self.fragmentNodeDict.setdefault(self.fragments[nodeid], []).append(nodeid)
         self.fragments = self.fragments[:self.totalNodes]
         self.weights = self.weights[:self.totalNodes]
         self.headtails = self.headtails[:self.totalNodes]
