@@ -8,7 +8,7 @@ class sql_master():
     def __init__(self,graph,db="",mode = 'build',dbidList=''):
         self.conn = sqlite3.connect(":memory:")
         cursor = self.conn.cursor()
-        for setname in dbidList:
+        for setname,arrays in dbidList:
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS vset{} (
                 node_id INTEGER PRIMARY KEY,
@@ -16,7 +16,6 @@ class sql_master():
             )
             '''.format(setname))
             self.conn.commit()
-            arrays = np.load(db/'{}/osm.npy'.format(setname),allow_pickle=True)
             binary_arrays = [[index,array.tobytes()] for index,array in enumerate(arrays)]
             df = pandas.DataFrame(binary_arrays, columns=['node_id','virus'])
             df.to_sql('vset'+str(setname), con=self.conn, if_exists='append', index=False)
