@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import numpy as np
-import warnings
 from multiprocessing import Manager,Process,Queue,shared_memory,Value,Lock,Array
 from DAG_info import *
 from DAG_operator import *
-warnings.filterwarnings("ignore")
 from datetime import datetime
-from tqdm import tqdm
 import time
 import os
 from Bio.Seq import Seq
@@ -65,6 +62,7 @@ class DAGPhmm(object):
             self.Me_Matrix_degenerate_base.append(np.logaddexp.reduce(self.Me_Matrix.T[degenerate_base]-np.log(len(degenerate_base)),axis=0))  
         self.Me_Matrix_degenerate_base = np.array(self.Me_Matrix_degenerate_base)              
         self.Ie_Matrix_degenerate_base = np.array(self.Ie_Matrix_degenerate_base)
+
     @jit(nopython=True)
     def calculate_alpha_values(last_alpha_M, last_alpha_I, last_alpha_D, Ie, Me, stateRangeStart, stateRangeEnd, D2D_array, I2D_array, M2D_array, D2I_array, I2I_array, M2I_array, D2M_array, I2M_array, M2M_array, arrayLength):
 
@@ -100,6 +98,7 @@ class DAGPhmm(object):
                 alpha_D[i-1] + D2D_array[stateRangeStart+i-1]        
             )
         return alpha_I, alpha_M, alpha_D
+    
     @jit(nopython=True)
     def calculate_beta_values(nextBeta_M, nextBeta_I, beta_D, stateRangeStart, stateRangeEnd, Match_num, D2I_array, D2M_array, D2D_array, I2I_array, I2M_array, I2D_array, M2M_array, M2I_array, M2D_array, arrayLength):
 
@@ -133,12 +132,12 @@ class DAGPhmm(object):
 
     @jit(nopython=True)
     def update_state(laststate_local, range_length, nowstate, nowstateindex, delta_index_start, decrease_list):
-
         while nowstate == 1:            
             state_slot = nowstate * range_length + nowstateindex - delta_index_start
             nowstate = laststate_local[state_slot]              
             nowstateindex += decrease_list[nowstate]                 
-        return nowstate, nowstateindex                  
+        return nowstate, nowstateindex  
+                    
     @jit(nopython=True)
     def calculate_delta_values(stateRangeStart, stateRangeEnd, arrayLength,
                     last_delta_I, last_delta_M, last_delta_D,
@@ -181,6 +180,7 @@ class DAGPhmm(object):
             maxProbOrigin_D[i] = np.argmax(D_arg)          
             delta_D[i] = D_arg[maxProbOrigin_D[i]]          
         return delta_I, delta_M, delta_D, maxProbOrigin_I, maxProbOrigin_M, maxProbOrigin_D
+    
     def forward(self,alpha_Matrix_M,alpha_Matrix_D,alpha_Matrix_I):
 
         def write_alpha_head(indexlist,alpha_head_dict):
@@ -372,6 +372,7 @@ class DAGPhmm(object):
         indegree_dict_shm.unlink()
         doneList_shm.close()
         doneList_shm.unlink()
+
     def backward(self, beta_Matrix_M, beta_Matrix_D, beta_Matrix_I, left_beta_Matrix_M, left_beta_Matrix_I, problist):
 
         def write_beta_head(indexlist, beta_head):
@@ -606,10 +607,10 @@ class DAGPhmm(object):
         doneList_shm.close()
         doneList_shm.unlink()
         problist.append(prob)
+
     def estep(self,alpha_Matrix_M,alpha_Matrix_I,alpha_Matrix_D,beta_Matrix_M,beta_Matrix_D,beta_Matrix_I,left_beta_Matrix_M,left_beta_Matrix_I):
-        
         def calculate_gamma(nodes,gamma_o_M_list,gamma_o_I_list,E_MM_list,E_MD_list,E_MI_list,E_II_list,E_IM_list,E_DM_list,E_DD_list,MEi_list,IEi_list,DEi_list):
-            
+
             Match_num = self.Match_num
             D2D_array = self.D2D_array
             I2D_array = self.I2D_array
@@ -620,14 +621,13 @@ class DAGPhmm(object):
             D2M_array = self.D2M_array
             I2M_array = self.I2M_array
             M2M_array = self.M2M_array
+
             degenerate_base_dict = self.degenerateBaseDictionary.copy()
-            degenerate_base_dict['A']=[0]
-            degenerate_base_dict['T']=[1]
-            degenerate_base_dict['C']=[2]
-            degenerate_base_dict['G']=[3]
+            degenerate_base_dict.update({'A':[0], 'T':[1], 'C':[2], 'G':[3]})
             allBaseDictReverse = self.allBaseDictReverse
-            gamma_o_M = np.log(np.zeros((Match_num, self.normalBaseCount),dtype=np.float64))
-            gamma_o_I = np.log(np.zeros((Match_num+1, self.normalBaseCount),dtype=np.float64))
+
+            gamma_o_M = np.full((Match_num, self.normalBaseCount), -np.inf, dtype=np.float64)
+            gamma_o_I = np.full((Match_num+1, self.normalBaseCount), -np.inf, dtype=np.float64)
             E_MM = np.full(Match_num-1, -np.inf)
             E_MD = np.full(Match_num-1, -np.inf)
             E_MI = np.full(Match_num, -np.inf)
@@ -640,76 +640,72 @@ class DAGPhmm(object):
             MEi = np.full(Match_num, -np.inf)
             IEi = np.full(Match_num+1, -np.inf)
             DEi = np.full(Match_num, -np.inf)
+
             nodes = set(nodes)
-            stnodes = self.graphStartNodes|set([-1])
-            spnodes = nodes&stnodes
-            nodes -=spnodes
-            for node in spnodes:
-                stateRangeStart=0
-                if node!=-1:
-                    stateRangeEnd = self.stateRangeDict[2*node+1]
-                else:
+            stnodes = self.graphStartNodes | {-1}
+            spnodes = nodes & stnodes
+            nodes -= spnodes
+
+            def process_node(node, is_start_node):
+                if node == -1:
+                    stateRangeStart = 0
                     stateRangeEnd = self.maxrange
-                arrayRangeStart,arrayRangeEnd = self.arrayRangeDict[node]
+                else:
+                    stateRangeStart = 0 if is_start_node else self.stateRangeDict[2 * node]
+                    stateRangeEnd = self.stateRangeDict[2 * node + 1]
+
+                arrayRangeStart, arrayRangeEnd = self.arrayRangeDict[node]
+                stateRange = slice(stateRangeStart, stateRangeEnd)
+                stateRangeM = slice(stateRangeStart, stateRangeEnd - 1)
+                arrayRange = slice(arrayRangeStart, arrayRangeEnd)
+                arrayRangeM = slice(arrayRangeStart, arrayRangeEnd - 1)
+
                 baseID = self.allBaseDict[self.DAG.fragments[node]]
-                alpha_M = alpha_Matrix_M[arrayRangeStart:arrayRangeEnd-1]
-                alpha_I = alpha_Matrix_I[arrayRangeStart:arrayRangeEnd]
-                alpha_D = alpha_Matrix_D[arrayRangeStart:arrayRangeEnd-1]
-                beta_M = beta_Matrix_M[arrayRangeStart:arrayRangeEnd-1]
-                beta_I = beta_Matrix_I[arrayRangeStart:arrayRangeEnd]
-                beta_D = beta_Matrix_D[arrayRangeStart:arrayRangeEnd-1]
-                nextBeta_M = left_beta_Matrix_M[arrayRangeStart:arrayRangeEnd-1]
-                nextBeta_I = left_beta_Matrix_I[arrayRangeStart:arrayRangeEnd]
-                gamma_M =  alpha_M+beta_M 
-                gamma_I =  alpha_I+beta_I 
-                gamma_D =  alpha_D+beta_D 
-                E_MM[stateRangeStart:stateRangeEnd-1] = np.logaddexp(alpha_M[:-1]+M2M_array[stateRangeStart:stateRangeEnd-1]+nextBeta_M[1:],E_MM[stateRangeStart:stateRangeEnd-1])
-                E_MD[stateRangeStart:stateRangeEnd-1] = np.logaddexp(alpha_M[:-1]+M2D_array[stateRangeStart:stateRangeEnd-1]+beta_D[1:],E_MD[stateRangeStart:stateRangeEnd-1])
-                E_MI[stateRangeStart:stateRangeEnd] = np.logaddexp(alpha_M+M2I_array[stateRangeStart:stateRangeEnd]+nextBeta_I[1:],E_MI[stateRangeStart:stateRangeEnd])
-                E_II[stateRangeStart:stateRangeEnd+1] = np.logaddexp(alpha_I+I2I_array[stateRangeStart:stateRangeEnd+1]+nextBeta_I,E_II[stateRangeStart:stateRangeEnd+1])
-                E_IM[stateRangeStart:stateRangeEnd] = np.logaddexp(alpha_I[:-1]+I2M_array[stateRangeStart:stateRangeEnd]+nextBeta_M,E_IM[stateRangeStart:stateRangeEnd])
-                E_ID[stateRangeStart:stateRangeEnd] = np.logaddexp(alpha_I[:-1]+I2D_array[stateRangeStart:stateRangeEnd]+beta_D,E_ID[stateRangeStart:stateRangeEnd])
-                E_DM[stateRangeStart:stateRangeEnd-1] = np.logaddexp(alpha_D[:-1]+D2M_array[stateRangeStart:stateRangeEnd-1]+nextBeta_M[1:],E_DM[stateRangeStart:stateRangeEnd-1])
-                E_DD[stateRangeStart:stateRangeEnd-1] = np.logaddexp(alpha_D[:-1]+D2D_array[stateRangeStart:stateRangeEnd-1]+beta_D[1:],E_DD[stateRangeStart:stateRangeEnd-1])
-                E_DI[stateRangeStart:stateRangeEnd] = np.logaddexp(alpha_D+D2I_array[stateRangeStart:stateRangeEnd]+nextBeta_I[1:],E_DI[stateRangeStart:stateRangeEnd])
-                MEi[stateRangeStart:stateRangeEnd] = np.logaddexp(gamma_M,MEi[stateRangeStart:stateRangeEnd])
-                IEi[stateRangeStart:stateRangeEnd+1] = np.logaddexp(gamma_I,IEi[stateRangeStart:stateRangeEnd+1])
-                DEi[stateRangeStart:stateRangeEnd] = np.logaddexp(gamma_D,DEi[stateRangeStart:stateRangeEnd])
-                self.gamma_M[node] = [gamma_M[0]]
-                self.gamma_I[node] = [gamma_I[0]]
-                self.gamma_D[node] = [gamma_D[0]]
+                alpha_M = alpha_Matrix_M[arrayRangeM]
+                alpha_I = alpha_Matrix_I[arrayRange]
+                alpha_D = alpha_Matrix_D[arrayRangeM]
+                beta_M = beta_Matrix_M[arrayRangeM]
+                beta_I = beta_Matrix_I[arrayRange]
+                beta_D = beta_Matrix_D[arrayRangeM]
+                nextBeta_M = left_beta_Matrix_M[arrayRangeM]
+                nextBeta_I = left_beta_Matrix_I[arrayRange]
+
+                gamma_M = alpha_M + beta_M
+                gamma_I = alpha_I + beta_I
+                gamma_D = alpha_D + beta_D
+
+                E_MM[stateRangeM] = np.logaddexp(alpha_M[:-1] + M2M_array[stateRangeM] + nextBeta_M[1:], E_MM[stateRangeM])
+                E_MD[stateRangeM] = np.logaddexp(alpha_M[:-1] + M2D_array[stateRangeM] + beta_D[1:], E_MD[stateRangeM])
+                E_MI[stateRange]  = np.logaddexp(alpha_M + M2I_array[stateRange] + nextBeta_I[1:], E_MI[stateRange])
+                E_II[stateRange.start:stateRange.stop+1] = np.logaddexp(alpha_I + I2I_array[stateRange.start:stateRange.stop+1] + nextBeta_I, E_II[stateRange.start:stateRange.stop+1])
+                E_IM[stateRange] = np.logaddexp(alpha_I[:-1] + I2M_array[stateRange] + nextBeta_M, E_IM[stateRange])
+                E_ID[stateRange] = np.logaddexp(alpha_I[:-1] + I2D_array[stateRange] + beta_D, E_ID[stateRange])
+                E_DM[stateRangeM] = np.logaddexp(alpha_D[:-1] + D2M_array[stateRangeM] + nextBeta_M[1:], E_DM[stateRangeM])
+                E_DD[stateRangeM] = np.logaddexp(alpha_D[:-1] + D2D_array[stateRangeM] + beta_D[1:], E_DD[stateRangeM])
+                E_DI[stateRange] = np.logaddexp(alpha_D + D2I_array[stateRange] + nextBeta_I[1:], E_DI[stateRange])
+
+                MEi[stateRange] = np.logaddexp(gamma_M, MEi[stateRange])
+                IEi[stateRange.start:stateRange.stop+1] = np.logaddexp(gamma_I, IEi[stateRange.start:stateRange.stop+1])
+                DEi[stateRange] = np.logaddexp(gamma_D, DEi[stateRange])
+
+                if is_start_node:
+                    self.gamma_M[node] = [gamma_M[0]]
+                    self.gamma_I[node] = [gamma_I[0]]
+                    self.gamma_D[node] = [gamma_D[0]]
+                else:
+                    bases = degenerate_base_dict[allBaseDictReverse[baseID]]
+                    gamma_o_M[stateRange, bases] = np.logaddexp(gamma_o_M[stateRange, bases],
+                                                                gamma_M[:, None] - np.log(len(bases)))
+                    gamma_o_I[stateRange.start:stateRange.stop+1, bases] = np.logaddexp(
+                        gamma_o_I[stateRange.start:stateRange.stop+1, bases],
+                        gamma_I[:, None] - np.log(len(bases))
+                    )
+
+            for node in spnodes:
+                process_node(node, is_start_node=True)
             for node in nodes:
-                stateRangeStart = self.stateRangeDict[2*node]
-                stateRangeEnd = self.stateRangeDict[2*node+1]
-                arrayRangeStart,arrayRangeEnd = self.arrayRangeDict[node]
-                baseID = self.allBaseDict[self.DAG.fragments[node]]
-                alpha_M = alpha_Matrix_M[arrayRangeStart:arrayRangeEnd-1]
-                alpha_I = alpha_Matrix_I[arrayRangeStart:arrayRangeEnd]
-                alpha_D = alpha_Matrix_D[arrayRangeStart:arrayRangeEnd-1]
-                beta_M = beta_Matrix_M[arrayRangeStart:arrayRangeEnd-1]
-                beta_I = beta_Matrix_I[arrayRangeStart:arrayRangeEnd]
-                beta_D = beta_Matrix_D[arrayRangeStart:arrayRangeEnd-1]
-                nextBeta_M = left_beta_Matrix_M[arrayRangeStart:arrayRangeEnd-1]
-                nextBeta_I = left_beta_Matrix_I[arrayRangeStart:arrayRangeEnd]
-                gamma_M =  alpha_M+beta_M 
-                gamma_I =  alpha_I+beta_I 
-                gamma_D =  alpha_D+beta_D 
-                bases = degenerate_base_dict[allBaseDictReverse[baseID]]
-                E_MM[stateRangeStart:stateRangeEnd-1] = np.logaddexp(alpha_M[:-1]+M2M_array[stateRangeStart:stateRangeEnd-1]+nextBeta_M[1:],E_MM[stateRangeStart:stateRangeEnd-1])
-                E_MD[stateRangeStart:stateRangeEnd-1] = np.logaddexp(alpha_M[:-1]+M2D_array[stateRangeStart:stateRangeEnd-1]+beta_D[1:],E_MD[stateRangeStart:stateRangeEnd-1])
-                E_MI[stateRangeStart:stateRangeEnd] = np.logaddexp(alpha_M+M2I_array[stateRangeStart:stateRangeEnd]+nextBeta_I[1:],E_MI[stateRangeStart:stateRangeEnd])
-                E_II[stateRangeStart:stateRangeEnd+1] = np.logaddexp(alpha_I+I2I_array[stateRangeStart:stateRangeEnd+1]+nextBeta_I,E_II[stateRangeStart:stateRangeEnd+1])
-                E_IM[stateRangeStart:stateRangeEnd] = np.logaddexp(alpha_I[:-1]+I2M_array[stateRangeStart:stateRangeEnd]+nextBeta_M,E_IM[stateRangeStart:stateRangeEnd])
-                E_ID[stateRangeStart:stateRangeEnd] = np.logaddexp(alpha_I[:-1]+I2D_array[stateRangeStart:stateRangeEnd]+beta_D,E_ID[stateRangeStart:stateRangeEnd])
-                E_DM[stateRangeStart:stateRangeEnd-1] = np.logaddexp(alpha_D[:-1]+D2M_array[stateRangeStart:stateRangeEnd-1]+nextBeta_M[1:],E_DM[stateRangeStart:stateRangeEnd-1])
-                E_DD[stateRangeStart:stateRangeEnd-1] = np.logaddexp(alpha_D[:-1]+D2D_array[stateRangeStart:stateRangeEnd-1]+beta_D[1:],E_DD[stateRangeStart:stateRangeEnd-1])
-                E_DI[stateRangeStart:stateRangeEnd] = np.logaddexp(alpha_D+D2I_array[stateRangeStart:stateRangeEnd]+nextBeta_I[1:],E_DI[stateRangeStart:stateRangeEnd])
-                MEi[stateRangeStart:stateRangeEnd] = np.logaddexp(gamma_M,MEi[stateRangeStart:stateRangeEnd])
-                IEi[stateRangeStart:stateRangeEnd+1] = np.logaddexp(gamma_I,IEi[stateRangeStart:stateRangeEnd+1])
-                DEi[stateRangeStart:stateRangeEnd] = np.logaddexp(gamma_D,DEi[stateRangeStart:stateRangeEnd])
-                for base in bases:
-                    gamma_o_M[stateRangeStart:stateRangeEnd,base] = np.logaddexp(gamma_M-np.log(len(bases)),gamma_o_M[stateRangeStart:stateRangeEnd,base])
-                    gamma_o_I[stateRangeStart:stateRangeEnd+1,base] = np.logaddexp(gamma_I-np.log(len(bases)),gamma_o_I[stateRangeStart:stateRangeEnd+1,base])
+                process_node(node, is_start_node=False)
+
             gamma_o_M_list.append(gamma_o_M)
             gamma_o_I_list.append(gamma_o_I)
             E_MM_list.append(E_MM)
@@ -717,13 +713,12 @@ class DAGPhmm(object):
             E_MI_list.append(E_MI)
             E_II_list.append(E_II)
             E_IM_list.append(E_IM)
-            E_ID_list.append(E_ID)
             E_DM_list.append(E_DM)
             E_DD_list.append(E_DD)
-            E_DI_list.append(E_DI)
             MEi_list.append(MEi)
             DEi_list.append(DEi)
             IEi_list.append(IEi)
+        
         problist = Manager().list()                
         problist.append([])                        
         allprocesslist = []
@@ -788,6 +783,7 @@ class DAGPhmm(object):
         print()
         print('P(x): ',prob)
         return prob
+    
     def mstep(self, perturbation=False, m_global_random_low=0.2, m_global_random_up=0.4):
         
         self.Ie_Matrix = self.gamma_o_I - self.IEi.reshape(-1, 1)
@@ -959,95 +955,9 @@ class DAGPhmm(object):
         parameterDict['insert_emission'] = np.full((self.Match_num+1,4),-np.inf)
         parameterDict['insert_emission'] = self.Ie_Matrix
         np.save(self.train_DAG_Path/'ini/{}_pc_{}.npy'.format(self.parameterName,self.train_times),parameterDict)
-    def init_train_data(self, Viterbi_DAG_Path, ref_node_list, ref_seq, modify_dict, kill_degenerate_base=True, windows_length=100, threads=3):
-        st = datetime.now()
-        self.windows_length = windows_length
-        self.head_length = modify_dict['head_length']             
-        self.tail_length = modify_dict['tail_length']             
-        self.emProbAdds_Match = modify_dict['emProbAdds_Match']                    
-        self.emProbAdds_Match_head = modify_dict['emProbAdds_Match_head']              
-        self.emProbAdds_Match_tail = modify_dict['emProbAdds_Match_tail']              
-        self.trProbAdds_mm = modify_dict['trProbAdds_mm']               
-        self.trProbAdds_md = modify_dict['trProbAdds_md']                
-        self.trProbAdds_mi = modify_dict['trProbAdds_mi']               
-        self.trProbAdds_PiM = modify_dict['trProbAdds_PiM']               
-        self.trProbAdds_PiI = modify_dict['trProbAdds_PiI']               
-        self.trProbAdds_PiD = modify_dict['trProbAdds_PiD']               
-        self.trProbAdds_im = modify_dict['trProbAdds_im']               
-        self.trProbAdds_ii = modify_dict['trProbAdds_ii']               
-        self.trProbAdds_iend = modify_dict['trProbAdds_iend']           
-        self.trProbAdds_ii_tail = modify_dict['trProbAdds_ii_tail']                
-        self.trProbAdds_mend = modify_dict['trProbAdds_mend']            
-        self.trProbAdds_mi_tail = modify_dict['trProbAdds_mi_tail']                
-        self.DAG = load_DAG(Viterbi_DAG_Path)
-        ed = datetime.now()
-        self.DAG.SourceList = [{nodeid} for nodeid in range(self.DAG.totalNodes)]
 
-        new_ref_list = ['x'] * (len(ref_node_list)-1)
-        ref_node_set = set(ref_node_list[1:])
-        for nodeid in range(self.DAG.totalNodes):
-            co_set = self.DAG.SourceList[nodeid] & ref_node_set
-            if co_set:
-                idx = ref_node_list[1:].index(co_set.pop())
-                new_ref_list[idx] = nodeid             
-        ref_node_list = ['x'] * (len(ref_seq)-len(new_ref_list)) + new_ref_list
-        self.DAG.fragmentReduce()
-        range_List = self.DAG.queryGraph.calculateStateRange(ref_node_list)
-        if kill_degenerate_base:
-            try:
-                idmapping = self.DAG.removeDegenerateBasePaths()
-                idmapping = {value: key for key, value in idmapping.items()}
-            except:
-                idmapping = {i: i for i in range(self.DAG.totalNodes)}
-        else:
-            idmapping = {i: i for i in range(self.DAG.totalNodes)}
-        self.maxrange = 0                          
-        self.stateRangeDict = []                              
-        self.range_length = 0                   
-        self.arrayRangeDict = []                    
-        for index in range(self.DAG.totalNodes):
-            node = idmapping[index]
-
-            start = max(0, range_List[node][0] - self.windows_length)
-            end = min(len(ref_node_list), range_List[node][1] + self.windows_length)
-            self.stateRangeDict.extend([start, end])
-            sted = [self.range_length]
-            self.range_length += (end - start + 1)
-            sted.append(self.range_length)
-            self.arrayRangeDict.append(sted)
-            if (end - start + 1) > self.maxrange:
-                self.maxrange = end - start + 1
-        self.maxrange = min(self.Match_num,self.maxrange)
-        sted = [self.range_length]
-        self.range_length += (self.maxrange + 1)
-        sted.append(self.range_length)
-        self.arrayRangeDict.append(sted)
-        self.vnum = self.DAG.sequenceNum
-        vtuple = np.load(Viterbi_DAG_Path / 'v_id.npy').tolist()
-        self.all_source = {tu[1] for tu in vtuple}            
-        self.vlist = [tu[1] for tu in vtuple]               
-        self.v2id_dict = dict(vtuple)                         
-        self.id2v_dict = {value: key for key, value in vtuple}          
-        self.pool_num = max(threads // 2, 1)                
-        self.graphStartNodes = set()
-        self.graphEndNodes = set()
-        for nodeid in range(self.DAG.totalNodes):
-            if self.DAG.queryGraph.findParentNodes(nodeid) == []:
-                self.graphStartNodes.add(nodeid)
-            if self.DAG.queryGraph.findChildNodes(nodeid) == []:
-                self.graphEndNodes.add(nodeid)
-        ed = datetime.now()
-        self.DAG.startNodeSet = self.graphStartNodes
-        self.DAG.endNodeSet = self.graphEndNodes
-        self.linearPath_list, self.linearPath_link, nodeID_linearPathID_Dict = build_coarse_grained_graph(
-            self.DAG.queryGraph, self.DAG.edgeWeightDict)
-        self.DAG.CG_DAG = DAGStru(len(self.linearPath_list), self.linearPath_link)
-        self.DAG.CG_DAG.calculateCoordinates()            
-        self.sequenceNum = self.DAG.sequenceNum
-        ed = datetime.now()
 
     def init_train_data_with_DAG(self, Viterbi_DAG_Path, ref_node_list, ref_seq, modify_dict,DAG, kill_degenerate_base=True, windows_length=100, threads=3):
-        st = datetime.now()
         self.windows_length = windows_length
         self.head_length = modify_dict['head_length']             
         self.tail_length = modify_dict['tail_length']             
@@ -1068,21 +978,14 @@ class DAGPhmm(object):
         self.trProbAdds_mi_tail = modify_dict['trProbAdds_mi_tail']
 
         self.DAG = DAG
-        ed = datetime.now()
-        
 
-        ref_node_list = ['x']*(len(ref_seq)-len(ref_node_list)) + ref_node_list
-        new_ref_list = ['x'] * (len(ref_node_list))
-        ref_node_set = set(ref_node_list[1:])                 
-        for nodeid in range(self.DAG.totalNodes):
-            co_set = set([nodeid]) & ref_node_set                 
-            if co_set:
-                idx = ref_node_list[1:].index(co_set.pop())
-                
-                new_ref_list[idx-int(self.DAG.offsetArray[nodeid])] = nodeid
-        ref_node_list = new_ref_list
+        ref_node_list = self.DAG.map_ref_seq_to_graph(ref_seq).tolist()
+        ref_node_list = ['x']*(len(ref_seq)-len(ref_node_list)) + ['x' if i==-1 else i  for i in ref_node_list]
+        self.DAG.fragmentReduce()
+
         
         range_List = self.DAG.queryGraph.calculateStateRange(ref_node_list)
+        
 
         if kill_degenerate_base:
             try:
@@ -1136,12 +1039,11 @@ class DAGPhmm(object):
         self.DAG.CG_DAG = DAGStru(len(self.linearPath_list), self.linearPath_link)
         self.DAG.CG_DAG.calculateCoordinates()            
         self.sequenceNum = self.DAG.sequenceNum
-        ed = datetime.now()
 
     def fit(self):
 
-        # self.init_train_data(Viterbi_DAG_Path, ref_node_list, ref_seq, modify_dict, kill_degenerate_base, windows_length, threads)
-        oriprob = -np.inf  
+
+        self.range_length = int(self.range_length)
         shared_array_alphaM = Array('d', self.range_length)               
         alpha_Matrix_M = np.frombuffer(shared_array_alphaM.get_obj(), dtype=np.float64).reshape(self.range_length)
         shared_array_alphaI = Array('d', self.range_length)                
@@ -1168,107 +1070,45 @@ class DAGPhmm(object):
 
             self.mstep()  
             break
-            oriprob = prob  
-    def init_viterbi_data(self, Viterbi_DAG_Path, Viterbi_result_path, ref_node_list, ref_seq, onm2db=False, polyA=False, windows_length=100, threads=3):
 
-        self.Viterbi_result_path = Viterbi_result_path
-        self.windows_length = windows_length
-        self.Viterbi_DAG_Path = Viterbi_DAG_Path
-
-        self.DAG = load_DAG(Viterbi_DAG_Path, load_onmfile=True)
-        self.DAG.fragmentReduce()
-        self.linearPath_list, self.linearPath_link, nodeID_linearPathID_Dict = build_coarse_grained_graph(
-            self.DAG.queryGraph, self.DAG.edgeWeightDict)
-        self.DAG.CG_DAG = DAGStru(len(self.linearPath_list), self.linearPath_link)
-        self.DAG.CG_DAG.calculateCoordinates() 
-
-        new_ref_list = ['x'] * (len(ref_node_list)-1)
-        ref_node_set = set(ref_node_list[1:])                 
-        for nodeid in range(self.DAG.totalNodes):
-            co_set = set([nodeid]) & ref_node_set                 
-            if co_set:
-                idx = ref_node_list[1:].index(co_set.pop())                
-                new_ref_list[idx-int(self.DAG.offsetArray[nodeid])] = nodeid                
-        ref_node_list = ['x']*(len(ref_seq)-len(new_ref_list)) + new_ref_list
-                  
-        self.DAG.queryGraph.calculateStateRange(ref_node_list)            
-        self.vnum = self.DAG.sequenceNum          
-        vtuple = np.load(Viterbi_DAG_Path/'v_id.npy').tolist()
-        self.all_source = {tu[1] for tu in vtuple}              
-        self.vlist = [tu[1] for tu in vtuple]          
-        self.v2id_dict = dict(vtuple)              
-        self.id2v_dict = {value: key for key, value in vtuple}              
-        self.pool_num = max(threads, 1)            
-        self.DAG.totalNodes = self.DAG.totalNodes                      
-        self.graphStartNodes = self.DAG.startNodeSet          
-        self.graphEndNodes = self.DAG.endNodeSet          
-        self.sequenceNum = self.DAG.sequenceNum            
-        self.maxrange = 0            
-        self.stateRangeDict = []                                     
-        self.range_length = 0                      
-        self.arrayRangeDict = []                  
-        for node in range(self.DAG.totalNodes):
-            min_pos = self.DAG.queryGraph.ref_coor[node][0] - self.windows_length
-            max_pos = self.DAG.queryGraph.ref_coor[node][1] + self.windows_length
-            self.stateRangeDict.extend([
-                max(0, min_pos), 
-                min(len(ref_node_list), max_pos)
-            ])
-            sted = [self.range_length]
-            self.range_length += (self.stateRangeDict[-1] - self.stateRangeDict[-2] + 1)
-            sted.append(self.range_length)
-            self.arrayRangeDict.append(sted)
-            current_range = self.stateRangeDict[-1] - self.stateRangeDict[-2]
-            if current_range > self.maxrange:
-                self.maxrange = current_range
-
-        self.maxrange = min(self.Match_num,self.maxrange)
-        sted = [self.range_length]
-        self.range_length += self.maxrange      
-        sted.append(self.range_length)
-        self.arrayRangeDict.append(sted)
-        if polyA == True:
-            self.M2I_array[-1] = np.log(0.1)                      
-            self.M2E = np.log(0.9)                            
-                      
-        self.ref_seq = ref_seq
-
-    def init_viterbi_data_withDAG(self, Viterbi_DAG_Path, Viterbi_result_path, ref_node_list, ref_seq,DAG,coarseDAGinfo,coarseDAG, polyA=False, windows_length=100, threads=3):
-
+    def init_viterbi_data_with_refseq(self, Viterbi_DAG_Path, Viterbi_result_path,ref_seq,DAG, polyA=False, windows_length=100, threads=3):
         self.Viterbi_result_path = Viterbi_result_path
         self.windows_length = windows_length
         self.Viterbi_DAG_Path = Viterbi_DAG_Path
         
         self.DAG = DAG
-        self.linearPath_list, self.linearPath_link = coarseDAGinfo
-        self.DAG.CG_DAG = coarseDAG
+        ref_node_list = self.DAG.map_ref_seq_to_graph(ref_seq)
+        ref_node_list = ['x']*(len(ref_seq)-len(ref_node_list)) + [anchor if anchor!=-1 else 'x' for anchor in  ref_node_list]
 
-        ref_node_list = ['x']*(len(ref_seq)-len(ref_node_list)) + ref_node_list
-        new_ref_list = ['x'] * (len(ref_node_list))
-        ref_node_set = set(ref_node_list[1:])                 
-        for nodeid in range(self.DAG.totalNodes):
-            co_set = set([nodeid]) & ref_node_set                 
-            if co_set:
-                idx = ref_node_list[1:].index(co_set.pop())                
-                new_ref_list[idx-int(self.DAG.offsetArray[nodeid])] = nodeid
-        ref_node_list = new_ref_list
-                  
-        self.DAG.queryGraph.calculateStateRange(ref_node_list)            
-        self.vnum = self.DAG.sequenceNum          
+        self.DAG.fragmentReduce()
+
+        self.linearPath_list, self.linearPath_link, nodeID_linearPathID_Dict = build_coarse_grained_graph(
+            self.DAG.queryGraph, self.DAG.edgeWeightDict)
+        self.DAG.CG_DAG = DAGStru(len(self.linearPath_list), self.linearPath_link)
+        self.DAG.CG_DAG.calculateCoordinates() 
+
+        self.DAG.fragmentReduce() 
+
+        self.DAG.queryGraph.calculateStateRange(ref_node_list)
+        self.vnum = self.DAG.sequenceNum  
         vtuple = np.load(Viterbi_DAG_Path/'v_id.npy').tolist()
-        self.all_source = {tu[1] for tu in vtuple}              
-        self.vlist = [tu[1] for tu in vtuple]          
-        self.v2id_dict = dict(vtuple)              
-        self.id2v_dict = {value: key for key, value in vtuple}              
-        self.pool_num = max(threads, 1)            
-        self.DAG.totalNodes = self.DAG.totalNodes                      
-        self.graphStartNodes = self.DAG.startNodeSet          
-        self.graphEndNodes = self.DAG.endNodeSet          
-        self.sequenceNum = self.DAG.sequenceNum            
-        self.maxrange = 0            
-        self.stateRangeDict = []                                     
-        self.range_length = 0                      
-        self.arrayRangeDict = []                  
+        self.all_source = {tu[1] for tu in vtuple}  
+        self.vlist = [tu[1] for tu in vtuple]  
+        self.id2v_dict = {tu[1]:tu[0] for tu in vtuple}
+        self.v2id_dict = dict(vtuple)
+
+        self.pool_num = max(threads, 1) 
+        self.DAG.totalNodes = self.DAG.totalNodes  
+        
+        self.graphStartNodes = self.DAG.startNodeSet  
+        self.graphEndNodes = self.DAG.endNodeSet  
+        self.sequenceNum = self.DAG.sequenceNum  
+        
+        self.maxrange = 0  
+        self.stateRangeDict = []  
+        self.range_length = 0    
+        self.arrayRangeDict = [] 
+        
         for node in range(self.DAG.totalNodes):
             min_pos = self.DAG.queryGraph.ref_coor[node][0] - self.windows_length
             max_pos = self.DAG.queryGraph.ref_coor[node][1] + self.windows_length
@@ -1276,31 +1116,34 @@ class DAGPhmm(object):
                 max(0, min_pos), 
                 min(len(ref_node_list), max_pos)
             ])
+            
             sted = [self.range_length]
             self.range_length += (self.stateRangeDict[-1] - self.stateRangeDict[-2] + 1)
             sted.append(self.range_length)
             self.arrayRangeDict.append(sted)
+            
             current_range = self.stateRangeDict[-1] - self.stateRangeDict[-2]
             if current_range > self.maxrange:
                 self.maxrange = current_range
 
         self.maxrange = min(self.Match_num,self.maxrange)
         sted = [self.range_length]
-        self.range_length += self.maxrange      
+        self.range_length += self.maxrange  
         sted.append(self.range_length)
         self.arrayRangeDict.append(sted)
-
+        
         if polyA == True:
             self.M2I_array[-1] = np.log(0.1)                      
             self.M2E = np.log(0.9)                            
                       
         self.ref_seq = ref_seq
+    
 
-    def Viterbi(self,seqiddb,threads=3):
+    def Viterbi(self,seqiddb,threads=4):
 
         def write_hiddensates_head(indexlist):
 
-            decrease_list=[-1,-1,0]
+            decrease_list=np.array([-1,-1,0])
             for index in indexlist:
                 linearPath = self.linearPath_list[index]
                 node = linearPath.pop()
@@ -1375,6 +1218,7 @@ class DAGPhmm(object):
                         tmp_state_dict[state] = tmp_state_dict.get(state,[[],[]])
                         tmp_state_dict[state][0].extend(from_state)
                         tmp_state_dict[state][1].append(int((ori_step+1)*(nowstate/2)))
+
                 if len(tmp_state_dict.keys())==1:
                     new_tmp_state_dict={}
                     state = next(iter(tmp_state_dict))
@@ -1417,7 +1261,6 @@ class DAGPhmm(object):
                                 source_matrix[size_now:size_now+col_size] = v            
                                 size_now += col_size
                             if sourcelist:
-                                # nct = DAGPhmm.get_intersection(content_source,source_matrix)
                                 nct = np.intersect1d(content_source, source_matrix)
                                 if nct.size!=0:
                                     if state[0]==2:
@@ -1448,7 +1291,6 @@ class DAGPhmm(object):
                                 col_size = v.shape[0]             
                                 source_matrix[size_now:size_now+col_size] = v            
                                 size_now += col_size
-                            # nct = DAGPhmm.get_intersection_no_fork(sourcelist,source_matrix,self.DAG.originalfragmentLength)
                             if state[0]==2:
                                 new_tmp_state_dict[state] = [source_matrix,max(tmp_state_dict[state][1])]
                                 lock.acquire()
@@ -1460,14 +1302,17 @@ class DAGPhmm(object):
                         state = next(iter(new_tmp_state_dict))
                         new_tmp_state_dict[state] = ('', new_tmp_state_dict[state][1])
                 hidden_states[node] = new_tmp_state_dict
+
                 doneList[node]=0
                 is_head = False
+
+                
         def init_delta_head():
 
             delta_head_dict={}
             for baseID in range(self.Me_Matrix_degenerate_base.shape[0]):
                 Me = self.Me_Matrix_degenerate_base[baseID]
-                Ie = self.Ie_Matrix_degenerate_base[baseID]                
+                Ie = self.Ie_Matrix_degenerate_base[baseID]
                 delta_M = np.full(self.Match_num, -np.inf, dtype=np.float64)
                 delta_I = np.full(self.Match_num + 1, -np.inf, dtype=np.float64)
                 delta_D = np.full(self.Match_num, -np.inf, dtype=np.float64)
@@ -1493,6 +1338,7 @@ class DAGPhmm(object):
         def write_delta_head(indexlist,delta_head_dict):
 
             for index in indexlist:
+                
                 linearPath = self.linearPath_list[index]
                 node = linearPath[0]
                 arrayRangeStart,arrayRangeEnd = self.arrayRangeDict[node]
@@ -1526,18 +1372,25 @@ class DAGPhmm(object):
             D2M_array = self.D2M_array
             I2M_array = self.I2M_array
             M2M_array = self.M2M_array
+            st=0
             for node in nodes:
                 arrayRangeStart,arrayRangeEnd = self.arrayRangeDict[node]
                 baseID = self.allBaseDict.get(self.DAG.fragments[node][-1],14)
                 partennodes = self.DAG.queryGraph.findParentNodes(node)
                 parentNodeWeightList=[]
-                alist = [self.DAG.edgeWeightDict[(lnode,node)] for lnode in partennodes]
-                b = np.sum(alist)
-                for lnode in partennodes:
-                    a = self.DAG.edgeWeightDict[(lnode,node)]
-                    adds=0
-                    ab = (a+adds/len(partennodes))/(b+adds)
-                    parentNodeWeightList.append([ab,lnode])
+                if st:
+                    for lnode in partennodes:
+                        parentNodeWeightList.append([1,lnode])
+                else:
+                    alist = [self.DAG.edgeWeightDict[(lnode,node)] for lnode in partennodes]
+                    b = np.sum(alist)
+                    for lnode in partennodes:
+                        a = self.DAG.edgeWeightDict[(lnode,node)]
+                        adds=0
+                        ab = (a+adds/len(partennodes))/(b+adds)
+                        parentNodeWeightList.append([ab,lnode])
+
+                st+=1
                 Me = self.Me_Matrix_degenerate_base[baseID]
                 Ie = self.Ie_Matrix_degenerate_base[baseID]
                 last_delta_M_list = np.full((len(parentNodeWeightList), self.Match_num), -np.inf, dtype=np.float64)
@@ -1711,6 +1564,7 @@ class DAGPhmm(object):
         namelist = []            
         namedict = {}              
         v_num = len(all_v)
+
         for i in range(v_num):            
             gid = int(all_v[i].split('_')[0])
             seqid = int(all_v[i].split('_')[1])
@@ -1728,7 +1582,8 @@ class DAGPhmm(object):
             endnodes.append(node)              
         
         processlist = []
-        pool_num = threads                 
+        pool_num = min(threads,4)
+        print(pool_num,'threads')           
         for idx in range(pool_num):
             processlist.append(Process(
                 target=calculate_delta,
@@ -1752,7 +1607,6 @@ class DAGPhmm(object):
         endnldelist = list(self.DAG.CG_DAG.endNodeSet)             
         goon_flag = Value('i', 1)            
         processlist = []
-        print()          
         for idx in range(pool_num):
             processlist.append(Process(
                 target=calculate_state,
@@ -1778,6 +1632,8 @@ class DAGPhmm(object):
         outdegreeDict_shm.unlink()
         doneList_shm.close()
         doneList_shm.unlink()
+
+
     def state_to_aligment(self, seqiddb, mode='local', save_fasta=False, matrix=False):
 
         def query_contend_sequence_id(node):
@@ -1810,7 +1666,7 @@ class DAGPhmm(object):
                         contentsource = query_contend_sequence_id(node)
                     else:
                         contentsource = node_hidden_states[state][0]
-
+                    
                     if contentsource.size != 0:
 
                         content = vectorized_v_dict(get_first_number(contentsource))
@@ -1909,12 +1765,15 @@ class DAGPhmm(object):
             string_matrix = vectorized_draw_dict(ali_matrix)
             seqlist = [
                 SeqRecord(Seq(''.join(i)), id=namelist[idx], description='') 
-                for idx, i in tqdm(enumerate(string_matrix))
+                for idx, i in enumerate(string_matrix)
             ]
             SeqIO.write(
                 seqlist,
                 self.Viterbi_result_path/'{}'.format(self.parameterName)/'aliresult.fasta',
                 'fasta'
             )
+
         ali_matrix_shm.close()
         ali_matrix_shm.unlink()
+
+
