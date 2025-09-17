@@ -2,16 +2,14 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 import re
-from collections import deque,Counter
 from DAG_stru import DAGStru
 from pathlib import Path
-from Bio.Seq import Seq
-from Bio.SeqRecord import SeqRecord
-from Bio import SeqIO
-from tqdm import tqdm
+
+
 degenerate_base_dict = {0:[0],1:[1],2:[2],3:[3],4:[4],5: [1, 4], 6: [3, 2], 7: [1, 3], 8: [4, 2], 9: [4, 3], 10: [1, 2], 11: [1, 2, 3], 12: [4, 2, 3], 13: [4, 1, 3], 14: [4, 1, 2], 15: [1, 2, 3, 4]}
 reverse_base_dict = {'-': 0, 'A': 1, 'T': 2, 'C': 3, 'G': 4, 'R': 5, 'Y': 6, 'M': 7, 'K': 8, 'S': 9, 'W': 10, 'H': 11, 'B': 12, 'V': 13, 'D': 14, 'N': 15}
 basedict ={0: '-', 1: 'A', 2: 'T', 3: 'C', 4: 'G', 5: 'R', 6: 'Y', 7: 'M', 8: 'K', 9: 'S', 10: 'W', 11: 'H', 12: 'B', 13: 'V', 14: 'D', 15: 'N'}
+
 def get_first_number(num, firstBit=32, allBit=64):
 
     if not (isinstance(firstBit, int) and isinstance(allBit, int)):
@@ -23,6 +21,7 @@ def get_first_number(num, firstBit=32, allBit=64):
         np.right_shift(num, allBit - firstBit),          
         mask1                                              
     )
+
 def get_second_number(num, firstBit=32, allBit=64):
 
     if not (isinstance(firstBit, int) and isinstance(allBit, int)):
@@ -31,6 +30,7 @@ def get_second_number(num, firstBit=32, allBit=64):
         raise ValueError(f"总位数{allBit}不能小于需提取的位数{firstBit}")
     mask2 = (1 << (allBit - firstBit)) - 1
     return np.bitwise_and(num, mask2)
+
 def save_numbers(num1, num2, firstBit=32, allBit=64):
 
     if not (isinstance(firstBit, int) and isinstance(allBit, int)):
@@ -42,8 +42,8 @@ def save_numbers(num1, num2, firstBit=32, allBit=64):
         np.left_shift(num1, shift_bits),          
         num2                                        
     )
-def array_to_block(arr, allow_gap=False):
 
+def array_to_block(arr, allow_gap=False):
     def _handle_gap_mode(valid):
         blocks = []
         weights = []
@@ -67,6 +67,7 @@ def array_to_block(arr, allow_gap=False):
         weights.append(count)
         differences.append(start_val - start_idx)
         return blocks, weights, differences
+    
     def _handle_strict_mode(valid):
         blocks = []
         weights = []
@@ -117,6 +118,8 @@ def remove_points_to_increase(lst, weights):
     for i in removed_indices:
         cp_rg.append(lst[i])
     return cp_rg
+
+
 def Cyclic_Anchor_Combination_Detection(Block_list, Block_dif, Block_weight):
     cp_rg = []
     fixflag = 0
@@ -130,82 +133,36 @@ def Cyclic_Anchor_Combination_Detection(Block_list, Block_dif, Block_weight):
     return cp_rg
 
 _DNA_PATTERN = re.compile(r'^[ATCG]*$', re.IGNORECASE)
+
 def no_degenerate(sequence):
 
     if not isinstance(sequence, str):
         return False
     return bool(_DNA_PATTERN.fullmatch(sequence.upper()))
+
 def find_consecutive_negatives(lst):
+    arr = np.asarray(lst)
+    mask = arr == -1
+    if not np.any(mask):
+        return []
+
+    diff = np.diff(mask.astype(int))
+    starts = np.where(diff == 1)[0] + 1
+    ends = np.where(diff == -1)[0]
+
+    if mask[0]: 
+        starts = np.insert(starts, 0, 0)
+    if mask[-1]: 
+        ends = np.append(ends, len(arr) - 1)
 
     results = []
-    i = 0
-    n = len(lst)
-    while i < n:
-        if lst[i] == -1:
-            start = i
-            while i < n and lst[i] == -1:
-                i += 1
-            end = i - 1               
-            prev_val = lst[start - 1] if start > 0 else 0
-            next_val = lst[end + 1] if end < n - 1 else float('inf')
-            results.append((start, end, prev_val, next_val))
-        else:
-            i += 1           
+    for s, e in zip(starts, ends):
+        prev_val = arr[s - 1] if s > 0 else 0
+        next_val = arr[e + 1] if e + 1 < len(arr) else float('inf')
+        results.append([s, e, prev_val, next_val])
+
     return results
-def replace_duplicates(lst: list[int], n: int = 3) -> list[int]:
 
-    count = Counter(lst)             
-    replace_set = {k for k, v in count.items() if v >= n}  
-    return [-1 if x in replace_set else x for x in lst]  
-def reduce_consecutive(lst: list[int], start_index=1):
-
-    if not lst:
-        return [], []
-    result = [lst[0]]              
-    indices = [[start_index]]                   
-    for i, curr in enumerate(lst[1:], start=start_index):
-        if curr != result[-1]:          
-            result.append(curr)           
-            indices.append([i + 1])              
-        else:           
-            indices[-1].append(i + 1)                     
-    return result, indices
-def find_long_negative_segments(data, threshold=-1, min_length=120):
-
-    data = np.array(data)
-    is_negative = data == threshold
-    diff = np.diff(np.concatenate(([0], is_negative, [0])))
-    start_indices = np.where(diff == 1)[0]            
-    end_indices = np.where(diff == -1)[0] - 1               
-    segments = [(start, end) 
-               for start, end in zip(start_indices, end_indices) 
-               if end - start + 1 > min_length]
-    return segments
-def search_increasing_blocks(numbers, min_length=10, max_dif=10):
-
-    valid_indices = [(i, num) for i, num in enumerate(numbers) if num != -1]
-    if not len(valid_indices) > 1:
-        return []
-    blocks = []
-    start_idx, start_num = valid_indices[0]
-    prev_num = start_num
-    prev_idx = start_idx
-    for curr_idx, curr_num in valid_indices[1:]:
-        idx_diff = curr_idx - prev_idx
-        num_diff = curr_num - prev_num
-        if curr_num >= prev_num and abs(idx_diff - num_diff) < max_dif:
-            pass
-        else:
-            block_length = prev_idx - start_idx + 1
-            if block_length >= min_length:
-                blocks.append((start_num, prev_num))
-            start_idx, start_num = curr_idx, curr_num
-        prev_num = curr_num
-        prev_idx = curr_idx
-    block_length = curr_idx - start_idx + 1                
-    if block_length >= min_length:
-        blocks.append((start_num, curr_num))
-    return blocks
 def merge_intervals(intervals):
 
     if not intervals:
@@ -221,6 +178,8 @@ def merge_intervals(intervals):
             merged[-1][1] = max(merged[-1][1], interval[3])
             tuples[-1].append(interval[:2])
     return list(zip(merged, tuples))
+
+
 def build_coarse_grained_graph(DAGStru: DAGStru, edgeWeightDict):
 
     indegree_list = [0] * DAGStru.totalNodes                             
@@ -265,6 +224,8 @@ def build_coarse_grained_graph(DAGStru: DAGStru, edgeWeightDict):
             parent_path_id = tail_dict[father_node]
             linearPath_link[(parent_path_id, path_id)] = edgeWeightDict[(father_node, path_nodes[0])]
     return linearPath_list, linearPath_link, nodeID_linearPathID_Dict
+
+
 def build_subgraphStru(subLinkDict: dict[(int, int): int]):
 
     idDict = {}                                     
@@ -285,6 +246,7 @@ def build_subgraphStru(subLinkDict: dict[(int, int): int]):
     subGraphStru = DAGStru(len(idDict), links.keys())
     subGraphStru.calculateCoordinates()
     return subGraphStru, idDict
+
 def sanitize_path(path: str, path_type: str='output') -> Path:
 
     try:
@@ -306,178 +268,153 @@ def sanitize_path(path: str, path_type: str='output') -> Path:
         return clean_path
     except Exception as e:
         raise ValueError(f"路径处理失败 ({path_type}): {str(e)}") from e
-def calculate_column(column,length,positive,negative):
-    num_dict={}
-    sp_num=0
-    for i in column[1:]:
-        num_dict[i[0]]=len(i[1])
-        sp_num+=num_dict[i[0]]
-    if length-sp_num!=0:
-        num_dict[column[0]]=length-sp_num
-    if set(num_dict.keys())==set([0]):
-        return 0,0,0
-    for n in [n for n in num_dict.keys() if n > 4]:
+    
+
+def calculate_column(column_data, length, positive, negative):
+    """Helper function to calculate scores for a single column from zipped data."""
+    num_dict = {}
+    sp_num = 0
+    for i in column_data[1:]:
+        num_dict[i[0]] = len(i[1])
+        sp_num += num_dict[i[0]]
+    if length - sp_num != 0:
+        num_dict[column_data[0]] = length - sp_num
+
+    if set(num_dict.keys()) == {0}:
+        return 0, 0, 0, length 
+
+    for n in [k for k in num_dict.keys() if k > 4]:
         deg_base = degenerate_base_dict[n]
+        count_to_distribute = num_dict[n]
         for s in deg_base:
-            num_dict[s] = num_dict.get(s, 0) + num_dict[n] / len(deg_base)
+            num_dict[s] = num_dict.get(s, 0) + count_to_distribute / len(deg_base)
         del num_dict[n]
-    n_score = 0
-    p_score = 0
-    Klist = num_dict.keys()
-    doneset=set()
-    for n in Klist:
-        num = num_dict[n]
-        n_score += (num - 1) * num / 2 * negative[n][n]
-        p_score += (num - 1) * num / 2 * positive[n][n]
-        doneset.add(n)
-        for b in Klist-doneset:
-            bnum = num_dict[b]
-            n_score += num * bnum * negative[n][b]
-            p_score += num * bnum * positive[n][b]
+
+    n_score, p_score = 0, 0
+    Klist = list(num_dict.keys())
+    
+    for i in range(len(Klist)):
+        n1 = Klist[i]
+        num1 = num_dict[n1]
+        p_score += num1 * (num1 - 1) / 2 * positive[n1][n1]
+        n_score += num1 * (num1 - 1) / 2 * negative[n1][n1]
+        for j in range(i + 1, len(Klist)):
+            n2 = Klist[j]
+            num2 = num_dict[n2]
+            p_score += num1 * num2 * positive[n1][n2]
+            n_score += num1 * num2 * negative[n1][n2]
+
     entropy = 0
-    for n in Klist:
-        num = num_dict[n]
-        if num != 0:
+    for num in num_dict.values():
+        if num > 0:
             P = num / length
             entropy += -P * np.log(P)
-    return n_score,p_score,entropy
-def sp_entro_zip_loaded(zip_ali,positive,negative):
-    all_entropy = 0
+            
+    gap_count = num_dict.get(0, 0)
+    return n_score, p_score, entropy, gap_count
+
+def sp_entro_zip_loaded(zip_ali, positive, negative, gap_threshold=0.7):
+    """Processes a pre-loaded, zipped alignment format."""
+    total_entropy = 0
     negative_score = 0
-    positive_score=0
+    positive_score = 0
+    total_core_entropy = 0
+    num_core_columns = 0
+    
     sumnum = zip_ali[-1]
-    length = len(zip_ali)-1
+    length = len(zip_ali) - 1
+    if length == 0 or sumnum < 2:
+        return 0.0, 0.0, 0.0
+
     for i in range(length):
         column = zip_ali[i]
-        n_score,p_score,entropy = calculate_column(column,sumnum,positive,negative)
+        n_score, p_score, entropy, gap_count = calculate_column(column, sumnum, positive, negative)
+        
         negative_score += n_score
         positive_score += p_score
-        all_entropy += entropy
-    scaled_sp  = 2*(positive_score+negative_score)/(sumnum*(sumnum-1)*length)
-    return scaled_sp,all_entropy
-def sp_entro_zip(inpath,positive,negative):
+        total_entropy += entropy
+        
+        if (gap_count / sumnum) < gap_threshold:
+            num_core_columns += 1
+            total_core_entropy += entropy
+
+    scaled_sp = 2 * (positive_score + negative_score) / (sumnum * (sumnum - 1) * length)
+    average_core_entropy = total_core_entropy / num_core_columns if num_core_columns > 0 else 0.0
+    
+    return scaled_sp, total_entropy, average_core_entropy
+
+def sp_entro_zip(inpath,positive,negative, gap_threshold=0.7):
     Binpath = inpath
     zipaliandnamelist = np.load(Binpath,mmap_mode='r',allow_pickle=True)
     zip_ali = zipaliandnamelist['align'].tolist()
-    all_entropy = 0
+    total_entropy = 0
     negative_score = 0
-    positive_score=0
+    positive_score = 0
+    total_core_entropy = 0
+    num_core_columns = 0
+    
     sumnum = zip_ali[-1]
-    length = len(zip_ali)-1
+    length = len(zip_ali) - 1
+    if length == 0 or sumnum < 2:
+        return 0.0, 0.0, 0.0
+
     for i in range(length):
         column = zip_ali[i]
-        n_score,p_score,entropy = calculate_column(column,sumnum,positive,negative)
+        n_score, p_score, entropy, gap_count = calculate_column(column, sumnum, positive, negative)
+        
         negative_score += n_score
         positive_score += p_score
-        all_entropy += entropy
-    scaled_sp  = 2*(positive_score+negative_score)/(sumnum*(sumnum-1)*length)
-    return scaled_sp,all_entropy
-def save_fasta(gp_path,pc_name,save_path):
-    print(save_path+'result.fastaa')
-    draw_dict = {0:'-',1: 'A', 2: 'T', 3: 'C', 4: 'G', 5: 'R', 6: 'Y', 7: 'M', 8: 'K', 9: 'S', 10: 'W', 11: 'H', 12: 'B', 13: 'V', 14: 'D', 15: 'N'}
-    zipaliandnamelist = np.load(gp_path+'V_result/alizips/{}/zipalign.npz'.format(pc_name),allow_pickle=True)
-    zipali = zipaliandnamelist['align'].tolist()[:-1]
-    namelist = zipaliandnamelist['namelist']
-    ali_matrix = np.full((len(namelist),len(zipali)),0)
-    for index,ali in enumerate(zipali):
-        ali_matrix[:,index] = ali[0]
-        for base in ali[1:]:
-            ali_matrix[base[1],index] = base[0]
-    vectorized_draw_dict = np.vectorize(draw_dict.get)
-    string_matrix = vectorized_draw_dict(ali_matrix)
-    xs = np.arange(len(string_matrix))
-    seqlist = [SeqRecord(Seq(''.join(i)),id=namelist[idx],description='') for idx,i in tqdm(zip(xs,string_matrix))]
-    SeqIO.write(seqlist,save_path,'fasta')
-def save_fasta_with_ref(gp_path,pc_name,save_path):
-    draw_dict = {0:'-',1: 'A', 2: 'T', 3: 'C', 4: 'G', 5: 'R', 6: 'Y', 7: 'M', 8: 'K', 9: 'S', 10: 'W', 11: 'H', 12: 'B', 13: 'V', 14: 'D', 15: 'N'}
-    zipaliandnamelist = np.load(gp_path+'V_result/alizips/{}/zipalign.npz'.format(pc_name),allow_pickle=True)
-    zipali = zipaliandnamelist['align'].tolist()[:-1]
-    namelist = zipaliandnamelist['namelist'].tolist()
-    ali_matrix = np.full((len(namelist)+1,len(zipali)),0)
-    for index,ali in enumerate(zipali):
-        ali_matrix[:,index] = ali[0]
-        for base in ali[1:]:
-            ali_matrix[base[1]+1,index] = base[0]
-    vectorized_draw_dict = np.vectorize(draw_dict.get)
-    string_matrix = vectorized_draw_dict(ali_matrix)
-    xs = np.arange(len(string_matrix))
-    namelist.insert(0,'ref')
-    seqlist = [SeqRecord(Seq(''.join(i)),id=namelist[idx],description='') for idx,i in tqdm(zip(xs,string_matrix))]
-    SeqIO.write(seqlist,save_path,'fasta')
+        total_entropy += entropy
+        
+        if (gap_count / sumnum) < gap_threshold:
+            num_core_columns += 1
+            total_core_entropy += entropy
+
+    scaled_sp = 2 * (positive_score + negative_score) / (sumnum * (sumnum - 1) * length)
+    average_core_entropy = total_core_entropy / num_core_columns if num_core_columns > 0 else 0.0
+    
+    return scaled_sp, total_entropy, average_core_entropy
 
 
 def find_max_weight_combination(nested_list):
 
     n = len(nested_list)
-    if n == 0:
-        return (-1, [], [])
-
-    dp = {i: [] for i in range(n)}
-    
-    for i in range(n):
-        if not nested_list[i]:
-            continue
-        candidates = []
-        max_local = max(item[2] for item in nested_list[i]) if nested_list[i] else -1
-        for item in nested_list[i]:
-            if item[2] == max_local:
-                candidates.append((item[2], item[1], -1, item))
-        if candidates:
-            best = max(candidates, key=lambda x: (x[0], x[1]))
-            dp[i].append(best)
+    dp = [(-1, [-1] * n, [-1] * n) for _ in range(n)] 
 
     for i in range(n):
-        if not dp.get(i):
-            continue
-        for j in range(i):
-            if not dp.get(j):
-                continue
-            for state_j in dp[j]:
-                weight_j, last_coord_j, _, elem_j = state_j
-                for item in nested_list[i]:
-                    item_id, item_coord, item_weight = item
-                    if item_coord > last_coord_j:
-                        new_weight = weight_j + item_weight
-                        existing = [s for s in dp[i] if s[0] >= new_weight and s[1] >= item_coord]
-                        if not existing:
-                            dp[i].append((new_weight, item_coord, j, item))
-        if dp[i]:
-            dp[i].sort(key=lambda x: (-x[0], -x[1]))
-            filtered = []
-            max_weight = dp[i][0][0]
-            max_coord = dp[i][0][1]
-            for s in dp[i]:
-                if s[0] == max_weight and s[1] <= max_coord:
+        best_weight = 0
+        best_ids = [-1] * n
+        best_coords = [-1] * n
+        for current in nested_list[i]:
+            node_id, coord, weight = current
+
+
+            max_prev_weight = 0
+            best_prev_ids = [-1] * n
+            best_prev_coords = [-1] * n
+            for j in range(i):
+                prev_weight, prev_ids, prev_coords = dp[j]
+                if prev_weight == -1:
                     continue
-                if s[0] < max_weight and s[1] <= max_coord:
-                    continue
-                filtered.append(s)
-                if s[0] > max_weight:
-                    max_weight = s[0]
-                    max_coord = s[1]
-                elif s[0] == max_weight and s[1] > max_coord:
-                    max_coord = s[1]
-            dp[i] = filtered
+                last_coord = prev_coords[j]
+                if last_coord == -1 or last_coord < coord:
+                    if prev_weight > max_prev_weight:
+                        max_prev_weight = prev_weight
+                        best_prev_ids = prev_ids
+                        best_prev_coords = prev_coords
 
-    max_weight = -1
-    best_path = []
-    for i in range(n):
-        for state in dp.get(i, []):
-            if state[0] > max_weight or (state[0] == max_weight and state[1] > best_path[-1][1] if best_path else False):
-                max_weight = state[0]
-                path = []
-                current = state
-                while current is not None:
-                    path.append((i if current[2] == -1 else current[2], current[3]))
-                    prev_idx = current[2]
-                    current = dp[prev_idx][0] if prev_idx != -1 and dp[prev_idx] else None
-                best_path = list(reversed(path))
+            new_ids = best_prev_ids[:]
+            new_coords = best_prev_coords[:]
+            new_ids[i] = node_id
+            new_coords[i] = coord
+            total_weight = max_prev_weight + weight
 
-    result_ids = [-1] * n
-    result_coords = [-1] * n
-    for entry in best_path:
-        sub_idx, item = entry
-        result_ids[sub_idx] = item[0]
-        result_coords[sub_idx] = item[1]
+            if total_weight > best_weight:
+                best_weight = total_weight
+                best_ids = new_ids
+                best_coords = new_coords
 
-    return (max_weight if max_weight != -1 else -1, result_ids, result_coords)
+        dp[i] = (best_weight, best_ids, best_coords)
+
+    best_result = max(dp, key=lambda x: x[0])
+    return best_result[1], best_result[2]
