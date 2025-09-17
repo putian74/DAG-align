@@ -1,87 +1,106 @@
+# **DAPG-TPHMM: Accurate Multiple Sequence Alignment of Ultramassive Genome Sets**
 
-# Environment Configuration
+**DAPG-TPHMM** is a high-performance, high-accuracy multiple sequence alignment (MSA) tool designed to handle ultramassive genomic datasets containing millions of sequences. It leverages a novel pangenome graph structure (FTO-DAPG) and a Tiled Profile Hidden Markov Model (TPHMM) to achieve state-of-the-art accuracy with unprecedented speed and scalability.
 
-## 1. Create a new conda virtual environment with Python 3.9
+This software is the official implementation for the research paper: *"Accurate Multiple Sequence Alignment of Ultramassive Genome Sets"*.
 
-```bash
-conda create -n myenv python=3.9
+## **Features**
+
+* **High Accuracy**: Achieves alignment accuracy comparable to the gold-standard aligner, Muscle.  
+* **Massive Scalability**: Efficiently aligns millions of sequences by eliminating redundancy through a graph-based structure.  
+* **Parallel Processing**: Utilizes multi-threading for both graph construction and alignment stages to significantly accelerate computation.  
+* **Adaptive Parameter Selection**: Automatically analyzes input data to select optimal parameters (fragment\_length) for different levels of sequence diversity.  
+* **Large-Scale Mode**: A specialized mode (-l) with optimized presets for aligning massive datasets quickly.  
+* **Compressed Output**: Implements a novel compressed sparse alignment format (.npz) for efficient storage of massive alignment results.
+
+## **Installation**
+
+### **1\. Create a new conda virtual environment with Python 3.9**
+
+```
+conda create \-n myenv python=3.9
 ```
 
-## 2. Activate the environment
+### **2\. Activate the environment**
 
-```bash
+```
 conda activate myenv
 ```
 
-## 3. Install required dependencies
+### **3\. Unzip Application Files**
 
-```bash
-pip install -r requirements.txt
+```
+unzip DAPG\_TPHMM-main.zip \-d . 
 ```
 
-## 4. Unzip Application Files
+### **4\. Install required dependencies**
 
-```bash
-unzip DAPG_TPHMM-main.zip -d .
+Navigate into the unzipped directory containing requirements.txt and run:
+
+```
+pip install \-r requirements.txt
 ```
 
-# DAPG-TPHMM
+## **Usage**
 
-DAPG-TPHMM is used for FTO-DAPG construction and model training/alignment on the obtained FTO-DAPG.
+The main script is DAG\_Ali.py. Below are the command-line options and examples.
 
-## Usage
+### **Basic Command**
 
-```bash
-python DAPG_TPHMM/DAG_Ali.py -i [INPUT_FASTA] -o [OUTPUT_DIR] -f [FRAGMENT_LENGTH] -t [THREADS] -c [CHUNK_SIZE]
+```
+python3 DAG_Ali.py -i <input.fasta> -o <output_directory> -t <threads\>
 ```
 
-### Parameters
 
-| Parameter               | Description                                                                |
-| ----------------------- | -------------------------------------------------------------------------- |
-| `-i, --input`           | Path to input FASTA file containing all sequences (required)               |
-| `-o, --output`          | Output directory path to save results (required)                           |
-| `-f, --fragment_Length` | Fragment length for FTO-DAPG construction (default: 16, recommended:16~64) |
-| `-t, --threads`         | Number of parallel threads (default: 36)                                   |
-| `-c, --chunk_size`      | Sequence chunk size for splitting large datasets (default: 5000)           |
 
-### Output Results
-- **Scores**: Sum of pairs score and entropy for each of 6 MSAs are saved in `outputpath/report.txt`
-- **Alignments**: Alignment results (FASTA format) saved to `outputpath/bestEntropy.fasta` and `outputpath/bestSP.fasta`  
+### **Command-Line Arguments**
 
----
+| Argument | Short | Type | Default | Description |
+| :---- | :---- | :---- | :---- | :---- |
+| \--input | \-i | string | **Required** | Path to the input FASTA file. |
+| \--output | \-o | string | **Required** | Path to the directory where results will be saved. |
+| \--threads | \-t | integer | 36 | Number of parallel threads to use. |
+| \--large\_scale | \-l | flag | False | Enables Large-Scale Mode for massive datasets. Presets chunk\_size to 5000 and fragment\_length to 32 (unless otherwise specified) and skips pre-analysis for speed. |
+| \--fragment\_Length | \-f | integer | auto | Fragment length for building the DAPG. In standard mode, this is determined automatically based on k-mer diversity. In large-scale mode, it defaults to 32\. |
+| \--chunk\_size | \-c | integer | auto | The number of sequences per chunk for parallel processing. In standard mode, this is determined adaptively based on average sequence length. In large-scale mode, it defaults to 5000\. |
+| \--Onlybuild | \-b | flag | False | If specified, the program will only perform graph construction and will not proceed to the alignment stage. |
 
-## Workflow
-1. **Graph Construction**:
-   - Splits input FASTA file into **${chunk_size}-sequence subsets** using specified chunk size
-   - Builds a basic FTO-DAPG for each subset
-   - Merges these FTO-DAPGs into a full graph through iterative two-to-one merging
+### **Modes of Operation**
 
-2. **Training & Alignment**:
-   - DAPG-TPHMM training is performed on the full graph
-   - Graphs for all sequence and subsets saved in `outputpath/subgraphs/1` and `outputpath/Merging_graphs/
-   - Viterbi alignment is run on **20000-sequence subgraphs（default)**
-   - 6 sets of results from different super parameter combinations are saved in `outputpath/V_result/alizips/tr*/`where `*` ranges from 1 to 6, including:
-     - Column-compressed full MSA results saved in `alizip.npz`
+DAPG-TPHMM has two main operating modes tailored for different dataset sizes.
 
----
+#### **1\. Standard Mode (Default)**
 
-## Super Parameter Sets
-| Parameter Set | Parameter Initialization Methods | Global LW Threshold | Match Emission Smoothing Constant |
-| ------------- | -------------------------------- | ------------------- | --------------------------------- |
-| tr1           | Length First                     | 0.01                | exp(-3)                           |
-| tr2           | Length First                     | 0.01                | exp(-5)                           |
-| tr3           | Length First                     | 0.01                | exp(-7)                           |
-| tr4           | Weight First                     | 0.01                | exp(-3)                           |
-| tr5           | Weight First                     | 0.01                | exp(-5)                           |
-| tr6           | Weight First                     | 0.01                | exp(-7)                           |
+This is the default mode for datasets of moderate size. It performs a pre-analysis of the input sequences to determine the optimal fragment\_length and chunk\_size automatically, balancing speed and accuracy.
 
-*Note: Other parameters are initialized identically across all sets.*
+* **fragment\_length**: Set to 16 for highly diverse sequences (k-mer diversity \>= 0.9) and 32 otherwise.  
+* **chunk\_size**: Determined adaptively based on the average sequence length.
 
----
+**Example:**
 
-## Dataset Information
-- Genome IDs for the total genome dataset and SLSW/LLSW test sets are available in `Data.zip`
-- Files to check:
-  - Total dataset: `sequence_names.txt`
-  - S/LLSW test sets: `SLSW_?_5000.txt` or `LLSW_?_5000.txt` (where `?` ranges from 1 to 24)
+python3 DAG\_Ali.py \-i my\_sequences.fasta \-o ./results \-t 24
+
+#### **2\. Large-Scale Mode (-l)**
+
+This mode is specifically optimized for aligning massive datasets (e.g., \>100,000 sequences). When the \-l flag is used, the program skips the time-consuming pre-analysis and uses robust default parameters.
+
+* **fragment\_length**: Defaults to 32 (can be overridden with \-f).  
+* **chunk\_size**: Defaults to 5000 (can be overridden with \-c).
+
+**Example for a very large dataset:**
+
+python3 DAG\_Ali.py \-i viral\_sequences.fasta \-o ./align\_results \-t 36 \-l
+
+## **Output Structure**
+
+The program implements an adaptive output strategy based on the number of input sequences to balance convenience with storage efficiency.
+
+* **For datasets with 40,000 or fewer sequences:**  
+  * In addition to the compressed results, a standard FASTA file of the final alignment will be generated at \<output\_directory\>/align\_result.fasta.  
+* **For datasets with more than 40,000 sequences:**  
+  * To conserve disk space, the standard FASTA output is suppressed. The alignment results are saved *exclusively* in the compressed sparse format (.npz).  
+* **Dual Alignment Results & Selection:**  
+  * The software runs the alignment process twice with different initial parameters to find a better result. These two compressed alignments are saved in:  
+    * \<output\_directory\>/V\_result/alizips/tr0  
+    * \<output\_directory\>/V\_result/alizips/tr1  
+  * A report file is generated at \<output\_directory\>/report.txt. This file contains the final likelihood scores for both alignment runs. **Users should consult this file to select the alignment with the higher score for downstream analysis.**
