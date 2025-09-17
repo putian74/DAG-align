@@ -1,116 +1,240 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import os
+import sys
+import random
+import statistics
+import gc
+import copy
+import argparse
+import time
+from typing import List, Tuple, Optional, Set
+from itertools import combinations
+from multiprocessing import Process, Value, Manager, Lock, Queue, Pool, cpu_count
+
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from Bio import SeqIO
-import os
 import numpy as np
 from DAG_operator import *
 from DAG_Phmm import DAGPhmm
 from sqlite_master import sql_master
-import gc
-from queue import Empty
-import copy
-import argparse
-def add_noise_and_normalize(*log_probs, noise_low=0, noise_high=0):
-    if len(log_probs) == 0:
-        raise ValueError("At least one vector must be provided")
-    shapes = [p.shape for p in log_probs]
-    if len(set(shapes)) != 1:
-        raise ValueError("All vectors must be the same length")
-    log_probs_matrix = np.stack(log_probs, axis=0)
 
-    noise = np.random.uniform(noise_low, noise_high, log_probs_matrix.shape)
-    perturbed = log_probs_matrix + noise
-    
-    max_vals = np.max(perturbed, axis=0, keepdims=True) 
-    shifted = perturbed - max_vals    
-    exp_shifted = np.exp(shifted)
-    sum_exp = np.sum(exp_shifted, axis=0, keepdims=True)
-    log_sum_exp = np.log(sum_exp) + max_vals  
-    normalized = perturbed - log_sum_exp   
-    
-    return tuple(normalized[i] for i in range(len(log_probs)))
-def add_noise_and_normalize_matrix(log_probs_matrix: np.ndarray,noise_low: float = 0,noise_high: float = 0,axis: int = 0) -> np.ndarray:
 
-    if log_probs_matrix.ndim != 2:
-        raise ValueError("输入必须是二维矩阵")
-    if axis not in (0, 1):
-        raise ValueError("轴必须为 0（列）或 1（行）")
+
+def parse_fasta(fasta_path: str) -> List[Tuple[str, str]]:
+    """
+    A simple and fast FASTA file parser.
+
+    Args:
+        fasta_path: Path to the FASTA file.
+
+    Returns:
+        A list of tuples, where each tuple contains a header and its sequence.
+    """
+    sequences = []
+    header, sequence_parts = None, []
+    with open(fasta_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('>'):
+                if header:
+                    sequences.append((header, ''.join(sequence_parts)))
+                header = line
+                sequence_parts = []
+            else:
+                sequence_parts.append(line)
+    if header:
+        sequences.append((header, ''.join(sequence_parts)))
+    return sequences
+
+def print_x(start, step, allstep, current_stage="Sequence alignment is in progress"):
+    """Formats and prints a progress bar to the console."""
+    runtime = time.time() - start
+    percent = step / allstep
+    bar = ('#' * int(percent * 20)).ljust(20)
     
-    noise = np.random.uniform(
-        low=noise_low,
-        high=noise_high,
-        size=log_probs_matrix.shape
-    )
-    perturbed = log_probs_matrix + noise
+    hours, remainder = divmod(runtime, 3600)
+    mins, secs = divmod(remainder, 60)
+    time_format = '{:02d}:{:02d}:{:02d}'.format(int(hours), int(mins), int(secs))
+
+    sys.stdout.write(f'\r[{bar}] {percent * 100:.2f}%  ({time_format}) | Stage: {current_stage:<30}')
+    sys.stdout.flush()
+
+
+
+def _process_kmer_chunk(sequences_chunk: List[Tuple[str, str]], k_size: int) -> Tuple[int, Set[str]]:
+    """
+    Worker function for multiprocessing. Processes a chunk of sequences to find
+    total and unique k-mers. Must be a top-level function.
+    """
+    local_unique_kmers = set()
+    local_total_kmers = 0
+    for header, sequence in sequences_chunk:
+        if len(sequence) < k_size:
+            continue
+        
+        num_kmers_in_seq = len(sequence) - k_size + 1
+        local_total_kmers += num_kmers_in_seq
+        
+        for i in range(num_kmers_in_seq):
+            local_unique_kmers.add(sequence[i:i+k_size])
+            
+    return (local_total_kmers, local_unique_kmers)
+
+def calculate_kmer_diversity_ratio(fasta_path: str, sample_size: int = 10000, k_size: int = 21, threads: Optional[int] = None) -> Optional[float]:
+    """
+    Calculates the ratio of unique k-mers to total k-mers from a sample of sequences
+    using multiple processes to speed up the calculation.
+    """
+    if not os.path.exists(fasta_path):
+        print(f"Error: Input FASTA file not found at '{fasta_path}'", file=sys.stderr)
+        return None
+        
+    try:
+        all_sequences = parse_fasta(fasta_path)
+    except Exception as e:
+        print(f"Error parsing FASTA file: {e}", file=sys.stderr)
+        return None
+
+    if not all_sequences:
+        print("Warning: FASTA file is empty or could not be parsed.", file=sys.stderr)
+        return None
+
+    if len(all_sequences) > sample_size:
+        sampled_sequences = random.sample(all_sequences, sample_size)
+    else:
+        sampled_sequences = all_sequences
+
+    num_threads = threads if threads is not None else cpu_count() or 1
     
-    max_vals = np.max(perturbed, axis=axis, keepdims=True)
-    shifted = perturbed - max_vals
-    exp_shifted = np.exp(shifted)
-    sum_exp = np.sum(exp_shifted, axis=axis, keepdims=True)
-    log_sum_exp = np.log(sum_exp) + max_vals
-    normalized = perturbed - log_sum_exp
+    unique_kmers = set()
+    total_kmers = 0
+
+    if num_threads == 1 or len(sampled_sequences) < num_threads * 2:
+        total_kmers, unique_kmers = _process_kmer_chunk(sampled_sequences, k_size)
+    else:
+        chunk_size = (len(sampled_sequences) + num_threads - 1) // num_threads
+        chunks = [sampled_sequences[i:i + chunk_size] for i in range(0, len(sampled_sequences), chunk_size)]
+        pool_args = [(chunk, k_size) for chunk in chunks]
+
+        with Pool(processes=num_threads) as pool:
+            results = pool.starmap(_process_kmer_chunk, pool_args)
+
+        total_kmers = sum(res[0] for res in results)
+        unique_kmers = set().union(*(res[1] for res in results))
+
+    if total_kmers == 0:
+        return 0.0
+
+    ratio = len(unique_kmers) / total_kmers
+    return ratio
+
+def sequence_to_kmers(sequence: str, k: int) -> Set[str]:
+    """Converts a DNA sequence into a set of its k-mers."""
+    if len(sequence) < k:
+        return set()
+    return {sequence[i:i+k] for i in range(len(sequence) - k + 1)}
+
+def calculate_jaccard_similarity(set1: Set[str], set2: Set[str]) -> float:
+    """Calculates the Jaccard similarity between two sets of k-mers."""
+    if not set1 and not set2: return 1.0
+    if not set1 or not set2: return 0.0
+    return len(set1.intersection(set2)) / len(set1.union(set2))
+
+def _calculate_jaccard_similarity_pair(pair: Tuple[Set[str], Set[str]]) -> float:
+    """Helper function for multiprocessing.Pool.map."""
+    return calculate_jaccard_similarity(pair[0], pair[1])
+
+def estimate_average_similarity(
+    fasta_path: str, num_samples: int = 5, sample_size: int = 1000,
+    threads: Optional[int] = None, k_size: int = 21
+) -> Optional[float]:
+    """Estimates the average pairwise sequence similarity using a k-mer based Jaccard index."""
+    if not os.path.exists(fasta_path):
+        print(f"Error: Input FASTA file not found at '{fasta_path}'", file=sys.stderr)
+        return None
+
+    try: all_sequences = parse_fasta(fasta_path)
+    except Exception as e:
+        print(f"Error parsing FASTA file: {e}", file=sys.stderr)
+        return None
+        
+    total_seq_count = len(all_sequences)
+    if total_seq_count < 2: return 1.0
     
-    return normalized
+    actual_sample_size = min(sample_size, total_seq_count)
+    sample_avg_similarities = []
+    num_threads = threads if threads is not None else cpu_count() or 1
+    print(f"Starting similarity estimation with {num_samples} samples of size {actual_sample_size} using {num_threads} threads...")
+
+    for i in range(num_samples):
+        print(f"  - Processing sample {i + 1}/{num_samples}...")
+        sampled_sequences = random.sample(all_sequences, actual_sample_size) if actual_sample_size < total_seq_count else all_sequences
+        kmer_sets = [sequence_to_kmers(seq, k_size) for _, seq in sampled_sequences]
+        pairs = list(combinations(kmer_sets, 2))
+        
+        if not pairs: sample_avg = 1.0
+        else:
+            if num_threads > 1 and len(pairs) > 1000:
+                with Pool(processes=num_threads) as pool:
+                    pairwise_similarities = pool.map(_calculate_jaccard_similarity_pair, pairs)
+            else:
+                pairwise_similarities = [_calculate_jaccard_similarity_pair(p) for p in pairs]
+            sample_avg = statistics.mean(pairwise_similarities)
+        sample_avg_similarities.append(sample_avg)
+
+    if not sample_avg_similarities: return None
+    return statistics.mean(sample_avg_similarities)
+
+
+
 
 def ini_paras(Ref_seq, emProbMatrix,insertRanges, ME, MD, MI, II, DM, pi_MID, outpath, parasName,perturbation=(0,0)):
 
-    assert np.exp(MD) + np.exp(MI) < 1.0 - 1e-6, "MD+MI概率超过有效范围"
-    assert np.exp(II) < 1.0 - 1e-6, "II概率无效"
-    assert np.exp(DM) < 1.0 - 1e-6, "DM概率无效"
-    assert emProbMatrix.shape[0] == 4, "发射概率矩阵维度错误"
-    assert emProbMatrix.shape[1] == len(Ref_seq), "发射概率长度与参考序列不匹配"
-    
-    assert np.sum(pi_MID) > 1e-6, "初始概率和不能为0"
-    
-    n_positions = len(Ref_seq) + 1 
-    pi_sum = np.sum(pi_MID)
+    assert np.exp(MD) + np.exp(MI) < 1.0 - 1e-6, "The probability of MD+MI exceeds the valid range"
+    assert np.exp(II) < 1.0 - 1e-6, "II probability invalid"
+    assert np.exp(DM) < 1.0 - 1e-6, "DM probability invalid"
+    assert emProbMatrix.shape[0] == 4, "Dimension error in emission probability matrix"
+    assert emProbMatrix.shape[1] == len(Ref_seq), "The length of the emission probability does not match the reference sequence"
+        
+    n_positions = len(Ref_seq) + 1  
+    pi_sum = np.sum(pi_MID)      
 
-    mm_base = np.log(1 - np.exp(MD) - np.exp(MI)) 
-    im_base = np.log(1 - np.exp(II))    
-    dd_base = np.log(1 - np.exp(DM))  
+    mm_base = np.log(1 - np.exp(MD) - np.exp(MI))  
+    im_base = np.log(1 - np.exp(II))           
+    dd_base = np.log(1 - np.exp(DM)) 
 
-
-    _mi = np.full(n_positions, MI, dtype=np.float64) 
-    _md = np.full(n_positions, MD, dtype=np.float64)   
+    _mi = np.full(n_positions, MI, dtype=np.float64)    
+    _md = np.full(n_positions, MD, dtype=np.float64)    
     _mm = np.full(n_positions, mm_base, dtype=np.float64) 
     hight_MI = np.logaddexp2(MI,np.log(0.1))
     for rg in insertRanges:
         for i in range(rg[0],rg[1]):
             _mi[i]=hight_MI
 
-    _mi,_md,_mm = add_noise_and_normalize(_mi,_md,_mm,noise_low=perturbation[0],noise_high=perturbation[1])
-    _mi[0] = np.log(pi_MID[1]/pi_sum)
-    _md[0] = np.log(pi_MID[2]/pi_sum) 
-    _mm[0] = np.log(pi_MID[0]/pi_sum)
+    _mi[0] = np.log(pi_MID[1]/pi_sum)  
+    _md[0] = np.log(pi_MID[2]/pi_sum)  
+    _mm[0] = np.log(pi_MID[0]/pi_sum) 
 
-    _mm[-1] = ME      
+    _mm[-1] = ME           
     _mi[-1] = np.log(1 - np.exp(ME))  
 
-    _mm[-1],_mi[-1] = add_noise_and_normalize(_mm[-1],_mi[-1],noise_low=perturbation[0],noise_high=perturbation[1])
-
-    _ii = np.full(n_positions, II, dtype=np.float64) 
+    _ii = np.full(n_positions, II, dtype=np.float64)  
     _im = np.full(n_positions, im_base, dtype=np.float64)  
     _id = np.full(n_positions, -np.inf, dtype=np.float64)  
 
-    _ii,_im,_id = add_noise_and_normalize(_ii,_im,_id,noise_low=perturbation[0],noise_high=perturbation[1])
-
-    _dm = np.full(n_positions, DM, dtype=np.float64) 
+    _dm = np.full(n_positions, DM, dtype=np.float64)  
     _dd = np.full(n_positions, dd_base, dtype=np.float64)  
     _di = np.full(n_positions, -np.inf, dtype=np.float64)  
-
-    _dm,_dd = add_noise_and_normalize(_dm,_dd,noise_low=perturbation[0],noise_high=perturbation[1])
 
     _dm[0] = _dd[0] = _dd[-1] = -np.inf  
     _dm[-1] = 0  
 
-
-
     _em = np.log(emProbMatrix.T + 1e-16)  
-    _em = add_noise_and_normalize_matrix(_em,axis=1)
-    print(_em)
-    _ei = np.full((_em.shape[0]+1, _em.shape[1]), np.log(0.25), dtype=np.float64) 
+    _ei = np.full((_em.shape[0]+1, _em.shape[1]), np.log(0.25), dtype=np.float64)  
 
     parameterDict = {
         "_mm": _mm, "_md": _md, "_mi": _mi,
@@ -122,9 +246,9 @@ def ini_paras(Ref_seq, emProbMatrix,insertRanges, ME, MD, MI, II, DM, pi_MID, ou
     np.save(outpath/"ini/init_{}.npy".format(parasName), parameterDict)
 
 
-def ref_graph_build(graph_path, thr=0.01,type=True, MissMatchScore=-5):
-    
-    ref_dict = np.load(graph_path/'thr_{}_{}.npz'.format(thr,type))
+def ref_graph_build(graph_path, thr=0.01, MissMatchScore=-5):
+
+    ref_dict = np.load(graph_path/'thr_{}.npz'.format(thr))
 
     ref_seq = str(ref_dict['ref_seq'])
     ref_node_list = list(ref_dict['ref_node_list'])
@@ -137,705 +261,128 @@ def ref_graph_build(graph_path, thr=0.01,type=True, MissMatchScore=-5):
     emProbMatrix = emProbMatrix / sum_of_emProbMatrix
     pi_MID = [1, 1, 1]
     return ref_seq, ref_node_list, emProbMatrix, pi_MID,insertRanges
-def ali_local(train_DAG_Path, Viterbi_DAG_Path, Viterbi_result_path,  seqiddb, outpath, hyperParameterList, threads,fit=True):
-    hyperParameterDict = dict(hyperParameterList)
-    for index in hyperParameterDict.keys():            
-        parasName = 'tr{}'.format(index)                  
-        outlog = open(outpath/'train_and_viterbi_{}.log'.format(parasName), 'w')
-        sys.stdout = outlog                
-        sys.stderr = outlog                
-        modifyDict = {}               
-        modifyDict['init_type'] = hyperParameterDict[index][1]
-        modifyDict['emProbAdds_Match'] = hyperParameterDict[index][2]           
-        modifyDict['emProbAdds_Match_head'] = modifyDict['emProbAdds_Match']            
-        modifyDict['emProbAdds_Match_tail'] = modifyDict['emProbAdds_Match']            
-        modifyDict['random'] = hyperParameterDict[index][3]
-        modifyDict['init_M2D'] = -2                        
-        modifyDict['init_M2I'] = -5                        
-        modifyDict['init_I2I'] = np.log(1/2)              
-        modifyDict['init_D2M'] = np.log(1/2)                    
-        modifyDict['init_M2End'] = np.log(1/2)            
-        modifyDict['weight_thr'] = hyperParameterDict[index][0]           
-        modifyDict['head_length'] = 50              
-        modifyDict['tail_length'] = 50          
-        modifyDict['trProbAdds_mm'] = -3                      
-        modifyDict['trProbAdds_md'] = -5                       
-        modifyDict['trProbAdds_mi'] = -50                      
-        modifyDict['trProbAdds_PiM'] = -1                 
-        modifyDict['trProbAdds_PiI'] = -1                  
-        modifyDict['trProbAdds_PiD'] = -1                  
-        modifyDict['trProbAdds_im'] = -1                       
-        modifyDict['trProbAdds_ii'] = -1                 
-        modifyDict['trProbAdds_iend'] = -1                 
-        modifyDict['trProbAdds_ii_tail'] = -1               
-        modifyDict['trProbAdds_mend'] = -10                
-        modifyDict['trProbAdds_mi_tail'] = -10                   
-        np.save(train_DAG_Path/'ini/{}_modifydict.npy'.format(parasName), modifyDict)
-        windows_length = 100            
-        ref_seq, ref_node_list, emProbMatrix, pi_MID,insertRanges = ref_graph_build(
-            outpath, thr=modifyDict['weight_thr'],
-            MissMatchScore=modifyDict['emProbAdds_Match'],type=modifyDict['init_type']
-        )
-        ini_paras(ref_seq, emProbMatrix,insertRanges,
-               modifyDict['init_M2End'], modifyDict['init_M2D'],
-               modifyDict['init_M2I'], modifyDict['init_I2I'],
-               modifyDict['init_D2M'], pi_MID,
-               train_DAG_Path, parasName,modifyDict['random'])
-        parameter_path = train_DAG_Path/"ini/init_{}.npy".format(parasName)
-        ph = DAGPhmm(train_DAG_Path, train_DAG_Path, parasName,
-                    parameter_path=parameter_path)
-        if fit:
-            ph.init_train_data(train_DAG_Path,ref_node_list,ref_seq,modifyDict,True,windows_length, threads//2)
-            ph.fit()
-        ph.init_viterbi_data(Viterbi_DAG_Path, Viterbi_result_path/'alizips/',
-                            ref_node_list, ref_seq,
-                            windows_length=windows_length, threads=threads)
-        os.makedirs(Viterbi_result_path/'alizips'/'{}'.format(parasName),exist_ok=True)
-        np.save(Viterbi_result_path/'alizips'/'{}/modifydict.npy'.format(parasName), modifyDict)
-        ph.Viterbi(seqiddb)
-        ph.state_to_aligment(seqiddb)
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
+
 def train(DAG,Viterbi_result_path, finalGraphPath, train_DAG_Path, hyperParameterDict,lock,start=None,taskNum=None,allstep=None, threads=3,fit=True):
     hyperParameterDict = dict(hyperParameterDict)
     for index in hyperParameterDict.keys():            
-        parasName = 'tr{}'.format(index)                  
-        modifyDict = {}               
-        modifyDict['init_type'] = hyperParameterDict[index][1]
-        modifyDict['emProbAdds_Match'] = hyperParameterDict[index][2]           
+        parasName = 'tr{}'.format(index)               
+        modifyDict = {}           
+        modifyDict['emProbAdds_Match'] = hyperParameterDict[index][1]          
         modifyDict['emProbAdds_Match_head'] = modifyDict['emProbAdds_Match']            
         modifyDict['emProbAdds_Match_tail'] = modifyDict['emProbAdds_Match']            
-        modifyDict['random'] = hyperParameterDict[index][3]
-        modifyDict['init_M2D'] = -2                       
-        modifyDict['init_M2I'] = -5                      
-        modifyDict['init_I2I'] = np.log(1/2)              
-        modifyDict['init_D2M'] = np.log(1/2)                    
-        modifyDict['init_M2End'] = np.log(1/2)            
-        modifyDict['weight_thr'] = hyperParameterDict[index][0]           
-        modifyDict['head_length'] = 50              
-        modifyDict['tail_length'] = 50          
-        modifyDict['trProbAdds_mm'] = -3                      
-        modifyDict['trProbAdds_md'] = -5                       
-        modifyDict['trProbAdds_mi'] = -50                      
-        modifyDict['trProbAdds_PiM'] = -1                 
-        modifyDict['trProbAdds_PiI'] = -1                  
-        modifyDict['trProbAdds_PiD'] = -1                  
-        modifyDict['trProbAdds_im'] = -1                       
-        modifyDict['trProbAdds_ii'] = -1                 
-        modifyDict['trProbAdds_iend'] = -1                 
-        modifyDict['trProbAdds_ii_tail'] = -1               
-        modifyDict['trProbAdds_mend'] = -10                
-        modifyDict['trProbAdds_mi_tail'] = -10                   
+        modifyDict['random'] = hyperParameterDict[index][2]
+        modifyDict['init_M2D'] = -2                  
+        modifyDict['init_M2I'] = -5                 
+        modifyDict['init_I2I'] = np.log(1/2)           
+        modifyDict['init_D2M'] = np.log(1/2)                 
+        modifyDict['init_M2End'] = np.log(1/2)          
+        modifyDict['weight_thr'] = hyperParameterDict[index][0]         
+        modifyDict['head_length'] = 50             
+        modifyDict['tail_length'] = 50        
+        modifyDict['trProbAdds_mm'] = -3                   
+        modifyDict['trProbAdds_md'] = -4                   
+        modifyDict['trProbAdds_mi'] = -50                   
+        modifyDict['trProbAdds_PiM'] = -1            
+        modifyDict['trProbAdds_PiI'] = -1             
+        modifyDict['trProbAdds_PiD'] = -1             
+        modifyDict['trProbAdds_im'] = -1                   
+        modifyDict['trProbAdds_ii'] = -1          
+        modifyDict['trProbAdds_iend'] = -1           
+        modifyDict['trProbAdds_ii_tail'] = -1             
+        modifyDict['trProbAdds_mend'] = -10            
+        modifyDict['trProbAdds_mi_tail'] = -10              
         np.save(train_DAG_Path/'ini/{}_modifydict.npy'.format(parasName), modifyDict)
         outlog = open(Viterbi_result_path/'train_{}.log'.format(parasName), 'w')
-        sys.stdout = outlog                  
-        sys.stderr = outlog             
-        windows_length = 100              
+        sys.stdout = outlog               
+        sys.stderr = outlog         
+        windows_length = 100               
         ref_seq, ref_node_list, emProbMatrix, pi_MID,insertRanges = ref_graph_build(
             finalGraphPath,
-            thr=modifyDict['weight_thr'],             
-            MissMatchScore=modifyDict['emProbAdds_Match'],type=modifyDict['init_type']           
+            thr=modifyDict['weight_thr'],         
+            MissMatchScore=modifyDict['emProbAdds_Match']         
         )
         ini_paras(
-            ref_seq,            
-            emProbMatrix,          
+            ref_seq,        
+            emProbMatrix,         
             insertRanges,
-            modifyDict['init_M2End'],        
-            modifyDict['init_M2D'],             
-            modifyDict['init_M2I'],             
-            modifyDict['init_I2I'],           
-            modifyDict['init_D2M'],             
-            pi_MID,          
-            train_DAG_Path,           
-            parasName,           
+            modifyDict['init_M2End'],    
+            modifyDict['init_M2D'],          
+            modifyDict['init_M2I'],          
+            modifyDict['init_I2I'],        
+            modifyDict['init_D2M'],          
+            pi_MID,         
+            train_DAG_Path,         
+            parasName,         
             modifyDict['random']
         )
         parameter_path = train_DAG_Path/"ini/init_{}.npy".format(parasName)
         ph = DAGPhmm(
-            train_DAG_Path,              
-            train_DAG_Path,                
-            parasName,           
-            parameter_path=parameter_path           
+            train_DAG_Path,               
+            train_DAG_Path,                 
+            parasName,          
+            parameter_path=parameter_path         
         )
         if fit:
-            ph.init_train_data_with_DAG(train_DAG_Path,ref_node_list,ref_seq,modifyDict,copy.copy(DAG),True,windows_length, threads)
+            ph.init_train_data_with_DAG(train_DAG_Path,ref_node_list,ref_seq,modifyDict,copy.deepcopy(DAG),True,windows_length, threads)
             
             ph.fit()
-        sys.stdout = sys.__stdout__          
-        sys.stderr = sys.__stderr__          
+        sys.stdout = sys.__stdout__         
+        sys.stderr = sys.__stderr__         
         if not taskNum is None:
             lock.acquire()
             taskNum.value+=1
-            print_x(start,taskNum.value,allstep,'Training ...')
+            print_x(start,taskNum.value,allstep,'Training alignment model')
             lock.release()
-def viterbi(train_DAG_Path, Viterbi_DAG_Path, Viterbi_result_path, parasName, seqiddb, ref_seq, ref_node_list,DAG,coarseDAGinfo,coarseDAG, threads=3,fit=True):
+
+def write_report(sp_and_entropy, outpath):
+    sp_list = [item[0] for item in sp_and_entropy]
+    entropy_list = [item[1] for item in sp_and_entropy]
     
-    windows_length = 100                 
-    train_times = 1               
-    while True:             
-        checkpoint_path = train_DAG_Path/'ini/{}_pc_{}.npy'.format(parasName, train_times)
-        if not os.path.exists(checkpoint_path):
-            break                   
-        parameter_path = checkpoint_path
-        train_times += 1            
-    if train_times == 1 or not fit:
-        checkpoint_path = train_DAG_Path/'ini/init_{}.npy'.format(parasName)
-        parameter_path = checkpoint_path
-    ph = DAGPhmm(
-        train_DAG_Path,                    
-        Viterbi_DAG_Path,                   
-        parasName,                   
-        parameter_path=parameter_path             
-    )
-
-    ph.init_viterbi_data_withDAG(
-        Viterbi_DAG_Path,                    
-        Viterbi_result_path,               
-        ref_node_list,                       
-        ref_seq,DAG=DAG,
-        coarseDAGinfo=coarseDAGinfo,
-        coarseDAG=coarseDAG,                         
-        windows_length=windows_length,          
-        threads=threads                
-    )
-    ph.Viterbi(seqiddb)             
-    ph.state_to_aligment(seqiddb)
-    del ph
-    gc.collect()            
-def save_ref_node(graphPath,graph, thrs, save_ref_onm=False):
+    bestsp_idx = np.argmax(sp_list)
+    besten_idx = np.argmin(entropy_list)
     
-    try:
-        no_degenerate_edgeDict,pureNodes = graph.noDegenerateGraph()
-    except:
-        no_degenerate_edgeDict,pureNodes = graph.edgeWeightDict,set(np.arange(graph.totalNodes))
-    if save_ref_onm:
-        ori_node_list = np.load(graphPath/'onm.npy', allow_pickle=True)          
-        ori_node_index = np.load(graphPath/'onm_index.npy', allow_pickle=True)      
-    for thr in thrs:
-        old_init_type = True
-        _ref_seq, _ref_node_list, _emProbMatrix,_insertrgs = graph.convertToAliReferenceDAG(pureNodes,thr)
-        np.savez(
-            graphPath/'thr_{}_{}.npz'.format(thr,old_init_type),
-            ref_seq=_ref_seq,
-            ref_node_list=_ref_node_list,
-            emProbMatrix=_emProbMatrix,
-            insert_range=_insertrgs
-        )
-        if save_ref_onm:
-            ref_onm_list = []
-            for node in _ref_node_list:             
-                start_idx, end_idx = ori_node_index[node]
-                ref_onm_list.append(ori_node_list[start_idx:end_idx])
-            np.save(
-                graphPath/'ref_onm_list_{}_{}.npy'.format(thr,old_init_type),
-                np.array(ref_onm_list, dtype=object)            
-            )
-            np.save(graphPath/'refseq_{}_{}.npy'.format(thr,old_init_type), _ref_seq)
+    header = [' ', 'sp score', 'entropy', 'best entropy', 'best sp score', 'alignment length']
+    data_rows = [header]
     
-        old_init_type = False
-        _ref_seq, _ref_node_list, _emProbMatrix,_insertrgs = graph.convertToAliReferenceDAG_new(no_degenerate_edgeDict,pureNodes,thr)
-        np.savez(
-            graphPath/'thr_{}_{}.npz'.format(thr,old_init_type),
-            ref_seq=_ref_seq,
-            ref_node_list=_ref_node_list,
-            emProbMatrix=_emProbMatrix,
-            insert_range=_insertrgs
-        )
-        if save_ref_onm:      
-            ref_onm_list = []
-            for node in _ref_node_list:             
-                start_idx, end_idx = ori_node_index[node]
-                ref_onm_list.append(ori_node_list[start_idx:end_idx])
-            np.save(
-                graphPath/'ref_onm_list_{}_{}.npy'.format(thr,old_init_type),
-                np.array(ref_onm_list, dtype=object)            
-            )
-            np.save(graphPath/'refseq_{}_{}.npy'.format(thr,old_init_type), _ref_seq)
-    
-    
-def lookup_mapped_reference_nodes(Viterbi_DAG_Path, ref_nodelist, ref_seq):
-
-    graph = load_DAG(Viterbi_DAG_Path, load_onmfile=True)
-    viterbi_reflist = []
-    w_length = graph.fragmentLength              
-    w_num = len(ref_seq) - graph.fragmentLength + 1              
-    coor_list = []                 
-    lastcoor = 0                     
-    check_flag = 0           
-    for idx in range(w_num):
-        m_mode = ref_nodelist[idx + graph.fragmentLength - 1]  
-        seq = ref_seq[idx:idx + w_length]  
-        ori_nodes = graph.fragmentNodeDict.get(seq, [])  
-        refnode = -1         
-        for node in ori_nodes:
-            if set(graph.SourceList[node]) & set(m_mode):
-                refnode = node
-                break           
-        if refnode != -1:
-            viterbi_reflist.append(refnode)
-            current_coor = graph.queryGraph.coordinateList[refnode]
-            coor_list.append(current_coor)
-            if current_coor <= lastcoor:
-                check_flag = 1            
-            lastcoor = current_coor          
-        else:
-            viterbi_reflist.append(-1)
-            coor_list.append(-1)
-    if check_flag == 1:
-        Block_list, weights, Block_dif = array_to_block(coor_list)
-        cprg = remove_points_to_increase(Block_list, weights)
-        for rg in cprg:
-            st, ed = rg[0][1], rg[1][1] + 1
-            for i in range(st, ed):
-                viterbi_reflist[i] = -1
-                coor_list[i] = -1
-    return viterbi_reflist
-def lookup_mapped_reference_batch(hierarchy,set_name,pathlist,ref_onm_list,ref_seq,thr,old_init_type=True):
-
-    for outpath in pathlist:
-        new_reflist = lookup_mapped_reference_nodes(outpath,ref_onm_list,ref_seq)
-        np.save(outpath/'local_ref_nodelist_{}_{}_{}_{}.npy'.format(hierarchy,set_name,thr,old_init_type),new_reflist)
-def find_global_ref(outpath,hierarchy,set_name,train_ref_Path,thr,subgraph_num,v_hierarchy,threads,old_init_type=True):
-
-    a = subgraph_num                
-    b = 2**v_hierarchy                    
-    min_num = (a // b) + (1 if a % b != 0 else 0)             
-    subGraphidstart = (set_name-1)*(2**(hierarchy-v_hierarchy))+1          
-    subGraphend = min(set_name*(2**(hierarchy-v_hierarchy))+1, min_num+1)          
-    ref_onm_list = np.load(train_ref_Path/'ref_onm_list_{}_{}.npy'.format(thr,old_init_type), allow_pickle=True)              
-    ref_seq = str(np.load(train_ref_Path/'refseq_{}_{}.npy'.format(thr,old_init_type)))
-    if v_hierarchy==0:
-        subGraphPathList = [train_ref_Path]
-    else:
-        subGraphPathList = []
-        for graph_name in range(int(subGraphidstart), int(subGraphend)):
-            subGraphPathList.append(outpath/"Merging_graphs/merge_{}/{}/".format(v_hierarchy, graph_name))
-    processlist = []
-    pool_num = min(threads, (subGraphend - subGraphidstart))
-    for idx in range(pool_num):
-        processlist.append(Process(
-            target=lookup_mapped_reference_batch,
-            args=(hierarchy, set_name, subGraphPathList[idx::pool_num], ref_onm_list, ref_seq, thr,old_init_type, )
-        ))
-    [p.start() for p in processlist]
-    [p.join() for p in processlist]
-
-def print_x(start, step, allstep, current_stage="Sequence alignment is in progress"):
-
-    runtime = time.time() - start
-    percent = step / allstep
-    bar = ('#' * int(percent * 20)).ljust(20)
-    
-    hours, remainder = divmod(runtime, 3600)
-    mins, secs = divmod(remainder, 60)
-    time_format = '{:02d}:{:02d}:{:02d}'.format(int(hours), int(mins), int(secs))
-
-    sys.stdout.write(f'\r[{bar}] {percent * 100:.2f}%  ({time_format}) | Stage: {current_stage:<30}')
-    sys.stdout.flush()
-
-def train_and_subViterbi(hierarchy, set_name, finalGraphPath, outpath, subgraph_num,threads=3, fit=True):
-
-    thrs = [0.01]
-    Matchs = [-3,-5,-7]  
-    Randoms = [(0,0)]
-    finalGraphPath = sanitize_path(finalGraphPath, 'input') 
-    outpath = sanitize_path(outpath, 'output')  
-    start = time.time()
-    Viterbi_result_path = outpath / 'V_result'
-    if not os.path.exists(Viterbi_result_path):
-        os.mkdir(Viterbi_result_path)
-    train_DAG_Path = finalGraphPath
-    os.makedirs(train_DAG_Path / 'ini', exist_ok=True)
-    taskNum = Value('i',0)
-    v_hierarchy = min(hierarchy,2)
-    a = subgraph_num
-    b = 2 ** v_hierarchy
-    min_num = (a // b) + (1 if a % b != 0 else 0) 
-    subgraphList = list(range(
-        (set_name-1) * (2 ** (hierarchy - v_hierarchy)) + 1,
-        min(min_num+1, set_name * (2 ** (hierarchy - v_hierarchy)) + 1)
-    ))
-    allstep=4
-    allstep+=2*len(thrs)
-    allstep+=2*len(thrs)*len(Matchs)*len(Randoms)
-    allstep+=len(Randoms)*len(subgraphList)
-
-    print_x(start, taskNum.value, allstep,'Extracting parameters(Length First) ...')
-    lock = Manager().Lock()
-    
-    paraNames=[]
-    hyperParameterDict = {}
-    idx=0
-    filtered_files = []
-
-    graph = load_DAG(finalGraphPath)
-    graph.SourceList = [ [nodeid] for nodeid in range(graph.totalNodes)]
-    graph.fragmentReduce()
-
-    save_ref_node(finalGraphPath,graph, thrs, save_ref_onm=True)
-    for thr in thrs:
+    for i, item in enumerate(sp_and_entropy):
+        is_best_sp = '*' if i == bestsp_idx else ''
+        is_best_en = '*' if i == besten_idx else ''
         
-        find_global_ref(outpath, hierarchy, set_name, finalGraphPath, thr, 
-                    subgraph_num, v_hierarchy, threads,old_init_type=True)
-        filtered_files.append('thr_{}_{}'.format(thr,True))
-        taskNum.value += 1
-        print_x(start, taskNum.value, allstep,'Extracting parameters(Weight First) ...')
-
-    for thr in thrs:
-        find_global_ref(outpath, hierarchy, set_name, finalGraphPath, thr, 
-                    subgraph_num, v_hierarchy, threads,old_init_type=False)
-        filtered_files.append('thr_{}_{}'.format(thr,False))
-        taskNum.value += 1
-        print_x(start, taskNum.value, allstep,'Training ...                           ')
-
-
-    for f in filtered_files:
-        datas = f.split('_')
-        thr = float(datas[1])
-        type = str(datas[2])
-        for m in Matchs:
-            for rdm in Randoms:
-                hyperParameterDict[idx] = (thr,type,m,rdm)
-                paraNames.append('tr{}'.format(idx))
-                idx+=1
-    hyperParameterList = list(hyperParameterDict.items())
-    taskList = Queue()
-    os.makedirs(Viterbi_result_path/'alizips/Logs',exist_ok=True)
-    for subGid in subgraphList:
-        taskList.put([subGid])
-        for para in paraNames:
-            os.makedirs(Viterbi_result_path/'alizips/{}'.format(para),exist_ok=True)
-    gc.collect()
-    if subgraph_num>400:
-        train_threads = 1
-    else:
-        train_threads = threads
-    graph.SourceList = [ set(nodeids) for nodeids in graph.SourceList]
-    processlist = []
-    pool_num = min(6,train_threads)
-    for pid in range(pool_num):
-        processlist.append(Process(target=train, args=(graph,
-            Viterbi_result_path, finalGraphPath, train_DAG_Path,
-            hyperParameterList[pid::pool_num],lock,start,taskNum,allstep, threads//pool_num,fit, )))
-    [p.start() for p in processlist]
-    [p.join() for p in processlist]
-    del graph
-    gc.collect()
-
-    taskNum.value += 1
-    print_x(start, taskNum.value, allstep,'Viterbi in subgraph ...               ')
-    processlist = []
-    pool_num = min(20,threads//4)
-    for idx in range(pool_num):
-        processlist.append(Process(target=viterbi_subgraph, args=(
-            v_hierarchy, subgraph_num, finalGraphPath, outpath, train_DAG_Path,
-            hierarchy, set_name, Viterbi_result_path, taskList,paraNames,start,taskNum,allstep, lock, 4,fit,  
-        )))                   
-    [p.start() for p in processlist]
-    [p.join() for p in processlist]
-    gc.collect()
-    taskNum.value += 1
-    print_x(start, taskNum.value, allstep,'Mergeing results ...                 ')
-
-    sp_and_entropy = Manager().list()                  
-    pool_num = min(6,threads)                  
-    processlist = []
-    for pid in range(pool_num):
-        processlist.append(Process(target=merge_zipali, args=(
-            outpath, Viterbi_result_path, hyperParameterList[pid::pool_num],
-            sp_and_entropy, v_hierarchy, )))              
-    [p.start() for p in processlist]
-    [p.join() for p in processlist]
-    sp_and_entropy = sorted(sp_and_entropy,key = lambda x:x[-1])
-    besten,bestsp = write_report(sp_and_entropy, outpath)
+        row = [
+            f'parameter {i}',
+            item[0],          
+            item[1],          
+            is_best_en,       
+            is_best_sp,       
+            item[-2]          
+        ]
+        data_rows.append(row)
+        
+    formatted_rows = []
+    for row in data_rows:
+        formatted_row = []
+        for i, cell in enumerate(row):
+            if isinstance(cell, float):
+                formatted_row.append(f"{cell:.5f}")
+            else:
+                formatted_row.append(str(cell))
+        formatted_rows.append(formatted_row)
+        
+    col_widths = [max(len(item) for item in col) for col in zip(*formatted_rows)]
     
-    if subgraph_num<400:
-        taskNum.value += 1
-        print_x(start, taskNum.value, allstep,'Writing Fasta file ...             ')
-        zipAlign2Fasta(Viterbi_result_path/'alizips/tr{}/zipalign.npz'.format(besten),outpath/'bestEntropy.fasta')
-        zipAlign2Fasta(Viterbi_result_path/'alizips/tr{}/zipalign.npz'.format(bestsp),outpath/'bestSP.fasta')
-    taskNum.value += 1
-    print_x(start, taskNum.value, allstep,'Done                                ')
-    print()
-def viterbi_subgraph(v_hierarchy, subgraph_num, finalGraphPath, outpath, train_DAG_Path, hierarchy, set_name, Viterbi_result_path,taskList,parasNameList,start,taskNum,allstep, lock, threads,fit=True):
-    last_oriGraphIdlist=None
-    while not taskList.empty():
-        try:
-            info = taskList.get(timeout=1)  
-        except:
-            continue
-        index = info[0]
-        subGraphLevel = v_hierarchy  
-        if v_hierarchy!=0:
-            Viterbi_DAG_Path = outpath / "Merging_graphs/merge_{}/{}/".format(subGraphLevel, index)
-        else:
-            Viterbi_DAG_Path = finalGraphPath
-        sub_Viterbi_result_path = Viterbi_result_path / '{}/'.format(index)
-        outlog = open(Viterbi_result_path/'alizips/Logs/{}.log'.format(index), 'w')
-        sys.stdout = outlog
-        sys.stderr = outlog
-        os.makedirs(sub_Viterbi_result_path,exist_ok=True)
-        oriGraphPath = outpath / "subgraphs/"
-        oriGraphIdlist = range((index-1)*(2**subGraphLevel)+1, min(subgraph_num+1, index*(2**subGraphLevel)+1))
-
-        DAG = load_DAG(Viterbi_DAG_Path, load_onmfile=True)
-        DAG.fragmentReduce()
-                   
-        linearPath_list, linearPath_link, _ = build_coarse_grained_graph(
-            DAG.queryGraph, DAG.edgeWeightDict)
-        coarseDAGinfo = (linearPath_list, linearPath_link)
-        coarseDAG = DAGStru(len(linearPath_list), linearPath_link)
-        coarseDAG.calculateCoordinates()               
-
-        for parasName in parasNameList:
-            parasPath = train_DAG_Path/'ini/{}_modifydict.npy'.format(parasName)
-            modifyDict = np.load(parasPath,allow_pickle=True).item()
+    with open(outpath / 'report.txt', 'w', encoding='utf-8') as file:
+        header_line = ' | '.join(cell.ljust(width) for cell, width in zip(formatted_rows[0], col_widths))
+        file.write(header_line + '\n')
+        
+        separator_line = '-+-'.join('-' * width for width in col_widths)
+        file.write(separator_line + '\n')
+        
+        for row in formatted_rows[1:]:
+            data_line = ' | '.join(cell.ljust(width) for cell, width in zip(row, col_widths))
+            file.write(data_line + '\n')
             
-            if last_oriGraphIdlist!=oriGraphIdlist:
-                lock.acquire()
-                seqiddb = sql_master('', db=oriGraphPath, mode='build', dbidList=oriGraphIdlist)  
-                lock.release()
-            last_oriGraphIdlist=oriGraphIdlist
-            ref_seq = str(np.load(finalGraphPath/'refseq_{}_{}.npy'.format(modifyDict['weight_thr'],modifyDict['init_type'])))
-            ref_node_list = np.load(
-                Viterbi_DAG_Path/'local_ref_nodelist_{}_{}_{}_{}.npy'.format(
-                    hierarchy, set_name, modifyDict['weight_thr'],modifyDict['init_type']
-                )
-            ).tolist()
-            if not os.path.exists(sub_Viterbi_result_path/'ini/'):
-                os.mkdir(sub_Viterbi_result_path/'ini/')
-            np.save(Viterbi_result_path/'alizips/{}/modifydict.npy'.format(parasName), modifyDict)
-            viterbi(train_DAG_Path, Viterbi_DAG_Path, sub_Viterbi_result_path,
-                    parasName, seqiddb, ref_seq, ref_node_list,DAG,coarseDAGinfo,coarseDAG, threads,fit)
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
-        if not taskNum is None and not allstep is None:
-            with lock:
-                taskNum.value+=1
-                print_x(start,taskNum.value,allstep,'Viterbi in subgraph ...')
+    return besten_idx, bestsp_idx
 
-
-def evaluate(zipali_path,positive,negative,outpath,tofasta=True):
-    sp_and_entropy=[]
-    for i,path in enumerate(zipali_path):
-        a,c = sp_entro_zip(path/'zipalign.npz',positive,negative)
-        modifyDict = np.load(path/'modifydict.npy',allow_pickle=True).item()
-        sp_and_entropy.append((modifyDict['weight_thr'],modifyDict['init_type'],modifyDict['emProbAdds_Match'],modifyDict['random'],a,c,i))
-    besten,bestsp = write_report(sp_and_entropy,outpath)
-    if tofasta:
-        zipAlign2Fasta(zipali_path[besten]/'zipalign.npz',outpath/'bestEntropy.fasta')
-        zipAlign2Fasta(zipali_path[bestsp]/'zipalign.npz',outpath/'bestSP.fasta')
-    
-def write_report(sp_and_entropy,outpath):
-    def tuple_to_str(t):
-        return '(' + ', '.join(tuple_to_str(x) if isinstance(x, tuple) else str(x) for x in t) + ')'
-    sp_list = [0]*len(sp_and_entropy)
-    entropy_list = [0]*len(sp_and_entropy)
-    for idx,sande in enumerate(sp_and_entropy):
-        sp_list[idx] = sande[4]
-        entropy_list[idx] = sande[5]
-    bestsp = np.argmax(sp_list)
-    besten = np.argmin(entropy_list)
-    data = [[' ','weight_thr','old_init','minEmProbAdds_Match','random','sp score','entropy','best entropy','best sp score']]
-    for i in range(len(sp_and_entropy)):
-        if i == bestsp:
-            isbestsp = '✔'
-        else:
-            isbestsp = ' '
-        if i == besten:
-            isbesten = '✔'
-        else:
-            isbesten = ' '
-        data.append(['tr{}'.format(i),sp_and_entropy[i][0],sp_and_entropy[i][1],sp_and_entropy[i][2],tuple_to_str(sp_and_entropy[i][3]),sp_list[i],entropy_list[i],isbesten,isbestsp])
-    col_widths = [max(len(str(item)) for item in column) for column in zip(*data)]
-    with open(outpath/'report.txt', 'w') as file:
-        def format_row(row):
-            return ' | '.join(f"{str(item).ljust(col_widths[i])}" if not isinstance(item, float) 
-                            else f"{item:.5f}".ljust(col_widths[i]) for i, item in enumerate(row))
-        header = format_row(data[0])
-        file.write(header + '\n')
-        file.write('-' * (sum(col_widths) + 4 * (len(col_widths) - 1)) + '\n')
-        for row in data[1:]:
-            file.write(format_row(row) + '\n')
-    np.save(outpath/'bestEntropyScore.npy',[sp_list[besten],entropy_list[besten]])
-    np.save(outpath/'bestSPScore.npy',[sp_list[bestsp],entropy_list[bestsp]])
-    return besten,bestsp
-def train_and_viterbi(hierarchy,finalGraphPath, outpath, threads=3,fit=True):
-    
-    negative = {                
-        1: {1:  0, 3: -1, 4: -1, 2: -1 ,0: -2},
-        3: {1: -1, 3:  0, 4: -1, 2: -1 ,0: -2},
-        4: {1: -1, 3: -1, 4:  0, 2: -1 ,0: -2},
-        2: {1: -1, 3: -1, 4: -1, 2:  0 ,0: -2},
-        0: {1: -2, 3: -2, 4: -2, 2: -2 ,0: 0},
-        } 
-    positive = {                
-        1: {1:  1, 3:  0, 4:  0, 2:  0 ,0:  0},
-        3: {1:  0, 3:  1, 4:  0, 2:  0 ,0:  0},
-        4: {1:  0, 3:  0, 4:  1, 2:  0 ,0:  0},
-        2: {1:  0, 3:  0, 4:  0, 2:  1 ,0:  0},
-        0: {1:  0, 3:  0, 4:  0, 2:  0 ,0:  0},
-        }
-
-    finalGraphPath = sanitize_path(finalGraphPath, 'input')          
-    outpath = sanitize_path(outpath, 'output')                        
-    train_DAG_Path = finalGraphPath
-    Viterbi_result_path = outpath / 'V_result/'                  
-    os.makedirs(Viterbi_result_path, exist_ok=True)
-    os.makedirs(train_DAG_Path/'ini', exist_ok=True)          
-    os.makedirs(Viterbi_result_path/'alizips', exist_ok=True)
-    start = time.time()
-    step, allstep = 0, 5
-    print_x(start, step, allstep,'Initializing')
-    oriGraphIdlist = os.listdir(outpath/'subgraphs/')            
-    seqiddb = sql_master('', db=outpath/'subgraphs/', mode='build', dbidList=oriGraphIdlist)
-    step += 1
-    print_x(start, step, allstep,'Extracting parameters(Length First) ...')
-    filtered_files = []
-    thrs = [0.01]
-    graph = load_DAG(finalGraphPath)
-    graph.SourceList = [ [nodeid] for nodeid in range(graph.totalNodes)]
-    graph.fragmentReduce()
-    save_ref_node(finalGraphPath,graph, thrs, save_ref_onm=True)
-    del graph
-    gc.collect()
-    for thr in thrs:
-        filtered_files.append('thr_{}_{}'.format(thr,True))
-        step += 1
-        print_x(start, step, allstep,'Extracting parameters(Weight First) ...')
-    for thr in thrs:
-        filtered_files.append('thr_{}_{}'.format(thr,False))
-        step += 1
-        print_x(start, step, allstep,'Train and Viterbi ...                  ')
-    
-    gc.collect()  
-    processlist = []
-    pool_num = 6
-    Matchs = [-3,-5,-7]
-    Randoms = [(0,0)] 
-    hyperParameterDict = {}
-    idx=0
-    for f in filtered_files:
-        datas = f.split('_')
-        thr = float(datas[1])
-        type = str(datas[2])
-        for m in Matchs:
-            for rdm in Randoms:
-                hyperParameterDict[idx] = (thr,type,m,rdm)
-                idx+=1
-    hyperParameterList = list(hyperParameterDict.items())
-    processlist = []  
-    for pid in range(pool_num):
-        processlist.append(
-            Process(target=ali_local, 
-                    args=(train_DAG_Path, train_DAG_Path, Viterbi_result_path,
-                          seqiddb, finalGraphPath, 
-                          hyperParameterList[pid::pool_num], threads//6,fit, ))          
-        )
-    [p.start() for p in processlist]        
-    [p.join() for p in processlist]         
-    step +=1
-    print_x(start, step, allstep,'Result evaluating ...                      ')
-    zipali_path = []
-    for i in range(len(hyperParameterList)):
-        zipali_path.append(Viterbi_result_path/f'alizips/tr{i}')
-    if hierarchy>8:
-        tofasta=False
-    else:
-        tofasta=True
-    evaluate(zipali_path, positive, negative, outpath,tofasta)
-    step +=1
-    print_x(start, step, allstep,'Done                                       ')
-    print()
-
-def merge_zipali(outpath, path, hyperParameterList, sp_and_entropy, v_hierarchy):
-
-    negative = {                
-        1: {1:  0, 3: -1, 4: -1, 2: -1 ,0: -2},
-        3: {1: -1, 3:  0, 4: -1, 2: -1 ,0: -2},
-        4: {1: -1, 3: -1, 4:  0, 2: -1 ,0: -2},
-        2: {1: -1, 3: -1, 4: -1, 2:  0 ,0: -2},
-        0: {1: -2, 3: -2, 4: -2, 2: -2 ,0: 0},
-        } 
-    positive = {                
-        1: {1:  1, 3:  0, 4:  0, 2:  0 ,0:  0},
-        3: {1:  0, 3:  1, 4:  0, 2:  0 ,0:  0},
-        4: {1:  0, 3:  0, 4:  1, 2:  0 ,0:  0},
-        2: {1:  0, 3:  0, 4:  0, 2:  1 ,0:  0},
-        0: {1:  0, 3:  0, 4:  0, 2:  0 ,0:  0},
-        }
-    os.makedirs(path/'alizips', exist_ok=True)            
-    hyperParameterDict = dict(hyperParameterList)
-    for paramsIdx in hyperParameterDict.keys():
-        parasName = 'tr{}'.format(paramsIdx)
-        if v_hierarchy==0:
-            fileList = [1]
-        else:
-            fileList = os.listdir(outpath/'Merging_graphs/merge_{}/'.format(v_hierarchy))
-            fileList = [file for file in fileList if 'alizips' not in file]
-            fileList = sorted(fileList, key=int)                 
-        maxInsertLengthGlobal = np.load(path/'{}/{}/insert_length_dict.npy'.format(fileList[0],parasName),allow_pickle=True).item()
-        for i in range(1, len(fileList)):
-            maxInsertLengthSub = np.load(path/'{}/{}/insert_length_dict.npy'.format(fileList[i],parasName),allow_pickle=True).item()
-            maxInsertLengthGlobal = {key: max(maxInsertLengthGlobal[key], maxInsertLengthSub[key]) for key in maxInsertLengthGlobal}
-        sequenceNameList = []           
-        zipali_global = []               
-        for i in range(len(fileList)):
-            maxInsertLengthSub = np.load(path/'{}/{}/insert_length_dict.npy'.format(fileList[i],parasName),allow_pickle=True).item()
-            indexdict = np.load(path/'{}/{}/indexdict.npy'.format(fileList[i],parasName),allow_pickle=True).item()           
-            alignInfo = np.load(path/'{}/{}/zipalign.npz'.format(fileList[i],parasName),allow_pickle=True)
-            zipali = alignInfo['align'].tolist()[:-1]                         
-            namelist = alignInfo['namelist']                        
-            insertList = []
-            for x in maxInsertLengthGlobal.keys():
-                if x in maxInsertLengthSub.keys():
-                    insert_global = maxInsertLengthGlobal[x]
-                    insert_local = maxInsertLengthSub[x]
-                    if insert_global > insert_local:
-                        insertList.append((indexdict[(2,x)], insert_global - insert_local))
-            insertList.sort(key=lambda x: x[0], reverse=True)
-            for j in insertList:
-                for k in range(j[1]):
-                    zipali.insert(j[0], [0])               
-            if not zipali_global:          
-                global_ali_length = len(zipali)
-                for columnCursor in range(global_ali_length):
-                    componentNum = len(zipali[columnCursor])
-                    for component in range(1, componentNum):
-                        zipali[columnCursor][component][1] = zipali[columnCursor][component][1].tolist()
-                zipali_global = zipali
-            else:          
-                addSequenceNum = len(sequenceNameList)                 
-                global_ali_length = len(zipali_global)
-                for columnCursor in range(global_ali_length):
-                    componentIndicesDict = {}               
-                    componentLists = zipali[columnCursor]                
-                    for k in range(1, len(componentLists)):
-                        componentAndIndices = componentLists[k]
-                        component = componentAndIndices[0]          
-                        indicesArray = componentAndIndices[1]  
-                        indicesArray += addSequenceNum               
-                        componentIndicesDict.setdefault(component, []).extend(indicesArray.tolist())
-                    donebase = set()           
-                    componentNum = len(zipali_global[columnCursor])
-                    for bindex in range(1, componentNum):
-                        component = zipali_global[columnCursor][bindex][0]
-                        if component in componentIndicesDict:
-                            zipali_global[columnCursor][bindex][1] += componentIndicesDict[component]
-                            donebase.add(component)
-                    for component in componentIndicesDict.keys() - donebase:
-                        zipali_global[columnCursor].append([component, componentIndicesDict[component]])
-            sequenceNameList.extend(namelist)             
-        zipali_global.append(len(sequenceNameList))
-        if not os.path.exists(path/'alizips'/parasName):
-            os.mkdir(path/'alizips'/parasName)
-        modifyDict = np.load(path/'alizips'/parasName/'modifydict.npy',allow_pickle=True).item()
-        a, c = sp_entro_zip_loaded(zipali_global, positive, negative)
-        sp_and_entropy.append((modifyDict['weight_thr'],modifyDict['init_type'],modifyDict['emProbAdds_Match'],modifyDict['random'],a, c, paramsIdx))                 
-        zipali_global = np.array(zipali_global, dtype=object)
-        np.savez(path/'alizips/{}/zipalign.npz'.format(parasName), 
-                namelist=sequenceNameList, 
-                align=zipali_global)
 def zipAlign2Fasta(zipAliPath,save_path,ref:bool=False):
     draw_dict = {0:'-',1: 'A', 2: 'T', 3: 'C', 4: 'G', 5: 'R', 6: 'Y', 7: 'M', 8: 'K', 9: 'S', 10: 'W', 11: 'H', 12: 'B', 13: 'V', 14: 'D', 15: 'N'}
     zipAliPath = sanitize_path(zipAliPath,'input')
@@ -860,43 +407,469 @@ def zipAlign2Fasta(zipAliPath,save_path,ref:bool=False):
     seqlist = [SeqRecord(Seq(''.join(i)),id=namelist[idx],description='') for idx,i in zip(xs,string_matrix)]
     SeqIO.write(seqlist,save_path,'fasta')
 
+
+def save_refseq(graphPath,graph, thrs):
+    graph.fragmentReduce()
+    no_degenerate_edgeDict,pureNodes = graph.edgeWeightDict,set(np.arange(graph.totalNodes)) 
+    
+    for thr in thrs:
+        _ref_seq, _ref_node_list, _emProbMatrix,_insertrgs = graph.convertToAliReferenceDAG_new(no_degenerate_edgeDict,pureNodes,thr)
+        np.savez(
+            graphPath/'thr_{}.npz'.format(thr),
+            ref_seq=_ref_seq,
+            ref_node_list=_ref_node_list,
+            emProbMatrix=_emProbMatrix,
+            insert_range=_insertrgs
+        )
+        
+
+def train_in_all(hierarchy, finalGraphPath, outpath, subgraph_num,threads=3, fit=True):
+    thrs = [0.001]
+    Matchs = [-3,-5]
+    Randoms = [(0,0)]
+    finalGraphPath = sanitize_path(finalGraphPath, 'input') 
+    outpath = sanitize_path(outpath, 'output')  
+    start = time.time()
+    Viterbi_result_path = outpath / 'V_result'
+    if not os.path.exists(Viterbi_result_path):
+        os.mkdir(Viterbi_result_path)
+    train_DAG_Path = finalGraphPath
+    os.makedirs(train_DAG_Path / 'ini', exist_ok=True)
+    taskNum = Value('i',0)
+    v_hierarchy = min(hierarchy,2)
+    a = subgraph_num
+    b = 2 ** v_hierarchy
+    min_num = (a // b) + (1 if a % b != 0 else 0) 
+    subgraphList = list(range(
+        (1-1) * (2 ** (hierarchy - v_hierarchy)) + 1,
+        min(min_num+1, 1 * (2 ** (hierarchy - v_hierarchy)) + 1)
+    ))
+
+    allstep=1
+    allstep+=len(thrs)*len(Matchs)*len(Randoms)
+
+    print_x(start, taskNum.value, allstep,'Loading graph data')
+    lock = Manager().Lock()
+    
+    paraNames=[]
+    hyperParameterDict = {}
+    idx=0
+    
+    graph = load_DAG(finalGraphPath)
+    graph.SourceList = [ [nodeid] for nodeid in range(graph.totalNodes)]
+    graph.fragmentReduce(16)
+    graph.merge_sameCoorFraNodes_loop_zip_new()
+    taskNum.value+=1
+    print_x(start, taskNum.value, allstep,'Preparing model parameters')
+    save_refseq(finalGraphPath,copy.deepcopy(graph), thrs)
+    filtered_files = []
+    for thr in thrs:
+        filtered_files.append('thr_{}'.format(thr))
+    for f in filtered_files:
+        datas = f.split('_')
+        thr = float(datas[1])
+        for m in Matchs:
+            for rdm in Randoms:
+                hyperParameterDict[idx] = (thr,m,rdm)
+                paraNames.append('tr{}'.format(idx))
+                idx+=1
+    hyperParameterList = list(hyperParameterDict.items())
+    taskList = Queue()
+    os.makedirs(Viterbi_result_path/'alizips/Logs',exist_ok=True)
+    for subGid in subgraphList:
+        taskList.put([subGid])
+        for para in paraNames:
+            os.makedirs(Viterbi_result_path/'alizips/{}'.format(para),exist_ok=True)
+    if subgraph_num>400:
+        train_threads = 2
+    else:
+        train_threads = threads
+    processlist = []
+    pool_num = min(6,train_threads)
+    print_x(start, taskNum.value, allstep,'Training alignment model')
+    for pid in range(pool_num):
+        processlist.append(Process(target=train, args=(graph,
+            Viterbi_result_path, finalGraphPath, train_DAG_Path,
+            hyperParameterList[pid::pool_num],lock,start,taskNum,allstep, threads//pool_num,fit, )))
+    [p.start() for p in processlist]
+    [p.join() for p in processlist]
+    del graph
+    gc.collect()
+
+def merge_zipali_new(iniPath,subZipaliPath, mergedZipaliPath, paraIndexs, sp_and_entropy, v_hierarchy):
+    negative = {          
+        1: {1:  0, 3: -1, 4: -1, 2: -1 ,0: -2},
+        3: {1: -1, 3:  0, 4: -1, 2: -1 ,0: -2},
+        4: {1: -1, 3: -1, 4:  0, 2: -1 ,0: -2},
+        2: {1: -1, 3: -1, 4: -1, 2:  0 ,0: -2},
+        0: {1: -2, 3: -2, 4: -2, 2: -2 ,0: 0},
+        } 
+    positive = {          
+        1: {1:  1, 3:  0, 4:  0, 2:  0 ,0:  0},
+        3: {1:  0, 3:  1, 4:  0, 2:  0 ,0:  0},
+        4: {1:  0, 3:  0, 4:  1, 2:  0 ,0:  0},
+        2: {1:  0, 3:  0, 4:  0, 2:  1 ,0:  0},
+        0: {1:  0, 3:  0, 4:  0, 2:  0 ,0:  0},
+        }
+    def reformat_col_data(data):
+        total_ids = data[-1]
+        columns = data[:-1]
+        processed_columns = []
+        all_position = set(np.arange(total_ids))
+        for col in columns:
+            main_char = col[0]
+            minor_components = col[1:]
+
+            if minor_components:
+                component_num_list = [len(n[1]) for n in minor_components]
+                ori_main_num = total_ids-sum(component_num_list)
+                if ori_main_num < max(component_num_list):
+
+                    new_main_char = minor_components[np.argmax(component_num_list)][0]
+
+                    ori_less_ids = set()
+                    for comp in minor_components:
+                        ori_less_ids|=set(comp[1])
+
+                    ori_main_components = all_position-ori_less_ids
+
+                    if ori_main_components:
+                        minor_components.append([main_char,list(ori_main_components)])
+
+                    minor_components = [n for n in minor_components if n[0]!=new_main_char]
+                    main_char = new_main_char
+                    sorted_minor_components = sorted(
+                        minor_components,
+                        key=lambda x: min(x[1])
+                    )
+                else:
+                    sorted_minor_components = sorted(
+                        minor_components,
+                        key=lambda x: min(x[1])
+                    )
+            else:
+                sorted_minor_components=[]
+            reformed_col = [main_char] + sorted_minor_components
+
+            processed_columns.append(reformed_col)
+        return processed_columns + [total_ids]
+
+    os.makedirs(mergedZipaliPath/'alizips', exist_ok=True) 
+    for paramsIdx in paraIndexs:
+        parasName = 'tr{}'.format(paramsIdx)
+        if v_hierarchy==0:
+            fileList = os.listdir(subZipaliPath/'subgraphs/')
+            fileList = [file for file in fileList if 'alizips' not in file]
+            fileList = sorted(fileList, key=int)
+        if v_hierarchy == hierarchy:
+            fileList = [1]
+        else:
+            fileList = os.listdir(subZipaliPath/'Merging_graphs/merge_{}/'.format(v_hierarchy))
+            fileList = [file for file in fileList if 'alizips' not in file]
+            fileList = sorted(fileList, key=int)               
+        maxInsertLengthGlobal = np.load(mergedZipaliPath/'{}/{}/insert_length_dict.npy'.format(fileList[0],parasName),allow_pickle=True).item()
+        for i in range(1, len(fileList)):
+            maxInsertLengthSub = np.load(mergedZipaliPath/'{}/{}/insert_length_dict.npy'.format(fileList[i],parasName),allow_pickle=True).item()
+            maxInsertLengthGlobal = {key: max(maxInsertLengthGlobal[key], maxInsertLengthSub[key]) for key in maxInsertLengthGlobal}
+
+        sequenceNameList = []  
+        zipali_global = []    
+        for i in range(len(fileList)):
+            maxInsertLengthSub = np.load(mergedZipaliPath/'{}/{}/insert_length_dict.npy'.format(fileList[i],parasName),allow_pickle=True).item()
+            indexdict = np.load(mergedZipaliPath/'{}/{}/indexdict.npy'.format(fileList[i],parasName),allow_pickle=True).item() 
+            alignInfo = np.load(mergedZipaliPath/'{}/{}/zipalign.npz'.format(fileList[i],parasName),allow_pickle=True)
+            zipali = alignInfo['align'].tolist()[:-1]  
+            namelist = alignInfo['namelist']
+            insertList = []
+            for x in maxInsertLengthGlobal.keys():
+                if x in maxInsertLengthSub.keys():
+                    insert_global = maxInsertLengthGlobal[x]
+                    insert_local = maxInsertLengthSub[x]
+                    if insert_global > insert_local:
+                        insertList.append((indexdict[(2,x)], insert_global - insert_local))
+            insertList.sort(key=lambda x: x[0], reverse=True)
+            for j in insertList:
+                for k in range(j[1]):
+                    zipali.insert(j[0], [0])
+
+            if not zipali_global:  
+                global_ali_length = len(zipali)
+                for columnCursor in range(global_ali_length):
+                    componentNum = len(zipali[columnCursor])
+                    for component in range(1, componentNum):
+                        zipali[columnCursor][component][1] = zipali[columnCursor][component][1].tolist()
+                zipali_global = zipali
+            else:  
+                addSequenceNum = len(sequenceNameList)
+                global_ali_length = len(zipali_global)
+                for columnCursor in range(global_ali_length):
+                    componentIndicesDict = {}
+                    componentLists = zipali[columnCursor]
+
+                    for k in range(1, len(componentLists)):
+                        componentAndIndices = componentLists[k]
+                        component = componentAndIndices[0]
+                        indicesArray = componentAndIndices[1]  
+                        indicesArray += addSequenceNum
+                        componentIndicesDict.setdefault(component, []).extend(indicesArray.tolist())
+                    donebase = set()  
+                    componentNum = len(zipali_global[columnCursor])
+                    
+                    for bindex in range(1, componentNum):
+                        component = zipali_global[columnCursor][bindex][0]
+                        if component in componentIndicesDict:
+                            zipali_global[columnCursor][bindex][1] += componentIndicesDict[component]
+                            donebase.add(component)
+                    for component in componentIndicesDict.keys() - donebase:
+                        zipali_global[columnCursor].append([component, componentIndicesDict[component]])
+
+            sequenceNameList.extend(namelist)  
+        zipali_global.append(len(sequenceNameList))  
+        zipali_global = reformat_col_data(zipali_global)
+        if not os.path.exists(mergedZipaliPath/'alizips'/parasName):
+            os.mkdir(mergedZipaliPath/'alizips'/parasName)
+
+        a, c,b = sp_entro_zip_loaded(zipali_global, positive, negative)
+        sp_and_entropy.append((a, c,len(zipali_global), paramsIdx))
+        zipali_global = np.array(zipali_global, dtype=object)
+        np.savez(mergedZipaliPath/'alizips/{}/zipalign.npz'.format(parasName), 
+                 namelist=sequenceNameList, 
+                 align=zipali_global)
+        
+def viterbi_whithout_mapping(parameter_path, Viterbi_DAG_Path, Viterbi_result_path, parasName, seqiddb, ref_seq,DAG, threads=3):
+    
+    windows_length = 100
+    
+    ph = DAGPhmm(
+        '',        
+        Viterbi_DAG_Path,     
+        parasName,             
+        parameter_path=parameter_path  
+    )
+    ph.init_viterbi_data_with_refseq(
+        Viterbi_DAG_Path,
+        Viterbi_result_path,
+        ref_seq,DAG,
+        windows_length=windows_length,
+        threads=threads
+    )
+    ph.Viterbi(seqiddb,threads=threads)
+    ph.state_to_aligment(seqiddb)
+    del ph
+    gc.collect()
+
+def viterbi_in_Graph(testGraphPath, iniPath,outpath,threads,chunk_size,seq_num):
+    
+    def subViterbi():
+        while not taskList.empty():
+            try:
+                task = taskList.get(timeout=1)
+            except:
+                continue
+
+            subGraphLevel = v_hierarchy
+            index = task[0]
+            oriGraphPath = testGraphPath / "subgraphs/"
+            oriGraphIdlist = range(
+                (index-1)*(2**subGraphLevel)+1, 
+                min(suborigraph_num+1, index*(2**subGraphLevel)+1)
+            )
+            with open(Viterbi_result_path / f'alizips/Logs/{index}.log', 'w',buffering=1) as outlog:
+                sys.stdout = outlog
+                sys.stderr = outlog
+                
+                Viterbi_DAG_Path = testGraphPath/f'subgraphs/{index}' if v_hierarchy == 0 else \
+                                 testGraphPath / f"Merging_graphs/merge_{subGraphLevel}/{index}/"
+                if v_hierarchy == hierarchy:
+                    Viterbi_DAG_Path = testGraphPath/'final_graph'
+
+                with lock:                
+                    datalist = []
+                    for i in oriGraphIdlist:
+                        array = np.load(oriGraphPath/'{}/osm.npy'.format(i),allow_pickle=True)
+                        datalist.append([i,array])
+                seqiddb = sql_master('',db=oriGraphPath,dbidList=datalist)
+            
+                for paraid in range(paraNum):
+                    parasName = f'tr{paraid}'
+
+                    sub_Viterbi_result_path = Viterbi_result_path / f'{index}/'
+                    os.makedirs(sub_Viterbi_result_path, exist_ok=True)
+
+                    parameter_path = iniPath/'final_graph/ini/{}_pc_1.npy'.format(parasName)
+                    parameterDict=np.load(parameter_path,allow_pickle=True).item() 
+                    Me_Matrix=parameterDict['match_emission']
+                    baseDict = {0:'A',1:'T',2:'C',3:'G'}
+                    ref_seq = ''
+                    for i in range(Me_Matrix.shape[0]):
+                        ref_seq += baseDict[np.argmax(Me_Matrix[i,:])]
+                    
+                    (Viterbi_result_path / 'alizips'/ parasName).mkdir(exist_ok=True)
+                    inputDAG = load_DAG(Viterbi_DAG_Path, load_onmfile=True)
+
+                    viterbi_whithout_mapping(parameter_path, Viterbi_DAG_Path, sub_Viterbi_result_path,
+                            parasName, seqiddb, ref_seq,inputDAG,threads=threads)
+                    sys.stdout = sys.__stdout__
+                    sys.stderr = sys.__stderr__
+                    taskNum.value+=1
+                    print_x(start, taskNum.value, allstep,'Performing Viterbi alignment')
+                    sys.stdout = outlog
+                    sys.stderr = outlog
+                seqiddb.conn.close()
+                
+                sys.stdout = sys.__stdout__
+                sys.stderr = sys.__stderr__
+                
+
+    start = time.time()
+    paraNum = int(len(os.listdir(iniPath/'final_graph/ini'))/3)
+    hierarchy = len(os.listdir(testGraphPath/'Merging_graphs'))
+
+    tmpv= hierarchy
+    for i in range(hierarchy):
+        if chunk_size*(2**i)>=80000:
+            tmpv = i
+            break
+    v_hierarchy=min(tmpv,hierarchy)
+    
+    a = len(os.listdir(testGraphPath/'subgraphs'))
+    b = 2 ** v_hierarchy
+    min_num = a // b + (1 if a % b else 0)
+    subgraphList = list(range(
+        (1 - 1) * (2 ** (hierarchy - v_hierarchy)) + 1,
+        min(min_num + 1, 1 * (2 ** (hierarchy - v_hierarchy)) + 1)
+    ))
+
+    suborigraph_num = len(os.listdir(testGraphPath/f'subgraphs'))
+    lock = Lock()
+    allstep = 1
+    taskList = Queue()
+    for subGid in subgraphList:
+        taskList.put([subGid])
+        allstep+=paraNum
+    
+    if seq_num<40000:
+        allstep+=1
+    taskNum = Value('i',0)
+
+    print_x(start, taskNum.value, allstep,'Performing Viterbi alignment')
+    
+    Viterbi_result_path = outpath / 'V_result'
+    Viterbi_result_path.mkdir(exist_ok=True)
+    os.makedirs(Viterbi_result_path/'alizips',exist_ok=True)
+    os.makedirs(Viterbi_result_path/'alizips'/'Logs',exist_ok=True)
+    
+    processlist = []
+    pool_num = min([10, threads // 4,len(subgraphList)])
+    if pool_num==0:
+        pool_num=1
+    for idx in range(pool_num):
+        processlist.append(Process(
+            target=subViterbi,
+        ))
+
+    [p.start() for p in processlist]
+    [p.join() for p in processlist]
+
+    print_x(start, taskNum.value, allstep,'Merging alignment results')
+    paraList= list(range(paraNum))
+    sp_and_entropy = Manager().list()
+    pool_num = min(6, threads)
+    processlist = []
+    
+    for pid in range(pool_num):
+        processlist.append(Process(
+            target=merge_zipali_new,
+            args=(iniPath,outpath, Viterbi_result_path, paraList[pid::pool_num],
+                  sp_and_entropy, v_hierarchy)
+        ))
+
+    [p.start() for p in processlist]
+    [p.join() for p in processlist]
+    taskNum.value+=1
+    print_x(start, taskNum.value, allstep,'Evaluating alignment quality')
+    sp_and_entropy = sorted(sp_and_entropy, key=lambda x: x[-1])
+    besten, bestsp = write_report(sp_and_entropy, outpath)
+    if seq_num<40000:
+        print_x(start, taskNum.value, allstep,'Writing final FASTA output')
+        zipAlign2Fasta(Viterbi_result_path/f'alizips/tr{besten}/zipalign.npz', outpath/'align_result.fasta')
+        taskNum.value+=1
+        print_x(start, taskNum.value, allstep,'Process finished successfully')
+
+def adaptive_chunk_size(avg_seq_len: float) -> int:
+    a = 1.7805e+18
+    b = -3.2505
+    raw = a * (avg_seq_len ** b)
+    return max(100, min(10000, int(raw)))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="DAPG-PHMM: Nucleotide multi-sequence aligner using DAPG  and Profile Hidden Markov Models",
-        epilog="Example usage for large datasets:\n  python DAG_Ali.py -i viral_sequences.fasta -o ./align_results -f 200 -t 36 --c 10000",
+        description="DAPG-PHMM: Nucleotide multi-sequence aligner using DAPG and Profile Hidden Markov Models",
+        epilog="Example usage for large datasets:\n  python DAG_Ali.py -i viral_sequences.fasta -o ./align_results -t 36 -l",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument('--input', '-i', required=True, 
-                      help='Input FASTA file path (required)')
-    parser.add_argument('--output', '-o', required=True, 
-                      help='Output directory path (required)')
-    parser.add_argument('--fragment_Length', '-f', type=int, default=16,
-                      help='Fragment length for building DAPG (default: 16)')
-    parser.add_argument('--threads', '-t', type=int, default=36,
-                      help='Number of parallel threads (default: 36)')
-    parser.add_argument('--chunk_size', '-c', type=int, default=5000,
-                      help='Sequence chunk size for splitting (default: 5000)')
-    
+
+    parser.add_argument('--input'          , '-i', required=True, help='Input FASTA file path (required)')
+    parser.add_argument('--output'         , '-o', required=True, help='Output directory path (required)')
+    parser.add_argument('--fragment_Length', '-f', type=int,     help='Fragment length for building DAPG. If not specified, enters automatic mode (default: auto)', default=None)
+    parser.add_argument('--threads'        , '-t', type=int,     help='Number of parallel threads (default: 36)', default=36)
+    parser.add_argument('--chunk_size'     , '-c', type=int,     help='Sequence chunk size for splitting (default: auto based on average sequence length)', default=None)
+    parser.add_argument('--large_scale'    , '-l', action='store_true', help='Enable large-scale alignment mode. This presets chunk_size to 5000 and fragment_length to 32 (unless specified) and skips pre-analysis for speed.')
+    parser.add_argument('--Onlybuild'      , '-b', action='store_true', help='Only build the graph, do not perform alignment (default: False)')
+
     args = parser.parse_args()
-    inpath = args.input
-    outpath = args.output
-    fra = args.fragment_Length
+
+    inpath = sanitize_path(args.input, 'input')
+    outpath = sanitize_path(args.output, 'output')
     threads = args.threads
-    chunk_size = args.chunk_size  
-    inpath = sanitize_path(inpath, 'input')
-    outpath = sanitize_path(outpath, 'output')
-    os.makedirs(outpath, exist_ok=True)
-    sub_fasta_path = sanitize_path(os.path.join(outpath, 'subfastas'), 'output')
-    os.makedirs(sub_fasta_path, exist_ok=True)
-    print('Preparing data')
-    seq_num, seqfileList = split_fasta(inpath, sub_fasta_path, chunk_size=chunk_size)
-    print('Building graph')
-    final_graph, hierarchy, subgraph_num = graph_construction(
-        outpath, seqfileList, build_fragment_graph, merge_graph, Tracing_merge,
-        threads=threads, fragmentLength=int(fra)
-    )
-    print('Sequence alignment')
-    if seq_num > 40000:
-        train_and_subViterbi(hierarchy, 1, final_graph, outpath, subgraph_num, threads, fit=True)
+
+    if args.large_scale:
+        print("Large-scale alignment mode enabled.")
+        chunk_size = args.chunk_size if args.chunk_size is not None else 5000
+        fragment_length = args.fragment_Length if args.fragment_Length is not None else 32
+        print(f"  - Using chunk size: {chunk_size}")
+        print(f"  - Using fragment length: {fragment_length}")
+
     else:
-        train_and_viterbi(hierarchy, final_graph, outpath, threads, fit=True)
+        print("Standard alignment mode: Performing pre-analysis to select optimal parameters...")
+        if args.chunk_size is not None:
+            chunk_size = args.chunk_size
+        else:
+            avg_len = fast_avg_seq_length_noloop(inpath)
+            chunk_size = adaptive_chunk_size(avg_len)
+        
+        if args.fragment_Length is not None:
+            fragment_length = args.fragment_Length
+        else:
+            kmer_diversity_ratio = calculate_kmer_diversity_ratio(inpath, k_size=32, threads=threads)
+            print(kmer_diversity_ratio,'dd')
+            if kmer_diversity_ratio is not None and kmer_diversity_ratio >= 0.9:
+                fragment_length = 16
+            else:
+                fragment_length = 32 
+        
+        print(f"  - Analysis complete. Using fragment length: {fragment_length}")
+
+    print("\nStage 1: Preparing data for alignment...")
+    os.makedirs(outpath, exist_ok=True)
+    sub_fasta_path = os.path.join(outpath, 'subfastas')
+    os.makedirs(sub_fasta_path, exist_ok=True)
+    seq_num, seqfileList = split_fasta(inpath, sub_fasta_path, chunk_size=chunk_size)
+    
+    print("\nStage 2: Constructing sequence graph...")
+    final_graph_path, hierarchy, subgraph_num = graph_construction(
+        outpath, seqfileList, build_fragment_graph, merge_graph_new, Tracing_merge,
+        threads=threads, fragmentLength=fragment_length
+    )
+
+
+    if not args.Onlybuild:
+        print("\nStage 3: Aligning sequences...")
+        final_graph_path = outpath/'final_graph'
+        train_in_all(hierarchy, final_graph_path, outpath, subgraph_num, threads, fit=True)
+        print()
+        viterbi_in_Graph(outpath, outpath, outpath, threads, chunk_size,seq_num)
+        
+    print("\nAlignment complete.")
+
