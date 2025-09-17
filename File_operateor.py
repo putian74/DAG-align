@@ -10,28 +10,56 @@ import time
 import subprocess
 from tqdm import tqdm
 from collections import Counter
-def split_fasta(input_file, output_prefix, chunk_size=5000):
 
-    seq_num = 0               
-    seq_records = []              
-    seqfileList = []             
-    i = 0                      
+import re
+
+def fast_avg_seq_length_noloop(fasta_file: str) -> float:
+    """
+    高性能：一次性读入文件并用正则表达式统计平均序列长度，避免逐行循环。
+    """
+    with open(fasta_file, 'r') as f:
+        data = f.read()
+
+    blocks = re.split(r'^>', data, flags=re.MULTILINE)
+    seq_lens = []
+
+    for block in blocks:
+        if not block.strip():
+            continue
+        lines = block.splitlines()
+        seq = ''.join(lines[1:])
+        seq_lens.append(len(seq))
+
+    if not seq_lens:
+        return 0.0
+    return sum(seq_lens) / len(seq_lens)
+
+def split_fasta(input_file, output_prefix, chunk_size=5000):
+    seq_num = 0                     
+    seq_records = []               
+    seqfileList = []                
+    i = 0                           
+
     for record in SeqIO.parse(input_file, "fasta"):
         seq_num += 1
         seq_records.append(record)
+
         if len(seq_records) == chunk_size:
             output_file = os.path.join(output_prefix, f"{i + 1}.fasta")
             seqfileList.append(str(output_file))
             with open(output_file, "w") as out_handle:
                 SeqIO.write(seq_records, out_handle, "fasta")
-            seq_records = []  
+            seq_records = []
             i += 1
+
     if seq_records:
         output_file = os.path.join(output_prefix, f"{i + 1}.fasta")
         seqfileList.append(str(output_file))
         with open(output_file, "w") as out_handle:
             SeqIO.write(seq_records, out_handle, "fasta")
+
     return seq_num, seqfileList
+
 def split_single_fasta(rootdir, outdir):
 
     index = 0         
