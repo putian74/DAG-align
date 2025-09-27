@@ -14,11 +14,10 @@ from collections import Counter
 import re
 
 def fast_avg_seq_length_noloop(fasta_file: str) -> float:
-    """
-    高性能：一次性读入文件并用正则表达式统计平均序列长度，避免逐行循环。
-    """
+
     with open(fasta_file, 'r') as f:
         data = f.read()
+
 
     blocks = re.split(r'^>', data, flags=re.MULTILINE)
     seq_lens = []
@@ -35,7 +34,7 @@ def fast_avg_seq_length_noloop(fasta_file: str) -> float:
     return sum(seq_lens) / len(seq_lens)
 
 def split_fasta(input_file, output_prefix, chunk_size=5000):
-    seq_num = 0                     
+    seq_num = 0                      
     seq_records = []               
     seqfileList = []                
     i = 0                           
