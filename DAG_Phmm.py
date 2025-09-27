@@ -1582,8 +1582,7 @@ class DAGPhmm(object):
             endnodes.append(node)              
         
         processlist = []
-        pool_num = min(threads,4)
-        print(pool_num,'threads')           
+        pool_num = threads           
         for idx in range(pool_num):
             processlist.append(Process(
                 target=calculate_delta,
