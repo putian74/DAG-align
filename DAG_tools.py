@@ -271,7 +271,6 @@ def sanitize_path(path: str, path_type: str='output') -> Path:
     
 
 def calculate_column(column_data, length, positive, negative):
-    """Helper function to calculate scores for a single column from zipped data."""
     num_dict = {}
     sp_num = 0
     for i in column_data[1:]:
@@ -314,7 +313,6 @@ def calculate_column(column_data, length, positive, negative):
     return n_score, p_score, entropy, gap_count
 
 def sp_entro_zip_loaded(zip_ali, positive, negative, gap_threshold=0.7):
-    """Processes a pre-loaded, zipped alignment format."""
     total_entropy = 0
     negative_score = 0
     positive_score = 0
