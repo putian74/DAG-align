@@ -65,6 +65,7 @@ def numba_backward_pass_with_bfs(
     backwardNodeList, backwardEdgeList,
     all_edges
 ):
+    # --- 前半部分逻辑保持不变 ---
     reachable_mask = np.full(total_nodes, False, dtype=np.bool_)
     q_buffer = np.empty(total_nodes, dtype=np.int32)
     q_head, q_tail = 0, 0
@@ -593,7 +594,6 @@ class DAGStru:
                 if degreeList[targetNode] == 0:
                     q.append(targetNode)
                 i = edgeList[i][1]           
-
 
     def calculateCoordinates(self, check_loop=True, forward=True):
         np_all_edges = np.array(list(self.currentEdgeSet), dtype=np.int32) if self.currentEdgeSet else np.empty((0,2), dtype=np.int32)
