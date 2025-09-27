@@ -51,6 +51,7 @@ class sql_master():
         alist = save_numbers(gid,get_first_number(virus,first_number_bite_of_OSM,all_bite_of_OSM),16,32)
         blist = get_second_number(virus,first_number_bite_of_OSM,all_bite_of_OSM)
         VS = save_numbers(alist,blist)
+        # VS=list(zip(alist, blist))
         return VS
     def findSequenceSource(self,nodes,first_number_bite_of_ONM=32,all_bite_of_ONM=64,first_number_bite_of_OSM=32,all_bite_of_OSM=64):
         nodes = np.array(nodes)
