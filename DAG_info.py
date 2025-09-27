@@ -144,10 +144,6 @@ class DAGInfo:
                 
         return max_anchor if count == 1 else -1
 
-    
-    def is_low_complexity_kmer_by_count(self,sequence: str, k: int = 3, threshold_count: int = 4) -> bool:
-
-        return False
 
     def anchor_coor(self, anchor: int) -> int:
         if anchor == -1:
@@ -166,8 +162,6 @@ class DAGInfo:
 
         anchors_list[0] = self.startFragmentNodeDict.get(fragments[0], [])            
         anchors_list[-1] = self.endFragmentNodeDict.get(fragments[-1], [])            
-
-
 
         sequencePathNodeArray = np.array(
             [self.check_anchor_maxweight_final(a) for a in anchors_list],
@@ -527,7 +521,7 @@ class DAGInfo:
 
         self.queryGraph.calculateCoordinates(forward=forward)
         coordinateList = self.queryGraph.coordinateList.copy() if forward else self.queryGraph.backwardCoordinateList.copy()
-        
+
         headtails = self.headtails
         
 
@@ -660,6 +654,7 @@ class DAGInfo:
             ori_node_list = np.array(ori_node_list,dtype=object)
             np.save(self.savePath/'Traceability_path.npy',ori_node_list)
 
+        # self.reflist = self.findMainPathNodes()  
         _,self.reflist = self.queryGraph.find_max_weight_path()         
         self.queryGraph.calculateStateRange(self.reflist, mode='build')          
         self.queryGraph.findLongestPath()          
@@ -668,15 +663,15 @@ class DAGInfo:
             range_length = self.queryGraph.ref_coor[node][1] - self.queryGraph.ref_coor[node][0]
             state_range_dict.setdefault(range_length, []).append(node)
 
-        print('\n//////////////Basic information of graphs//////////////////')
-        print('The number of nodes in the graph : ', self.totalNodes)
-        print('The number of links in the graph: ', len(self.edgeWeightDict))
-        print('The longest path length in the graph : ', self.queryGraph.maxlength)
-        print('The number of longestpath_nodes in the graph: ', len(self.queryGraph.longestPathNodeSet))
-        print('ref_sequence_length: ', len(self.reflist))
-        print('mean_weight of ref_seq', np.mean([self.weights[node] for node in self.reflist]))
-        print('max_range of nodes in graph:', max(list(state_range_dict.keys())))
-        print('graph file save in ', self.savePath)
+        # print('\n//////////////Basic information of graphs//////////////////')
+        # print('The number of nodes in the graph : ', self.totalNodes)
+        # print('The number of links in the graph: ', len(self.edgeWeightDict))
+        # print('The longest path length in the graph : ', self.queryGraph.maxlength)
+        # print('The number of longestpath_nodes in the graph: ', len(self.queryGraph.longestPathNodeSet))
+        # print('ref_sequence_length: ', len(self.reflist))
+        # print('mean_weight of ref_seq', np.mean([self.weights[node] for node in self.reflist]))
+        # print('max_range of nodes in graph:', max(list(state_range_dict.keys())))
+        # print('graph file save in ', self.savePath)
 
         self.edgeWeightDict = np.array([
             [link[0], link[1], value] 
@@ -810,8 +805,9 @@ class DAGInfo:
             self.SourceList[node]= []
         self.startNodeSet -= set(delList)
         self.endNodeSet -= set(delList)
+             
 
-    
+
         
     def convertToAliReferenceDAG_new(self,no_degenerate_edgeDict,pureNodes,thr):
 
@@ -822,7 +818,6 @@ class DAGInfo:
         ref_nodes = []
         for c in max_path:
             ref_nodes.extend(linearPath_list[c])
-
 
         coordinateNodeDict={}
         for idx,node in enumerate(ref_nodes):
