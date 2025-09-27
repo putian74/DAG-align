@@ -21,17 +21,7 @@ from DAG_Phmm import DAGPhmm
 from sqlite_master import sql_master
 
 
-
 def parse_fasta(fasta_path: str) -> List[Tuple[str, str]]:
-    """
-    A simple and fast FASTA file parser.
-
-    Args:
-        fasta_path: Path to the FASTA file.
-
-    Returns:
-        A list of tuples, where each tuple contains a header and its sequence.
-    """
     sequences = []
     header, sequence_parts = None, []
     with open(fasta_path, 'r') as f:
@@ -51,7 +41,6 @@ def parse_fasta(fasta_path: str) -> List[Tuple[str, str]]:
     return sequences
 
 def print_x(start, step, allstep, current_stage="Sequence alignment is in progress"):
-    """Formats and prints a progress bar to the console."""
     runtime = time.time() - start
     percent = step / allstep
     bar = ('#' * int(percent * 20)).ljust(20)
@@ -63,13 +52,8 @@ def print_x(start, step, allstep, current_stage="Sequence alignment is in progre
     sys.stdout.write(f'\r[{bar}] {percent * 100:.2f}%  ({time_format}) | Stage: {current_stage:<30}')
     sys.stdout.flush()
 
-
-
 def _process_kmer_chunk(sequences_chunk: List[Tuple[str, str]], k_size: int) -> Tuple[int, Set[str]]:
-    """
-    Worker function for multiprocessing. Processes a chunk of sequences to find
-    total and unique k-mers. Must be a top-level function.
-    """
+
     local_unique_kmers = set()
     local_total_kmers = 0
     for header, sequence in sequences_chunk:
@@ -85,10 +69,7 @@ def _process_kmer_chunk(sequences_chunk: List[Tuple[str, str]], k_size: int) -> 
     return (local_total_kmers, local_unique_kmers)
 
 def calculate_kmer_diversity_ratio(fasta_path: str, sample_size: int = 10000, k_size: int = 21, threads: Optional[int] = None) -> Optional[float]:
-    """
-    Calculates the ratio of unique k-mers to total k-mers from a sample of sequences
-    using multiple processes to speed up the calculation.
-    """
+
     if not os.path.exists(fasta_path):
         print(f"Error: Input FASTA file not found at '{fasta_path}'", file=sys.stderr)
         return None
@@ -133,26 +114,22 @@ def calculate_kmer_diversity_ratio(fasta_path: str, sample_size: int = 10000, k_
     return ratio
 
 def sequence_to_kmers(sequence: str, k: int) -> Set[str]:
-    """Converts a DNA sequence into a set of its k-mers."""
     if len(sequence) < k:
         return set()
     return {sequence[i:i+k] for i in range(len(sequence) - k + 1)}
 
 def calculate_jaccard_similarity(set1: Set[str], set2: Set[str]) -> float:
-    """Calculates the Jaccard similarity between two sets of k-mers."""
     if not set1 and not set2: return 1.0
     if not set1 or not set2: return 0.0
     return len(set1.intersection(set2)) / len(set1.union(set2))
 
 def _calculate_jaccard_similarity_pair(pair: Tuple[Set[str], Set[str]]) -> float:
-    """Helper function for multiprocessing.Pool.map."""
     return calculate_jaccard_similarity(pair[0], pair[1])
 
 def estimate_average_similarity(
     fasta_path: str, num_samples: int = 5, sample_size: int = 1000,
     threads: Optional[int] = None, k_size: int = 21
 ) -> Optional[float]:
-    """Estimates the average pairwise sequence similarity using a k-mer based Jaccard index."""
     if not os.path.exists(fasta_path):
         print(f"Error: Input FASTA file not found at '{fasta_path}'", file=sys.stderr)
         return None
@@ -188,9 +165,6 @@ def estimate_average_similarity(
 
     if not sample_avg_similarities: return None
     return statistics.mean(sample_avg_similarities)
-
-
-
 
 def ini_paras(Ref_seq, emProbMatrix,insertRanges, ME, MD, MI, II, DM, pi_MID, outpath, parasName,perturbation=(0,0)):
 
@@ -350,10 +324,10 @@ def write_report(sp_and_entropy, outpath):
         
         row = [
             f'parameter {i}',
-            item[0],          
+            item[0],         
             item[1],          
-            is_best_en,       
-            is_best_sp,       
+            is_best_en,      
+            is_best_sp,      
             item[-2]          
         ]
         data_rows.append(row)
@@ -406,7 +380,6 @@ def zipAlign2Fasta(zipAliPath,save_path,ref:bool=False):
         namelist.insert(0,'ref')
     seqlist = [SeqRecord(Seq(''.join(i)),id=namelist[idx],description='') for idx,i in zip(xs,string_matrix)]
     SeqIO.write(seqlist,save_path,'fasta')
-
 
 def save_refseq(graphPath,graph, thrs):
     graph.fragmentReduce()
@@ -653,12 +626,12 @@ def viterbi_whithout_mapping(parameter_path, Viterbi_DAG_Path, Viterbi_result_pa
         windows_length=windows_length,
         threads=threads
     )
-    ph.Viterbi(seqiddb,threads=threads)
+    ph.Viterbi(seqiddb)
     ph.state_to_aligment(seqiddb)
     del ph
     gc.collect()
 
-def viterbi_in_Graph(testGraphPath, iniPath,outpath,threads,chunk_size,seq_num):
+def viterbi_in_Graph(testGraphPath, iniPath,outpath,threads,chunk_size):
     
     def subViterbi():
         while not taskList.empty():
@@ -708,7 +681,7 @@ def viterbi_in_Graph(testGraphPath, iniPath,outpath,threads,chunk_size,seq_num):
                     inputDAG = load_DAG(Viterbi_DAG_Path, load_onmfile=True)
 
                     viterbi_whithout_mapping(parameter_path, Viterbi_DAG_Path, sub_Viterbi_result_path,
-                            parasName, seqiddb, ref_seq,inputDAG,threads=threads)
+                            parasName, seqiddb, ref_seq,inputDAG)
                     sys.stdout = sys.__stdout__
                     sys.stderr = sys.__stderr__
                     taskNum.value+=1
@@ -748,7 +721,7 @@ def viterbi_in_Graph(testGraphPath, iniPath,outpath,threads,chunk_size,seq_num):
         taskList.put([subGid])
         allstep+=paraNum
     
-    if seq_num<40000:
+    if subgraph_num<400:
         allstep+=1
     taskNum = Value('i',0)
 
@@ -761,8 +734,6 @@ def viterbi_in_Graph(testGraphPath, iniPath,outpath,threads,chunk_size,seq_num):
     
     processlist = []
     pool_num = min([10, threads // 4,len(subgraphList)])
-    if pool_num==0:
-        pool_num=1
     for idx in range(pool_num):
         processlist.append(Process(
             target=subViterbi,
@@ -790,7 +761,7 @@ def viterbi_in_Graph(testGraphPath, iniPath,outpath,threads,chunk_size,seq_num):
     print_x(start, taskNum.value, allstep,'Evaluating alignment quality')
     sp_and_entropy = sorted(sp_and_entropy, key=lambda x: x[-1])
     besten, bestsp = write_report(sp_and_entropy, outpath)
-    if seq_num<40000:
+    if subgraph_num<400:
         print_x(start, taskNum.value, allstep,'Writing final FASTA output')
         zipAlign2Fasta(Viterbi_result_path/f'alizips/tr{besten}/zipalign.npz', outpath/'align_result.fasta')
         taskNum.value+=1
@@ -809,7 +780,6 @@ if __name__ == "__main__":
         epilog="Example usage for large datasets:\n  python DAG_Ali.py -i viral_sequences.fasta -o ./align_results -t 36 -l",
         formatter_class=argparse.RawTextHelpFormatter
     )
-
     parser.add_argument('--input'          , '-i', required=True, help='Input FASTA file path (required)')
     parser.add_argument('--output'         , '-o', required=True, help='Output directory path (required)')
     parser.add_argument('--fragment_Length', '-f', type=int,     help='Fragment length for building DAPG. If not specified, enters automatic mode (default: auto)', default=None)
@@ -843,7 +813,6 @@ if __name__ == "__main__":
             fragment_length = args.fragment_Length
         else:
             kmer_diversity_ratio = calculate_kmer_diversity_ratio(inpath, k_size=32, threads=threads)
-            print(kmer_diversity_ratio,'dd')
             if kmer_diversity_ratio is not None and kmer_diversity_ratio >= 0.9:
                 fragment_length = 16
             else:
@@ -855,7 +824,7 @@ if __name__ == "__main__":
     os.makedirs(outpath, exist_ok=True)
     sub_fasta_path = os.path.join(outpath, 'subfastas')
     os.makedirs(sub_fasta_path, exist_ok=True)
-    seq_num, seqfileList = split_fasta(inpath, sub_fasta_path, chunk_size=chunk_size)
+    set_num, seqfileList = split_fasta(inpath, sub_fasta_path, chunk_size=chunk_size)
     
     print("\nStage 2: Constructing sequence graph...")
     final_graph_path, hierarchy, subgraph_num = graph_construction(
@@ -863,13 +832,13 @@ if __name__ == "__main__":
         threads=threads, fragmentLength=fragment_length
     )
 
-
     if not args.Onlybuild:
         print("\nStage 3: Aligning sequences...")
         final_graph_path = outpath/'final_graph'
+        
         train_in_all(hierarchy, final_graph_path, outpath, subgraph_num, threads, fit=True)
         print()
-        viterbi_in_Graph(outpath, outpath, outpath, threads, chunk_size,seq_num)
+        viterbi_in_Graph(outpath, outpath, outpath, threads, chunk_size)
         
     print("\nAlignment complete.")
 
