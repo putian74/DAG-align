@@ -1,6 +1,6 @@
-# **DAPG-TPHMM: Accurate Multiple Sequence Alignment of Ultramassive Genome Sets**
+# **DAG-align: Accurate Multiple Sequence Alignment of Ultramassive Genome Sets**
 
-**DAPG-TPHMM** is a high-performance, high-accuracy multiple sequence alignment (MSA) tool designed to handle ultramassive genomic datasets containing millions of sequences. It leverages a novel pangenome graph structure (FTO-DAPG) and a Tiled Profile Hidden Markov Model (TPHMM) to achieve state-of-the-art accuracy with unprecedented speed and scalability.
+**DAG-align** is a high-performance, high-accuracy multiple sequence alignment (MSA) tool designed to handle ultramassive genomic datasets containing millions of sequences. It leverages a novel pangenome graph structure (FTO-DAG) and a Tiled Profile Hidden Markov Model (TPHMM) to achieve state-of-the-art accuracy with unprecedented speed and scalability.
 
 This software is the official implementation for the research paper: *"Accurate Multiple Sequence Alignment of Ultramassive Genome Sets"*.
 
@@ -67,7 +67,7 @@ python3 DAG_Ali.py -i <input.fasta> -o <output_directory> -t <threads\>
 
 ### **Modes of Operation**
 
-DAPG-TPHMM has two main operating modes tailored for different dataset sizes.
+DAG-align has two main operating modes tailored for different dataset sizes.
 
 #### **1\. Standard Mode (Default)**
 
@@ -104,3 +104,4 @@ The program implements an adaptive output strategy based on the number of input 
     * \<output\_directory\>/V\_result/alizips/tr0  
     * \<output\_directory\>/V\_result/alizips/tr1  
   * A report file is generated at \<output\_directory\>/report.txt. This file contains the final likelihood scores for both alignment runs. **Users should consult this file to select the alignment with the higher score for downstream analysis.**
+
