@@ -286,7 +286,7 @@ def find_anchor_target(gp_base, gp_add, base_main, add_main):
         ed = block[1][1]          
         w = sum([gp_base.weights[i] for i in anchors[st:ed+1] if i != -1])
         block_weight.append(w)
-    copy_rg = Cyclic_Anchor_Combination_Detection(blocklist, block_weight, blockdif)
+    copy_rg = Cyclic_Anchor_Combination_Detection(blocklist, blockdif, weights)
 
     while copy_rg:
         for rg in copy_rg:
@@ -297,7 +297,7 @@ def find_anchor_target(gp_base, gp_add, base_main, add_main):
                 anchor_list[j] = -1
 
         blocklist, weights, blockdif = array_to_block(Coordinate_list)
-        copy_rg = Cyclic_Anchor_Combination_Detection(blocklist, weights, blockdif)
+        copy_rg = Cyclic_Anchor_Combination_Detection(blocklist, blockdif, weights)
     w=0
     k=0
     for anchor_tuple in anchor_list:
@@ -320,7 +320,6 @@ def anchor_into_base_graph(gp_base,gp_add,newpath,anchor_tuple_list):
             addNodefragment = gp_add.fragments[id]
             addNodeheadtails = gp_add.headtails[id]
             new_base_nodeid = gp_base.totalNodes
-            # print(new_base_nodeid)
             gp_base.addnewNodes(addNodefragment,addNodeheadtails)
             gp_base.weights[new_base_nodeid]=0
             gp_base.SourceList.append([])
@@ -366,12 +365,14 @@ def anchor_into_base_graph(gp_base,gp_add,newpath,anchor_tuple_list):
 def init_graph_merge(graphfile, tmp_gindex):
     graph = load_DAG(graphfile)                     
     graph.reflist = graph.findMainPathNodes(0.5)  
-    graph.SourceList = [[(tmp_gindex,idx)] for idx in range(graph.totalNodes)]             
+    graph.SourceList = [[(tmp_gindex,idx)] for idx in range(graph.totalNodes)]
+             
     main_list = sorted([
         [node_id, graph.queryGraph.coordinateList[node_id]] 
         for node_id in graph.reflist 
         if graph.headtails[node_id] == 0          
-    ], key=lambda x: x[1])                   
+    ], key=lambda x: x[1])              
+         
     return graph, main_list
 
 def Tracing_merge(graphfileA, graphfileB, newpath):
@@ -466,6 +467,7 @@ def merge_graph(graphfileA, graphfileB, newpath):
     graphA.sequenceIDList += graphB.sequenceIDList           
     graphA.fastaFilePathList.extend(graphB.fastaFilePathList)            
     graphA.queryGraph.calculateCoordinates()                      
+
     graphA.save_graph(mode='merge',maxdistant=10, savePath=newpath) 
     del graphA
     del graphB
@@ -474,41 +476,31 @@ def merge_graph(graphfileA, graphfileB, newpath):
 
 def find_anchor_target_new(gp_base, gp_add, base_main, add_main):
     tupset = set()
+    base_seqs_dict = {}
+    for node in base_main:
+        fragment = gp_base.fragments[node[0]]
+        base_seqs_dict[fragment] = base_seqs_dict.get(fragment, [])
+        base_seqs_dict[fragment].append(node[0])
     Coordinate_list = []                
     anchor_list = []                   
     anchors = []
     alternative_anchor_list = []
     for node in add_main:
-        seq = gp_add.fragments[node[0]]                
+        seq = gp_add.fragments[node[0]]
+        optional_anchors = base_seqs_dict.get(seq, [])
         alternative_anchor_list.append(gp_base.fragmentNodeDict.get(seq,[]))
-        optional_anchors = alternative_anchor_list[-1]
         if optional_anchors:
-            n = len(optional_anchors)
-            if n == 1:
-                anchor =  optional_anchors[0]
-            else:
-                max_weight = -np.inf
-                max_anchor = -1  
-                count = 0
-                for anchor in optional_anchors:
-                    w = gp_base.weights[anchor]
-                    if w > max_weight:
-                        max_weight = w
-                        max_anchor = anchor
-                        count = 1
-                    elif w == max_weight:
-                        count += 1
-                anchor = max_anchor if count == 1 else -1
-            if anchor!=-1:
-                Coordinate_list.append(gp_base.queryGraph.coordinateList[anchor])
-            else:
-                Coordinate_list.append(-1)
+            anchor = optional_anchors[0]               
+            Coordinate_list.append(gp_base.queryGraph.coordinateList[anchor])
             anchor_list.append(anchor)
             anchors.append(anchor)
         else:
             Coordinate_list.append(-1)
             anchors.append(-1)              
             anchor_list.append(-1)
+    anchor_list = np.array(anchor_list)
+    anchor_list[np.isin(anchor_list, (u := np.unique(anchor_list[anchor_list != -1], return_counts=True))[0][u[1] > 1])] = -1
+
     blocklist, weights, blockdif = array_to_block(Coordinate_list)
 
     block_weight = []
@@ -517,7 +509,7 @@ def find_anchor_target_new(gp_base, gp_add, base_main, add_main):
         ed = block[1][1]          
         w = sum([gp_base.weights[i] for i in anchors[st:ed+1] if i != -1])
         block_weight.append(w)
-    copy_rg = Cyclic_Anchor_Combination_Detection(blocklist, block_weight, blockdif)
+    copy_rg = Cyclic_Anchor_Combination_Detection(blocklist, blockdif, weights)
 
     for rg in copy_rg:
         start_idx = rg[0][1]
@@ -543,6 +535,8 @@ def find_anchor_target_new(gp_base, gp_add, base_main, add_main):
         else:
             cursor_coor += 1
         sequencePathCoordinates[index] = cursor_coor
+    
+
     unanchor_block = find_consecutive_negatives(Coordinate_list)
     for block in unanchor_block:
         subanchor_list = alternative_anchor_list[block[0]:block[1]+1]
@@ -574,7 +568,8 @@ def init_graph_merge_new(graphfile, tmp_gindex):
         [node_id, graph.queryGraph.coordinateList[node_id]] 
         for node_id in graph.reflist 
         if graph.headtails[node_id] == 0          
-    ]                        
+    ]              
+
     return graph, main_list
 
 def merge_graph_new(graphfileA, graphfileB, newpath):
@@ -583,6 +578,9 @@ def merge_graph_new(graphfileA, graphfileB, newpath):
         os.mkdir(newpath)
     graphA, main_list_A = init_graph_merge_new(graphfileA, 0)
     graphB, main_list_B = init_graph_merge_new(graphfileB, 1)
+
+    print(graphfileA)
+    print(graphfileB)
     anchored_pairs_A,wA = find_anchor_target_new(graphA, graphB, main_list_A, main_list_B)
     anchored_pairs_B,wB = find_anchor_target_new(graphB, graphA, main_list_B, main_list_A) 
 
@@ -608,11 +606,13 @@ def merge_graph_new(graphfileA, graphfileB, newpath):
     for edge_tuple, weight in Add_graph.edgeWeightDict.items():
         newlinkset.append([edge_tuple[0], edge_tuple[1], weight])
     Add_graph.edgeWeightDict = newlinkset
+
     anchor_into_base_graph(Base_graph, Add_graph, newpath, anchor_tuple_list)
     Base_graph.graphID = Base_graph.graphID + '&' + Add_graph.graphID         
     Base_graph.sequenceIDList += Add_graph.sequenceIDList           
     Base_graph.fastaFilePathList.extend(Add_graph.fastaFilePathList)            
     Base_graph.queryGraph.calculateCoordinates()
+
 
     Base_graph.save_graph(mode='merge',maxdistant=10, savePath=newpath) 
     del Base_graph
