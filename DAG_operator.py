@@ -403,7 +403,6 @@ def find_anchor_target_new(gp_base, gp_add, base_main, add_main):
             anchors.append(-1)              
             anchor_list.append(-1)
     anchor_list = np.array(anchor_list)
-    anchor_list[np.isin(anchor_list, (u := np.unique(anchor_list[anchor_list != -1], return_counts=True))[0][u[1] > 1])] = -1
 
     blocklist, weights, blockdif = array_to_block(Coordinate_list)
 
