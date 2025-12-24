@@ -733,7 +733,7 @@ def viterbi_in_Graph(testGraphPath, iniPath,outpath,threads,chunk_size):
     os.makedirs(Viterbi_result_path/'alizips'/'Logs',exist_ok=True)
     
     processlist = []
-    pool_num = min([10, threads // 4,len(subgraphList)])
+    pool_num = max(min([10, threads // 4,len(subgraphList)]),1)
     for idx in range(pool_num):
         processlist.append(Process(
             target=subViterbi,
