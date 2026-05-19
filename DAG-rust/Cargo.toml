@@ -1,0 +1,17 @@
+[package]
+name = "dag-rust"
+version = "0.1.0"
+edition = "2024"
+description = "Rust FTO-DAG construction and graph export core for DAG-align"
+license = "MIT"
+
+[lib]
+name = "dag_rust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dag-rust"
+path = "src/main.rs"
+
+[dependencies]
+
