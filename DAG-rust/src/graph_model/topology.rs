@@ -31,13 +31,13 @@ impl DagTopology {
         let mut parents = vec![Vec::new(); node_count];
         let mut children = vec![Vec::new(); node_count];
         for edge in graph.edges() {
-            let source = edge.key.source.to_usize();
-            let target = edge.key.target.to_usize();
-            if source >= node_count || target >= node_count {
-                return Err(DagError::InvalidEdge { source, target });
+            let parent = edge.key.parent.to_usize();
+            let child = edge.key.child.to_usize();
+            if parent >= node_count || child >= node_count {
+                return Err(DagError::InvalidEdge { parent, child });
             }
-            children[source].push(edge.key.target);
-            parents[target].push(edge.key.source);
+            children[parent].push(edge.key.child);
+            parents[child].push(edge.key.parent);
         }
 
         let topological_order = topological_sort(&parents, &children)?;

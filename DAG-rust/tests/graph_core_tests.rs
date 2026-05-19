@@ -32,8 +32,8 @@ fn endpoint_index_separates_sequence_and_structural_endpoints() {
     assert_eq!(update.weight, Weight::new(3));
     assert_eq!(
         graph.edge_weight(EdgeKey {
-            source: start,
-            target: internal,
+            parent: start,
+            child: internal,
         }),
         Some(Weight::new(3))
     );
@@ -51,9 +51,9 @@ fn endpoint_index_separates_sequence_and_structural_endpoints() {
 
 #[test]
 fn hybrid_edge_index_increments_existing_edges() {
-    let mut graph = FtoDag::with_source_and_edge_storage(
+    let mut graph = FtoDag::with_provenance_and_edge_storage(
         1,
-        SourceStorageStrategy::FullRecords,
+        ProvenanceStorageStrategy::FullRecords,
         EdgeIndexStrategy::LowDegreeHybrid,
     );
     let left = graph.add_node(key(1), NodeKind::Start).unwrap();
@@ -75,8 +75,8 @@ fn hybrid_edge_index_increments_existing_edges() {
     assert_eq!(graph.edge_count(), 1);
     assert_eq!(
         graph.edge_weight(EdgeKey {
-            source: left,
-            target: right,
+            parent: left,
+            child: right,
         }),
         Some(Weight::new(4))
     );
@@ -127,140 +127,140 @@ fn fragment_index_uses_packed_inline_keys() {
 }
 
 #[test]
-fn graph_owned_source_table_tracks_node_source_ranges() {
+fn graph_owned_provenance_table_tracks_node_provenance_ranges() {
     let mut graph = FtoDag::new(1);
     let left = graph.add_node(key(1), NodeKind::Start).unwrap();
     let right = graph.add_node(key(2), NodeKind::End).unwrap();
 
     graph
-        .add_source_record(
+        .add_provenance_record(
             left,
-            SourceRecord {
+            ProvenanceRecord {
                 sequence_id: SequenceId::new(0),
-                position: SourcePosition::new(10),
+                position: ProvenancePosition::new(10),
             },
         )
         .unwrap();
     graph
-        .add_source_record(
+        .add_provenance_record(
             right,
-            SourceRecord {
+            ProvenanceRecord {
                 sequence_id: SequenceId::new(0),
-                position: SourcePosition::new(11),
+                position: ProvenancePosition::new(11),
             },
         )
         .unwrap();
     graph
-        .add_source_record(
+        .add_provenance_record(
             left,
-            SourceRecord {
+            ProvenanceRecord {
                 sequence_id: SequenceId::new(1),
-                position: SourcePosition::new(20),
+                position: ProvenancePosition::new(20),
             },
         )
         .unwrap();
 
-    let left_sources = graph.source_records(left).unwrap();
-    assert_eq!(left_sources.len(), 2);
-    assert_eq!(left_sources[0].sequence_id, SequenceId::new(0));
-    assert_eq!(left_sources[1].sequence_id, SequenceId::new(1));
+    let left_provenance = graph.provenance_records(left).unwrap();
+    assert_eq!(left_provenance.len(), 2);
+    assert_eq!(left_provenance[0].sequence_id, SequenceId::new(0));
+    assert_eq!(left_provenance[1].sequence_id, SequenceId::new(1));
     assert_eq!(graph.nodes()[left.to_usize()].weight, Weight::new(2));
     assert!(graph.validate().is_valid());
 }
 
 #[test]
-fn packed32_source_storage_round_trips_records() {
-    let mut graph = FtoDag::with_source_storage(1, SourceStorageStrategy::Packed32);
+fn packed32_provenance_storage_round_trips_records() {
+    let mut graph = FtoDag::with_provenance_storage(1, ProvenanceStorageStrategy::Packed32);
     let node = graph.add_node(key(1), NodeKind::Singleton).unwrap();
     let records = [
-        SourceRecord {
+        ProvenanceRecord {
             sequence_id: SequenceId::new(12),
-            position: SourcePosition::new(34),
+            position: ProvenancePosition::new(34),
         },
-        SourceRecord {
+        ProvenanceRecord {
             sequence_id: SequenceId::new(56),
-            position: SourcePosition::new(78),
+            position: ProvenancePosition::new(78),
         },
     ];
 
     for record in records {
-        graph.add_source_record(node, record).unwrap();
+        graph.add_provenance_record(node, record).unwrap();
     }
 
     assert_eq!(
-        graph.source_storage_strategy(),
-        SourceStorageStrategy::Packed32
+        graph.provenance_storage_strategy(),
+        ProvenanceStorageStrategy::Packed32
     );
-    assert!(graph.retains_source_records());
-    assert_eq!(graph.source_record_count(node).unwrap(), records.len());
-    assert_eq!(graph.source_records(node).unwrap(), records);
+    assert!(graph.retains_provenance_records());
+    assert_eq!(graph.provenance_record_count(node).unwrap(), records.len());
+    assert_eq!(graph.provenance_records(node).unwrap(), records);
     assert!(graph.validate().is_valid());
 }
 
 #[test]
-fn count_only_source_storage_tracks_counts_without_records() {
-    let mut graph = FtoDag::with_source_storage(1, SourceStorageStrategy::CountOnly);
+fn count_only_provenance_storage_tracks_counts_without_records() {
+    let mut graph = FtoDag::with_provenance_storage(1, ProvenanceStorageStrategy::CountOnly);
     let node = graph.add_node(key(1), NodeKind::Singleton).unwrap();
     graph
-        .add_source_record(
+        .add_provenance_record(
             node,
-            SourceRecord {
+            ProvenanceRecord {
                 sequence_id: SequenceId::new(0),
-                position: SourcePosition::new(10),
+                position: ProvenancePosition::new(10),
             },
         )
         .unwrap();
     graph
-        .add_source_record(
+        .add_provenance_record(
             node,
-            SourceRecord {
+            ProvenanceRecord {
                 sequence_id: SequenceId::new(1),
-                position: SourcePosition::new(11),
+                position: ProvenancePosition::new(11),
             },
         )
         .unwrap();
 
     assert_eq!(
-        graph.source_storage_strategy(),
-        SourceStorageStrategy::CountOnly
+        graph.provenance_storage_strategy(),
+        ProvenanceStorageStrategy::CountOnly
     );
-    assert_eq!(graph.source_record_count(node).unwrap(), 2);
-    assert!(graph.source_records(node).is_err());
+    assert_eq!(graph.provenance_record_count(node).unwrap(), 2);
+    assert!(graph.provenance_records(node).is_err());
     assert!(graph.validate().is_valid());
 }
 
 #[test]
-fn trace_path_source_storage_tracks_sequence_paths_without_node_records() {
-    let mut graph = FtoDag::with_source_storage(1, SourceStorageStrategy::TracePaths);
+fn trace_path_provenance_storage_tracks_sequence_paths_without_node_records() {
+    let mut graph = FtoDag::with_provenance_storage(1, ProvenanceStorageStrategy::TracePaths);
     let left = graph.add_node(key(1), NodeKind::Start).unwrap();
     let right = graph.add_node(key(2), NodeKind::End).unwrap();
     graph
-        .add_source_record(
+        .add_provenance_record(
             left,
-            SourceRecord {
+            ProvenanceRecord {
                 sequence_id: SequenceId::new(0),
-                position: SourcePosition::new(0),
+                position: ProvenancePosition::new(0),
             },
         )
         .unwrap();
     graph
-        .add_source_record(
+        .add_provenance_record(
             right,
-            SourceRecord {
+            ProvenanceRecord {
                 sequence_id: SequenceId::new(0),
-                position: SourcePosition::new(1),
+                position: ProvenancePosition::new(1),
             },
         )
         .unwrap();
 
     assert_eq!(
-        graph.source_storage_strategy(),
-        SourceStorageStrategy::TracePaths
+        graph.provenance_storage_strategy(),
+        ProvenanceStorageStrategy::TracePaths
     );
-    assert!(!graph.retains_source_records());
+    assert!(!graph.retains_provenance_records());
     assert!(graph.retains_sequence_trace_paths());
-    assert_eq!(graph.source_record_count(left).unwrap(), 1);
-    assert!(graph.source_records(left).is_err());
+    assert_eq!(graph.provenance_record_count(left).unwrap(), 1);
+    assert!(graph.provenance_records(left).is_err());
     assert_eq!(
         graph.sequence_trace_path(SequenceId::new(0)).unwrap(),
         &[left, right]
@@ -269,16 +269,16 @@ fn trace_path_source_storage_tracks_sequence_paths_without_node_records() {
 }
 
 #[test]
-fn validation_reports_duplicate_sequence_sources() {
+fn validation_reports_duplicate_sequence_provenance() {
     let mut graph = FtoDag::new(1);
     let node = graph.add_node(key(1), NodeKind::Singleton).unwrap();
     for position in [0, 1] {
         graph
-            .add_source_record(
+            .add_provenance_record(
                 node,
-                SourceRecord {
+                ProvenanceRecord {
                     sequence_id: SequenceId::new(7),
-                    position: SourcePosition::new(position),
+                    position: ProvenancePosition::new(position),
                 },
             )
             .unwrap();
@@ -288,7 +288,7 @@ fn validation_reports_duplicate_sequence_sources() {
     assert!(
         report
             .errors
-            .contains(&GraphValidationError::DuplicateSequenceSource {
+            .contains(&GraphValidationError::DuplicateSequenceProvenance {
                 node: node.to_usize(),
                 sequence: 7,
             })

@@ -43,8 +43,8 @@ fn manifest_exposes_ad_phmm_contract_names() {
     let mut manifest =
         TensorGraphManifest::new_v1(SourceFormat::DagAlignLegacy, 2, 1).with_global_state_count(5);
     manifest.add_array(ArraySpec::new(
-        "node_state_left",
-        "coordinates/node_state_left.npy",
+        "node_window_left",
+        "coordinates/node_window_left.npy",
         DataType::U64,
         vec![2],
     ));
@@ -55,7 +55,7 @@ fn manifest_exposes_ad_phmm_contract_names() {
         manifest.state_interval_semantics,
         StateIntervalSemantics::HalfOpen
     );
-    assert!(manifest.require_array("node_state_left").is_some());
+    assert!(manifest.require_array("node_window_left").is_some());
 }
 
 #[test]
@@ -249,7 +249,12 @@ fn legacy_adapter_converts_tiny_dag_align_graph_with_object_bridge() {
     assert_eq!(output.initializations.tracks.len(), 2);
     assert!(output_dir.join("manifest.json").exists());
     assert!(output_dir.join("graph/node_symbol.npy").exists());
-    assert!(output_dir.join("coordinates/node_state_left.npy").exists());
+    assert!(
+        output_dir
+            .join("coordinates/node_coordinate_left.npy")
+            .exists()
+    );
+    assert!(output_dir.join("coordinates/node_window_left.npy").exists());
     assert!(
         output_dir
             .join("coordinates/edge_state_overlap_len.npy")

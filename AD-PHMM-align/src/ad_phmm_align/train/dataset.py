@@ -34,8 +34,10 @@ class PreparedTrainingBatch:
     edge_src: Any
     edge_dst: Any
     edge_weight: Any
-    node_state_left: Any
-    node_state_right: Any
+    node_coordinate_left: Any
+    node_coordinate_right: Any
+    node_window_left: Any
+    node_window_right: Any
     node_flags: Optional[Any] = None
     topo_order: Optional[Any] = None
     csr_indptr: Optional[Any] = None

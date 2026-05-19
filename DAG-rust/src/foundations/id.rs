@@ -48,5 +48,5 @@ typed_numeric!(ChunkId, u32);
 typed_numeric!(RoundId, u32);
 typed_numeric!(TopologicalCoordinate, u32);
 typed_numeric!(Weight, u64);
-typed_numeric!(SourcePosition, u64);
+typed_numeric!(ProvenancePosition, u64);
 typed_numeric!(GlobalStateId, u32);

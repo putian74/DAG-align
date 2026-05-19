@@ -153,8 +153,15 @@ fn validate_array_shape_contract(
     report: &mut ValidationReport,
 ) {
     match array.name.as_str() {
-        "node_symbol" | "node_weight" | "node_flags" | "node_state_left" | "node_state_right"
-        | "node_state_offset" | "node_state_len" => {
+        "node_symbol"
+        | "node_weight"
+        | "node_flags"
+        | "node_coordinate_left"
+        | "node_coordinate_right"
+        | "node_window_left"
+        | "node_window_right"
+        | "node_state_offset"
+        | "node_state_len" => {
             if array.shape.first().copied() != Some(manifest.node_count) {
                 report.error(
                     "manifest_node_array_shape",
@@ -322,8 +329,10 @@ fn graph_core_required_arrays() -> &'static [&'static str] {
 
 fn training_ready_required_arrays() -> &'static [&'static str] {
     &[
-        "node_state_left",
-        "node_state_right",
+        "node_coordinate_left",
+        "node_coordinate_right",
+        "node_window_left",
+        "node_window_right",
         "node_state_offset",
         "node_state_len",
         "edge_state_src_offset",
@@ -351,6 +360,21 @@ fn validate_related_array_shapes(manifest: &TensorGraphManifest, report: &mut Va
             "manifest_source_position_shape",
             "source_position length must match source_packed length",
         );
+    }
+    for (left_name, right_name) in [
+        ("node_coordinate_left", "node_coordinate_right"),
+        ("node_window_left", "node_window_right"),
+    ] {
+        if let (Some(left), Some(right)) = (
+            manifest.require_array(left_name),
+            manifest.require_array(right_name),
+        ) && left.shape != right.shape
+        {
+            report.error(
+                "manifest_interval_pair_shape",
+                format!("{left_name} and {right_name} must have identical shapes"),
+            );
+        }
     }
 }
 

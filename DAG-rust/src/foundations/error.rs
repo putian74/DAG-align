@@ -36,10 +36,10 @@ pub enum DagError {
         node: usize,
     },
     InvalidEdge {
-        source: usize,
-        target: usize,
+        parent: usize,
+        child: usize,
     },
-    DuplicateSequenceSource {
+    DuplicateSequenceProvenance {
         node: usize,
         sequence: u32,
     },
@@ -48,6 +48,8 @@ pub enum DagError {
         expected: u32,
         found: u32,
     },
+    Io(String),
+    InvalidStorage(String),
     UnsupportedOperation(&'static str),
 }
 
@@ -79,10 +81,10 @@ impl Display for DagError {
                 write!(f, "invalid range {start}..{end} for length {len}")
             }
             Self::MissingNode { node } => write!(f, "missing node {node}"),
-            Self::InvalidEdge { source, target } => {
-                write!(f, "invalid edge ({source}, {target})")
+            Self::InvalidEdge { parent, child } => {
+                write!(f, "invalid edge ({parent}, {child})")
             }
-            Self::DuplicateSequenceSource { node, sequence } => {
+            Self::DuplicateSequenceProvenance { node, sequence } => {
                 write!(f, "node {node} already contains sequence {sequence}")
             }
             Self::CycleDetected => write!(f, "cycle detected"),
@@ -92,6 +94,8 @@ impl Display for DagError {
                     "storage version mismatch: expected {expected}, found {found}"
                 )
             }
+            Self::Io(message) => write!(f, "i/o error: {message}"),
+            Self::InvalidStorage(message) => write!(f, "invalid storage: {message}"),
             Self::UnsupportedOperation(message) => write!(f, "unsupported operation: {message}"),
         }
     }

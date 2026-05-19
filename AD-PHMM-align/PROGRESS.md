@@ -37,22 +37,32 @@ It should not own legacy DAG-align pickle/object conversion or CPU-heavy preproc
   - Added edge-overlap cross-checks against packed node windows.
   - Added training artifact precondition checks for required state windows and edge overlaps.
   - Extended prepared training batches with graph scheduling/adjacency fields needed by DP kernels.
+- Implemented the first loader/range scaffold pass:
+  - Added typed `tensor_graph.v1` and initialization artifact loaders with dtype/shape validation.
+  - Added named transition-logit views so PHMM code consumes one packed tensor through stable transition names.
+  - Added effective packed-state masks, forward/backward support propagation, and wavefront scheduling scaffolds.
+  - Added typed forward/backward, Viterbi, and soft-Viterbi preparer interfaces plus trainer runtime-artifact loading.
+  - Tightened consistency checks for packed-window offsets, overlap edge IDs, transition tensor rank/width, and graph/init compatibility.
+  - Added unit coverage for loader wiring, transition views, effective-support propagation, and wavefront schedules.
+  - Adopted the explicit coordinate/window split from Pre-AD-prep:
+    - `node_coordinate_left/right` carry raw propagated legal spans.
+    - `node_window_left/right` carry the static padded DP windows that must match packed-window arrays.
+    - `TensorDag`, loaders, and public batch contracts now distinguish those two interval layers directly.
 
 ## Active phase
 
-**Next:** implement artifact loaders for the `Pre-AD-prep/tensor_graph.v1` manifest and arrays using the tightened contracts.
+**Next:** implement the CPU reference forward/backward and hard/soft Viterbi recurrences on top of the now-typed loader, effective-support, and wavefront scaffolds.
 
 ## Pending phases
 
-1. Implement artifact loaders for `tensor_graph.v1`.
-2. Validate graph arrays, state windows, edge overlaps, and initialization artifacts.
-3. Instantiate PHMM tensors from `InitialPhmmParameters`.
-4. Implement CPU reference banded DP for tiny tests.
-5. Implement PyTorch packed-window forward/backward.
-6. Implement soft-Viterbi and hard Viterbi over the same packed-window layout.
-7. Implement losses and metrics.
-8. Implement subgraph SGD with global state projections.
-9. Add DAG-rust/Pre-AD-prep migration tests and benchmarks.
+1. Implement CPU reference forward/backward for branching/merging DAGs.
+2. Implement soft-Viterbi and hard Viterbi over the same packed-window layout.
+3. Lift the reference kernels to a PyTorch wavefront backend.
+4. Profile and optimize CUDA-oriented merge-reduction and overlap-transfer hotspots.
+5. Implement losses and metrics.
+6. Implement subgraph SGD with global state projections.
+7. Compare `reference_msa` initialization after baseline training is stable.
+8. Add DAG-rust/Pre-AD-prep migration tests and benchmarks.
 
 ## Alternating iteration workflow
 

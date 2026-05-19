@@ -36,6 +36,14 @@ class PackedStateWindows:
             raise ArtifactValidationError("packed window arrays must match")
         if np.any(self.offset < 0):
             raise ArtifactValidationError("packed window offset is negative")
+        if self.offset.size and int(self.offset[0]) != 0:
+            raise ArtifactValidationError("packed window offsets must start at 0")
+        if self.offset.size > 1:
+            expected_offset = self.offset[:-1] + self.length[:-1]
+            if np.any(self.offset[1:] != expected_offset):
+                raise ArtifactValidationError(
+                    "packed window offsets must be contiguous with preceding lengths"
+                )
         expected = self.right - self.left
         if np.any(self.length != expected):
             raise ArtifactValidationError(

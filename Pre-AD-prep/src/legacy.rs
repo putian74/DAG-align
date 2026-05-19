@@ -432,13 +432,23 @@ fn write_coordinate_artifacts(
     edge_count: usize,
 ) -> Result<()> {
     let coordinates_dir = output_dir.join("coordinates");
-    let node_state_left: Vec<u64> = coordinates
+    let node_coordinate_left: Vec<u64> = coordinates
         .node_intervals
         .iter()
         .map(|interval| interval.left as u64)
         .collect();
-    let node_state_right: Vec<u64> = coordinates
+    let node_coordinate_right: Vec<u64> = coordinates
         .node_intervals
+        .iter()
+        .map(|interval| interval.right as u64)
+        .collect();
+    let node_window_left: Vec<u64> = windows
+        .intervals
+        .iter()
+        .map(|interval| interval.left as u64)
+        .collect();
+    let node_window_right: Vec<u64> = windows
+        .intervals
         .iter()
         .map(|interval| interval.right as u64)
         .collect();
@@ -454,12 +464,20 @@ fn write_coordinate_artifacts(
     }
 
     write_npy_1d(
-        coordinates_dir.join("node_state_left.npy"),
-        &node_state_left,
+        coordinates_dir.join("node_coordinate_left.npy"),
+        &node_coordinate_left,
     )?;
     write_npy_1d(
-        coordinates_dir.join("node_state_right.npy"),
-        &node_state_right,
+        coordinates_dir.join("node_coordinate_right.npy"),
+        &node_coordinate_right,
+    )?;
+    write_npy_1d(
+        coordinates_dir.join("node_window_left.npy"),
+        &node_window_left,
+    )?;
+    write_npy_1d(
+        coordinates_dir.join("node_window_right.npy"),
+        &node_window_right,
     )?;
     write_npy_1d(
         coordinates_dir.join("node_state_offset.npy"),
@@ -521,8 +539,8 @@ fn add_generated_manifest_arrays(
         push_array_if_missing(
             manifest,
             ArraySpec::new(
-                "node_state_left",
-                "coordinates/node_state_left.npy",
+                "node_coordinate_left",
+                "coordinates/node_coordinate_left.npy",
                 DataType::U64,
                 vec![node_count],
             ),
@@ -530,8 +548,26 @@ fn add_generated_manifest_arrays(
         push_array_if_missing(
             manifest,
             ArraySpec::new(
-                "node_state_right",
-                "coordinates/node_state_right.npy",
+                "node_coordinate_right",
+                "coordinates/node_coordinate_right.npy",
+                DataType::U64,
+                vec![node_count],
+            ),
+        );
+        push_array_if_missing(
+            manifest,
+            ArraySpec::new(
+                "node_window_left",
+                "coordinates/node_window_left.npy",
+                DataType::U64,
+                vec![node_count],
+            ),
+        );
+        push_array_if_missing(
+            manifest,
+            ArraySpec::new(
+                "node_window_right",
+                "coordinates/node_window_right.npy",
                 DataType::U64,
                 vec![node_count],
             ),

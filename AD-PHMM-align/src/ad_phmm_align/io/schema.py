@@ -99,3 +99,17 @@ class InitialPhmmParameters:
         }
         data.update(dict(self.metadata))
         return data
+
+
+@dataclass(frozen=True)
+class InitialPhmmManifest:
+    """Typed initialization manifest before loading tensor arrays."""
+
+    track: InitializationTrack
+    global_state_count: int
+    alphabet_size: int
+    transition_order: Sequence[str]
+    match_emission: ArraySpec
+    insert_emission: ArraySpec
+    transition_logits: ArraySpec
+    metadata: Mapping[str, Any] = field(default_factory=dict)

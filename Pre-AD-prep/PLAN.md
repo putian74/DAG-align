@@ -40,8 +40,10 @@ tensor_graph.v1/
     topo_level_ptr.npy
     topo_level_nodes.npy
   coordinates/
-    node_state_left.npy
-    node_state_right.npy
+    node_coordinate_left.npy
+    node_coordinate_right.npy
+    node_window_left.npy
+    node_window_right.npy
     node_state_offset.npy
     node_state_len.npy
     edge_state_src_offset.npy
@@ -70,7 +72,12 @@ tensor_graph.v1/
 
 The format should avoid Python object arrays. All arrays should have explicit dtype, shape, semantics, and required/optional status in `manifest.json`.
 
-All PHMM state intervals use half-open `[left, right)` semantics so `node_state_len` is exactly `right - left` and downstream NumPy/PyTorch slicing is unambiguous.
+All PHMM state intervals use half-open `[left, right)` semantics. The exported contract should distinguish:
+
+- `node_coordinate_left/right`: the raw full-graph propagated coordinate/legal span;
+- `node_window_left/right`: the padded static DP window actually paired with `node_state_offset/len` and `edge_state_*`.
+
+`node_state_len` must equal `node_window_right - node_window_left`, and edge-overlap offsets must always be defined in `node_window_*` space rather than raw coordinate-span space.
 
 ## Implementation phases
 
@@ -106,7 +113,8 @@ All PHMM state intervals use half-open `[left, right)` semantics so `node_state_
 
 7. **Initialization artifacts**
    - Export `legacy_current` initialization in a common schema.
-   - Export `reference_msa` initialization in the same schema.
+   - Keep `legacy_current` as the baseline path used to complete the first PHMM training pipeline.
+   - Export `reference_msa` initialization in the same schema as an additional path for later comparison against the baseline.
    - Include metadata for graph/reference version, smoothing, priors, parameter shapes, provenance, and track label.
 
 8. **State-sampling ranges and projections**
@@ -134,13 +142,15 @@ All PHMM state intervals use half-open `[left, right)` semantics so `node_state_
 - Initialization tracks produce compatible parameter shapes and metadata.
 - Subgraph projections preserve global PHMM state identity.
 
-## Near-term first slice
+## Current implementation baseline
 
-Start with the legacy DAG-align converter and `tensor_graph.v1` manifest/validation. This creates the artifact contract that both Rust preprocessing and AD-PHMM-align can iterate against.
+The first legacy preprocessing baseline is now end to end:
 
-The initial implemented converter slice uses a transitional Python/Numpy bridge only for reading current DAG-align pickle/object `.npz/.npy` artifacts. The Rust adapter owns the public API, input validation, converter orchestration, typed graph return value, and downstream validation. The bridge output is typed `.npy` arrays plus JSON metadata, so AD-PHMM-align does not need to consume Python object arrays.
+- the transitional Python/Numpy bridge reads current DAG-align pickle/object inputs and emits typed graph/source/reference/init files plus JSON sidecars;
+- the Rust adapter owns input validation, graph reconstruction, fallback reference-path selection, coordinate/window export, training-ready artifact validation, diagnostics, and CLI orchestration;
+- `tensor_graph.v1` now reaches `TrainingReady` for legacy fixtures when a reference path can be imported or derived.
 
-The Rust adapter and AD-PHMM-align manifest schema must stay synchronized for source format, alphabet, symbol encoding, array identity, half-open state interval semantics, diagnostics, and profiling metadata.
+The Rust adapter and AD-PHMM-align manifest schema must stay synchronized for source format, alphabet, symbol encoding, array identity, half-open state interval semantics, diagnostics, profiling metadata, coordinate/window array names, and initialization manifest layout.
 
 ## Detailed module implementation plans
 
@@ -623,7 +633,8 @@ Implementation plan:
   - `global_state_count`;
   - `alphabet_size`.
 - Implement `legacy_current` as a baseline track that mirrors current DAG-align initialization where possible.
-- Implement `reference_msa` as the preferred track from Rust reference-path MSA sufficient statistics.
+- Use `legacy_current` first to unblock end-to-end PHMM training and baseline evaluation.
+- Implement `reference_msa` as a follow-on comparative track from Rust reference-path MSA sufficient statistics.
 - Keep initialization generation deterministic and independently testable from graph conversion.
 
 Detailed blueprint:
@@ -652,12 +663,12 @@ Detailed blueprint:
 Acceptance criteria:
 
 - Both tracks export the same tensor names and compatible shapes.
-- AD-PHMM-align can construct `InitialPhmmParameters` without track-specific code.
+- AD-PHMM-align can construct `InitialPhmmParameters` without track-specific code and can switch from baseline to comparison-track initialization without schema changes.
 - Initialization metadata records source graph, reference, smoothing, priors, and diagnostics.
 
 ### `reference_msa` module to add
 
-Purpose: generate the graph-derived reference-MSA initialization and sampling proposals.
+Purpose: generate the graph-derived reference-MSA initialization and sampling proposals as a later improvement path after baseline PHMM training is complete with `legacy_current`.
 
 Implementation plan:
 
@@ -850,11 +861,12 @@ Acceptance criteria:
 3. Implement global coordinate construction.
 4. Implement packed state windows and edge overlaps.
 5. Implement source-path extraction.
-6. Implement `legacy_current` initialization export.
-7. Implement reference-path MSA sufficient-statistics preprocessing.
-8. Export MSA-derived candidate state ranges and projections.
-9. Add DAG-rust input adapter once DAG-rust exports stabilize.
-10. Optimize and benchmark only after correctness fixtures are stable.
+6. Implement `legacy_current` initialization export and use it as the baseline training path.
+7. Complete PHMM training against the baseline initialization path.
+8. Implement reference-path MSA sufficient-statistics preprocessing as a comparative initialization path.
+9. Export MSA-derived candidate state ranges and projections.
+10. Add DAG-rust input adapter once DAG-rust exports stabilize.
+11. Optimize and benchmark only after correctness fixtures are stable.
 
 Module dependency map:
 
@@ -870,7 +882,6 @@ Module dependency map:
 
 ## Immediate next implementation targets
 
-1. Wire `coordinates/global` into legacy reference inputs and export `node_state_left/right`, `ref_node_ids`, and `ref_sequence_symbols`.
-2. Wire `coordinates/windows` into artifact export for `node_state_offset/len` and edge-overlap arrays.
-3. Extend `legacy` to load optional `thr_*.npz` reference artifacts and optional `ini/*.npy` initialization inputs.
-4. Start `init/legacy_current` on top of the validated graph/source/coordinate artifacts.
+1. Finish and keep validating the `legacy_current` baseline initialization path for downstream PHMM training.
+2. Use the common initialization schema to complete baseline PHMM training before adding reference-MSA-derived statistics.
+3. Keep `reference_msa` scoped as a later comparison path once baseline training metrics are available.

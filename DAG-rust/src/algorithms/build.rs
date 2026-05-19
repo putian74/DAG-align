@@ -3,16 +3,16 @@
 use crate::foundations::error::DagError;
 use crate::foundations::error::Result;
 use crate::foundations::id::{
-    GraphId, NodeId, SequenceId, SourcePosition, TopologicalCoordinate, Weight,
+    GraphId, NodeId, ProvenancePosition, SequenceId, TopologicalCoordinate, Weight,
 };
 use crate::graph_model::graph::{EdgeIndexStrategy, EdgeKey, FtoDag, NodeKind};
-use crate::graph_model::source::{SourceRecord, SourceStorageStrategy};
+use crate::graph_model::provenance::{ProvenanceRecord, ProvenanceStorageStrategy};
 use crate::graph_model::topology::DagTopology;
 use crate::sequence_model::alphabet::Alphabet;
 use crate::sequence_model::fragment::{
     FragmentEncoder, FragmentKey, FragmentOccurrence, PathPositionKind,
 };
-use crate::sequence_model::sequence::{EncodedSequence, SequenceSource};
+use crate::sequence_model::sequence::{EncodedSequence, SequenceInput};
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -34,7 +34,7 @@ pub struct BuildConfig {
     pub min_initial_match_ratio: Option<SimilarityThreshold>,
     pub rejection_policy: RejectionPolicy,
     pub topology_update_strategy: TopologyUpdateStrategy,
-    pub source_storage_strategy: SourceStorageStrategy,
+    pub provenance_storage_strategy: ProvenanceStorageStrategy,
     pub edge_index_strategy: EdgeIndexStrategy,
     pub collect_topology_counters: bool,
     pub topology_rebuild_queue_threshold: Option<usize>,
@@ -49,7 +49,7 @@ impl BuildConfig {
             min_initial_match_ratio: None,
             rejection_policy: RejectionPolicy::RecordAndSkip,
             topology_update_strategy: TopologyUpdateStrategy::FullRebuild,
-            source_storage_strategy: SourceStorageStrategy::FullRecords,
+            provenance_storage_strategy: ProvenanceStorageStrategy::FullRecords,
             edge_index_strategy: EdgeIndexStrategy::GlobalHash,
             collect_topology_counters: false,
             topology_rebuild_queue_threshold: None,
@@ -250,7 +250,7 @@ pub struct BuildSequenceResult {
     pub sequence_id: SequenceId,
     pub node_path: Vec<NodeId>,
     pub inserted_edges: usize,
-    pub source_records_added: usize,
+    pub provenance_records_added: usize,
     pub block_plan: BlockPlan,
 }
 
@@ -279,7 +279,7 @@ pub struct BuildReport {
     pub attempted_sequences: usize,
     pub total_nodes_created: usize,
     pub total_edges_inserted: usize,
-    pub total_source_records_added: usize,
+    pub total_provenance_records_added: usize,
     pub topology_counters: TopologyUpdateCounters,
 }
 
@@ -289,8 +289,8 @@ pub struct TopologyUpdateCounters {
     pub full_rebuild_fallbacks: usize,
     pub new_nodes: usize,
     pub inserted_edges: usize,
-    pub inserted_edges_to_new_targets: usize,
-    pub inserted_edges_to_existing_targets: usize,
+    pub inserted_edges_to_new_children: usize,
+    pub inserted_edges_to_existing_children: usize,
     pub safe_forward_edges: usize,
     pub forward_relax_attempts: usize,
     pub forward_coordinate_updates: usize,
@@ -307,8 +307,8 @@ impl TopologyUpdateCounters {
         self.full_rebuild_fallbacks += other.full_rebuild_fallbacks;
         self.new_nodes += other.new_nodes;
         self.inserted_edges += other.inserted_edges;
-        self.inserted_edges_to_new_targets += other.inserted_edges_to_new_targets;
-        self.inserted_edges_to_existing_targets += other.inserted_edges_to_existing_targets;
+        self.inserted_edges_to_new_children += other.inserted_edges_to_new_children;
+        self.inserted_edges_to_existing_children += other.inserted_edges_to_existing_children;
         self.safe_forward_edges += other.safe_forward_edges;
         self.forward_relax_attempts += other.forward_relax_attempts;
         self.forward_coordinate_updates += other.forward_coordinate_updates;
@@ -366,15 +366,33 @@ pub struct FtoDagBuilder {
 impl FtoDagBuilder {
     pub fn new(config: BuildConfig) -> Self {
         Self {
-            graph: FtoDag::with_source_and_edge_storage(
+            graph: FtoDag::with_provenance_and_edge_storage(
                 config.fragment_len,
-                config.source_storage_strategy,
+                config.provenance_storage_strategy,
                 config.edge_index_strategy,
             ),
             config,
             report: BuildReport::default(),
             topology_cache: None,
         }
+    }
+
+    pub fn from_graph(graph: FtoDag, mut config: BuildConfig) -> Result<Self> {
+        if graph.fragment_len() != config.fragment_len {
+            return Err(DagError::InvalidStorage(format!(
+                "builder fragment length {} does not match graph fragment length {}",
+                config.fragment_len,
+                graph.fragment_len()
+            )));
+        }
+        config.provenance_storage_strategy = graph.provenance_storage_strategy();
+        config.edge_index_strategy = graph.edge_index_strategy();
+        Ok(Self {
+            config,
+            graph,
+            report: BuildReport::default(),
+            topology_cache: None,
+        })
     }
 
     pub fn config(&self) -> BuildConfig {
@@ -400,6 +418,14 @@ impl FtoDagBuilder {
         encoder: &E,
     ) -> Result<BuildSequenceResult> {
         let occurrences = encoder.encode_occurrences(sequence, self.config.fragment_len)?;
+        self.initialize_from_occurrences(sequence_id, occurrences)
+    }
+
+    fn initialize_from_occurrences(
+        &mut self,
+        sequence_id: SequenceId,
+        occurrences: Vec<FragmentOccurrence>,
+    ) -> Result<BuildSequenceResult> {
         let mut previous = None;
         let mut node_path = Vec::new();
         let mut inserted_edges = 0;
@@ -414,7 +440,7 @@ impl FtoDagBuilder {
             previous = Some(node_id);
             node_path.push(node_id);
         }
-        let source_records_added = node_path.len();
+        let provenance_records_added = node_path.len();
         Ok(BuildSequenceResult {
             sequence_id,
             block_plan: BlockPlan {
@@ -423,7 +449,7 @@ impl FtoDagBuilder {
             },
             node_path,
             inserted_edges,
-            source_records_added,
+            provenance_records_added,
         })
     }
 
@@ -438,6 +464,16 @@ impl FtoDagBuilder {
             .outcome)
     }
 
+    pub fn add_sequence_from_occurrences(
+        &mut self,
+        sequence_id: SequenceId,
+        occurrences: Vec<FragmentOccurrence>,
+    ) -> Result<SequenceBuildOutcome> {
+        Ok(self
+            .add_sequence_from_occurrences_profiled(sequence_id, occurrences)?
+            .outcome)
+    }
+
     pub fn add_sequence_from_encoded_profiled<E: FragmentEncoder>(
         &mut self,
         sequence_id: SequenceId,
@@ -446,10 +482,41 @@ impl FtoDagBuilder {
     ) -> Result<ProfiledSequenceBuildOutcome> {
         let total_start = Instant::now();
         let mut timing = BuildTimingBreakdown::default();
+        let start = Instant::now();
+        let occurrences = encoder.encode_occurrences(sequence, self.config.fragment_len)?;
+        timing.fragment_occurrences += start.elapsed();
+        self.add_sequence_from_occurrences_profiled_with_timing(
+            sequence_id,
+            occurrences,
+            total_start,
+            timing,
+        )
+    }
+
+    pub fn add_sequence_from_occurrences_profiled(
+        &mut self,
+        sequence_id: SequenceId,
+        occurrences: Vec<FragmentOccurrence>,
+    ) -> Result<ProfiledSequenceBuildOutcome> {
+        self.add_sequence_from_occurrences_profiled_with_timing(
+            sequence_id,
+            occurrences,
+            Instant::now(),
+            BuildTimingBreakdown::default(),
+        )
+    }
+
+    fn add_sequence_from_occurrences_profiled_with_timing(
+        &mut self,
+        sequence_id: SequenceId,
+        occurrences: Vec<FragmentOccurrence>,
+        total_start: Instant,
+        mut timing: BuildTimingBreakdown,
+    ) -> Result<ProfiledSequenceBuildOutcome> {
         self.report.attempted_sequences += 1;
         if self.graph.node_count() == 0 {
             let start = Instant::now();
-            let result = self.initialize_from_encoded(sequence_id, sequence, encoder)?;
+            let result = self.initialize_from_occurrences(sequence_id, occurrences)?;
             timing.initialize += start.elapsed();
             if self.config.topology_update_strategy.is_incremental() {
                 let start = Instant::now();
@@ -465,10 +532,6 @@ impl FtoDagBuilder {
                 timing,
             });
         }
-
-        let start = Instant::now();
-        let occurrences = encoder.encode_occurrences(sequence, self.config.fragment_len)?;
-        timing.fragment_occurrences += start.elapsed();
 
         let start = Instant::now();
         if let IntegrationDecision::Reject(rejected) =
@@ -541,7 +604,7 @@ impl FtoDagBuilder {
         let mut used_existing_node_marks = vec![false; self.graph.node_count()];
         let mut inserted_edges = 0;
         let mut inserted_edge_keys = Vec::new();
-        let mut source_records_added = 0;
+        let mut provenance_records_added = 0;
 
         let start = Instant::now();
         for (index, (occurrence, decision)) in occurrences
@@ -589,7 +652,7 @@ impl FtoDagBuilder {
                     }
                 }
             };
-            source_records_added += 1;
+            provenance_records_added += 1;
             if let Some(previous) = previous {
                 let update = self
                     .graph
@@ -614,7 +677,7 @@ impl FtoDagBuilder {
             sequence_id,
             node_path,
             inserted_edges,
-            source_records_added,
+            provenance_records_added,
             block_plan,
         };
         let start = Instant::now();
@@ -968,8 +1031,8 @@ impl FtoDagBuilder {
             let score = self
                 .graph
                 .edge_weight(EdgeKey {
-                    source: previous,
-                    target: candidate.node,
+                    parent: previous,
+                    child: candidate.node,
                 })
                 .unwrap_or_default();
             if score == Weight::new(0) {
@@ -1024,24 +1087,24 @@ impl FtoDagBuilder {
         select_monotone_anchor_path_with_graph(candidate_sets, &self.graph)
     }
 
-    pub fn build_from_source<E: FragmentEncoder>(
+    pub fn build_from_input<E: FragmentEncoder>(
         &mut self,
-        source: &mut dyn SequenceSource,
+        input: &mut dyn SequenceInput,
         alphabet: &dyn Alphabet,
         encoder: &E,
     ) -> Result<BuildReport> {
-        self.build_from_source_starting_at(source, alphabet, encoder, SequenceId::new(0))
+        self.build_from_input_starting_at(input, alphabet, encoder, SequenceId::new(0))
     }
 
-    pub fn build_from_source_starting_at<E: FragmentEncoder>(
+    pub fn build_from_input_starting_at<E: FragmentEncoder>(
         &mut self,
-        source: &mut dyn SequenceSource,
+        input: &mut dyn SequenceInput,
         alphabet: &dyn Alphabet,
         encoder: &E,
         first_sequence_id: SequenceId,
     ) -> Result<BuildReport> {
         let mut offset = 0_usize;
-        while let Some(record) = source.next_record()? {
+        while let Some(record) = input.next_record()? {
             let sequence_id =
                 SequenceId::try_from(first_sequence_id.to_usize().saturating_add(offset))?;
             let encoded = EncodedSequence::encode(record, alphabet)?;
@@ -1060,11 +1123,11 @@ impl FtoDagBuilder {
         let node_id = self
             .graph
             .add_node(occurrence.key, node_kind_for_path_position(occurrence.kind))?;
-        self.graph.add_source_record(
+        self.graph.add_provenance_record(
             node_id,
-            SourceRecord {
+            ProvenanceRecord {
                 sequence_id,
-                position: SourcePosition::new(position as u64),
+                position: ProvenancePosition::new(position as u64),
             },
         )?;
         Ok(node_id)
@@ -1077,16 +1140,16 @@ impl FtoDagBuilder {
         position: usize,
     ) -> Result<()> {
         if !self.can_node_accept_sequence(node_id, sequence_id) {
-            return Err(DagError::DuplicateSequenceSource {
+            return Err(DagError::DuplicateSequenceProvenance {
                 node: node_id.to_usize(),
                 sequence: sequence_id.raw(),
             });
         }
-        self.graph.add_source_record(
+        self.graph.add_provenance_record(
             node_id,
-            SourceRecord {
+            ProvenanceRecord {
                 sequence_id,
-                position: SourcePosition::new(position as u64),
+                position: ProvenancePosition::new(position as u64),
             },
         )
     }
@@ -1101,7 +1164,7 @@ impl FtoDagBuilder {
         self.report.integrated_sequences.push(result.sequence_id);
         self.report.total_nodes_created += result.block_plan.new_nodes.len();
         self.report.total_edges_inserted += result.inserted_edges;
-        self.report.total_source_records_added += result.source_records_added;
+        self.report.total_provenance_records_added += result.provenance_records_added;
     }
 
     fn ensure_topology_cache(&mut self) -> Result<()> {
@@ -1167,12 +1230,12 @@ impl FtoDagBuilder {
             return false;
         };
         let previous_node_count = cache.node_count();
-        let existing_target_edges = inserted_edges
+        let existing_child_edges = inserted_edges
             .iter()
-            .filter(|edge| edge.target.to_usize() < previous_node_count)
+            .filter(|edge| edge.child.to_usize() < previous_node_count)
             .count();
-        existing_target_edges > 1_024
-            && existing_target_edges.saturating_mul(4) > self.graph.node_count()
+        existing_child_edges > 1_024
+            && existing_child_edges.saturating_mul(4) > self.graph.node_count()
     }
 }
 
@@ -1261,13 +1324,13 @@ impl TopologyCache {
         if collect_counters {
             counters.new_nodes = graph.node_count() - previous_node_count;
             counters.inserted_edges = inserted_edges.len();
-            counters.inserted_edges_to_new_targets = inserted_edges
+            counters.inserted_edges_to_new_children = inserted_edges
                 .iter()
-                .filter(|edge| edge.target.to_usize() >= previous_node_count)
+                .filter(|edge| edge.child.to_usize() >= previous_node_count)
                 .count();
-            counters.inserted_edges_to_existing_targets = inserted_edges
+            counters.inserted_edges_to_existing_children = inserted_edges
                 .iter()
-                .filter(|edge| edge.target.to_usize() < previous_node_count)
+                .filter(|edge| edge.child.to_usize() < previous_node_count)
                 .count();
         }
         for index in previous_node_count..graph.node_count() {
@@ -1364,11 +1427,11 @@ impl TopologyCache {
         let mut queue = VecDeque::new();
         let mut queue_pops = 0_usize;
         for edge in inserted_edges {
-            if edge.target.to_usize() >= previous_node_count {
+            if edge.child.to_usize() >= previous_node_count {
                 continue;
             }
-            if self.refresh_forward_node(graph, edge.target, counters, collect_counters)? {
-                queue.push_back(edge.target);
+            if self.refresh_forward_node(graph, edge.child, counters, collect_counters)? {
+                queue.push_back(edge.child);
             }
         }
         while let Some(node) = queue.pop_front() {
@@ -1401,12 +1464,12 @@ impl TopologyCache {
         let mut queued = vec![false; graph.node_count()];
         let mut queue_pops = 0_usize;
         for edge in inserted_edges {
-            if edge.target.to_usize() >= previous_node_count {
+            if edge.child.to_usize() >= previous_node_count {
                 continue;
             }
             self.relax_forward_edge(
-                edge.source,
-                edge.target,
+                edge.parent,
+                edge.child,
                 counters,
                 collect_counters,
                 &mut queue,
@@ -1450,8 +1513,8 @@ impl TopologyCache {
         let mut queue = VecDeque::new();
         let mut queue_pops = 0_usize;
         for edge in inserted_edges {
-            if self.refresh_reverse_node(graph, edge.source, counters, collect_counters)? {
-                queue.push_back(edge.source);
+            if self.refresh_reverse_node(graph, edge.parent, counters, collect_counters)? {
+                queue.push_back(edge.parent);
             }
         }
         while let Some(node) = queue.pop_front() {
@@ -1473,8 +1536,8 @@ impl TopologyCache {
 
     fn relax_forward_edge(
         &mut self,
-        source: NodeId,
-        target: NodeId,
+        parent: NodeId,
+        child: NodeId,
         counters: &mut TopologyUpdateCounters,
         collect_counters: bool,
         queue: &mut VecDeque<NodeId>,
@@ -1483,31 +1546,31 @@ impl TopologyCache {
         if collect_counters {
             counters.forward_relax_attempts += 1;
         }
-        let source_coordinate = self
+        let parent_coordinate = self
             .forward_coordinates
-            .get(source.to_usize())
+            .get(parent.to_usize())
             .copied()
             .ok_or(DagError::InvalidEdge {
-                source: source.to_usize(),
-                target: target.to_usize(),
+                parent: parent.to_usize(),
+                child: child.to_usize(),
             })?;
-        let target_coordinate =
+        let child_coordinate =
             self.forward_coordinates
-                .get_mut(target.to_usize())
+                .get_mut(child.to_usize())
                 .ok_or(DagError::InvalidEdge {
-                    source: source.to_usize(),
-                    target: target.to_usize(),
+                    parent: parent.to_usize(),
+                    child: child.to_usize(),
                 })?;
-        let candidate = source_coordinate.raw() + 1;
-        if candidate > target_coordinate.raw() {
-            *target_coordinate = TopologicalCoordinate::new(candidate);
+        let candidate = parent_coordinate.raw() + 1;
+        if candidate > child_coordinate.raw() {
+            *child_coordinate = TopologicalCoordinate::new(candidate);
             if collect_counters {
                 counters.forward_coordinate_updates += 1;
             }
-            let target_index = target.to_usize();
-            if !queued[target_index] {
-                queued[target_index] = true;
-                queue.push_back(target);
+            let child_index = child.to_usize();
+            if !queued[child_index] {
+                queued[child_index] = true;
+                queue.push_back(child);
             }
             Ok(true)
         } else {
@@ -1615,9 +1678,9 @@ mod tests {
         FragmentKey::symbols(vec![SymbolId::new(raw)])
     }
 
-    fn add_edge(graph: &mut FtoDag, source: NodeId, target: NodeId) -> EdgeKey {
+    fn add_edge(graph: &mut FtoDag, parent: NodeId, child: NodeId) -> EdgeKey {
         let update = graph
-            .add_or_increment_edge(source, target, Weight::new(1))
+            .add_or_increment_edge(parent, child, Weight::new(1))
             .expect("edge insertion succeeds");
         assert!(update.inserted);
         update.key
@@ -1663,7 +1726,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(counters.inserted_edges_to_existing_targets, 1);
+        assert_eq!(counters.inserted_edges_to_existing_children, 1);
         assert!(counters.forward_relax_attempts > 0);
         assert!(counters.forward_coordinate_updates >= 2);
         assert_eq!(counters.forward_parent_scans, 2);
@@ -1834,8 +1897,8 @@ fn select_monotone_anchor_path_with_edge_score(
                         continuity: Weight::new(
                             prev_cell.continuity.raw()
                                 + edge_score(EdgeKey {
-                                    source: prev_candidate.node,
-                                    target: candidate.node,
+                                    parent: prev_candidate.node,
+                                    child: candidate.node,
                                 })
                                 .raw(),
                         ),
@@ -2085,8 +2148,8 @@ fn direct_child_extension_candidate<'a>(
         };
         let score = graph
             .edge_weight(EdgeKey {
-                source: previous,
-                target: candidate.node,
+                parent: previous,
+                child: candidate.node,
             })
             .unwrap_or_default();
         if score == Weight::new(0) {
@@ -2116,8 +2179,8 @@ fn direct_extension_candidate<'a>(
             continue;
         }
         let score = edge_score(EdgeKey {
-            source: previous,
-            target: candidate.node,
+            parent: previous,
+            child: candidate.node,
         });
         if score == Weight::new(0) {
             continue;
@@ -2137,10 +2200,10 @@ fn greedy_candidate_score(
     edge_score: &impl Fn(EdgeKey) -> Weight,
 ) -> Weight {
     previous
-        .map(|source| {
+        .map(|parent| {
             edge_score(EdgeKey {
-                source,
-                target: candidate.node,
+                parent,
+                child: candidate.node,
             })
         })
         .unwrap_or_default()
@@ -2367,16 +2430,16 @@ fn reuse_score(
     let previous_score = previous_node
         .and_then(|previous| {
             graph.edge_weight(EdgeKey {
-                source: previous,
-                target: candidate.node,
+                parent: previous,
+                child: candidate.node,
             })
         })
         .unwrap_or_default();
     let next_score = next_node
         .and_then(|next| {
             graph.edge_weight(EdgeKey {
-                source: candidate.node,
-                target: next,
+                parent: candidate.node,
+                child: next,
             })
         })
         .unwrap_or_default();

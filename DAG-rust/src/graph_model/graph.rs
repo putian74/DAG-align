@@ -3,8 +3,9 @@
 use crate::foundations::bit_encoding::NodeFlags;
 use crate::foundations::error::{DagError, Result};
 use crate::foundations::id::{NodeId, SequenceId, Weight};
-use crate::graph_model::source::{
-    PackedSourceRecord, SourceRange, SourceRecord, SourceStorageStrategy, SourceTable,
+use crate::graph_model::provenance::{
+    PackedProvenanceRecord, ProvenanceRange, ProvenanceRecord, ProvenanceStorageStrategy,
+    ProvenanceTable,
 };
 use crate::sequence_model::fragment::FragmentKey;
 use std::collections::HashMap;
@@ -43,13 +44,13 @@ pub struct Node {
     pub kind: NodeKind,
     pub weight: Weight,
     pub flags: NodeFlags,
-    pub source_range: SourceRange,
+    pub provenance_range: ProvenanceRange,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct EdgeKey {
-    pub source: NodeId,
-    pub target: NodeId,
+    pub parent: NodeId,
+    pub child: NodeId,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -76,7 +77,7 @@ const HYBRID_EDGE_INLINE_LIMIT: usize = 8;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct InlineEdgeEntry {
-    target: NodeId,
+    child: NodeId,
     edge_index: usize,
 }
 
@@ -117,11 +118,11 @@ impl EdgeIndexStorage {
         match self {
             Self::Global(index) => index.get(&key).copied(),
             Self::Hybrid { inline, overflow } => inline
-                .get(key.source.to_usize())
+                .get(key.parent.to_usize())
                 .and_then(|entries| {
                     entries
                         .iter()
-                        .find(|entry| entry.target == key.target)
+                        .find(|entry| entry.child == key.child)
                         .map(|entry| entry.edge_index)
                 })
                 .or_else(|| overflow.get(&key).copied()),
@@ -134,13 +135,13 @@ impl EdgeIndexStorage {
                 index.insert(key, edge_index);
             }
             Self::Hybrid { inline, overflow } => {
-                let Some(entries) = inline.get_mut(key.source.to_usize()) else {
+                let Some(entries) = inline.get_mut(key.parent.to_usize()) else {
                     overflow.insert(key, edge_index);
                     return;
                 };
                 if entries.len() < HYBRID_EDGE_INLINE_LIMIT {
                     entries.push(InlineEdgeEntry {
-                        target: key.target,
+                        child: key.child,
                         edge_index,
                     });
                 } else {
@@ -271,16 +272,16 @@ impl EndpointIndex {
         self.structural_sinks.push(node_id);
     }
 
-    fn record_edge_insertion(&mut self, source: NodeId, target: NodeId) {
+    fn record_edge_insertion(&mut self, parent: NodeId, child: NodeId) {
         Self::remove_endpoint(
             &mut self.structural_sinks,
             &mut self.structural_sink_positions,
-            source,
+            parent,
         );
         Self::remove_endpoint(
             &mut self.structural_roots,
             &mut self.structural_root_positions,
-            target,
+            child,
         );
     }
 
@@ -316,8 +317,8 @@ pub struct FtoDag {
     edge_index: EdgeIndexStorage,
     parents: Vec<Vec<NodeId>>,
     children: Vec<Vec<NodeId>>,
-    source_table: SourceTable,
-    node_sources: NodeSourceStorage,
+    provenance_table: ProvenanceTable,
+    node_provenance: NodeProvenanceStorage,
     sequence_trace_paths: Vec<Vec<NodeId>>,
     node_last_sequences: Vec<Option<SequenceId>>,
     fragment_index: FragmentIndex,
@@ -325,29 +326,80 @@ pub struct FtoDag {
 }
 
 #[derive(Clone, Debug)]
-enum NodeSourceStorage {
-    Full(Vec<Vec<SourceRecord>>),
-    Packed32(Vec<Vec<PackedSourceRecord>>),
+pub(crate) enum NodeProvenanceStorage {
+    Full(Vec<Vec<ProvenanceRecord>>),
+    Packed32(Vec<Vec<PackedProvenanceRecord>>),
     TracePaths(Vec<u64>),
     CountOnly(Vec<u64>),
 }
 
-impl NodeSourceStorage {
-    fn new(strategy: SourceStorageStrategy) -> Self {
-        match strategy {
-            SourceStorageStrategy::FullRecords => Self::Full(Vec::new()),
-            SourceStorageStrategy::Packed32 => Self::Packed32(Vec::new()),
-            SourceStorageStrategy::TracePaths => Self::TracePaths(Vec::new()),
-            SourceStorageStrategy::CountOnly => Self::CountOnly(Vec::new()),
+#[derive(Clone, Debug)]
+pub(crate) enum ProvenanceSnapshot {
+    Full(Vec<Vec<ProvenanceRecord>>),
+    Packed32(Vec<Vec<PackedProvenanceRecord>>),
+    TracePaths {
+        node_counts: Vec<u64>,
+        sequence_trace_paths: Vec<Vec<NodeId>>,
+    },
+    CountOnly(Vec<u64>),
+}
+
+impl ProvenanceSnapshot {
+    pub(crate) fn strategy(&self) -> ProvenanceStorageStrategy {
+        match self {
+            Self::Full(_) => ProvenanceStorageStrategy::FullRecords,
+            Self::Packed32(_) => ProvenanceStorageStrategy::Packed32,
+            Self::TracePaths { .. } => ProvenanceStorageStrategy::TracePaths,
+            Self::CountOnly(_) => ProvenanceStorageStrategy::CountOnly,
         }
     }
 
-    fn strategy(&self) -> SourceStorageStrategy {
+    fn node_count(&self) -> usize {
         match self {
-            Self::Full(_) => SourceStorageStrategy::FullRecords,
-            Self::Packed32(_) => SourceStorageStrategy::Packed32,
-            Self::TracePaths(_) => SourceStorageStrategy::TracePaths,
-            Self::CountOnly(_) => SourceStorageStrategy::CountOnly,
+            Self::Full(records) => records.len(),
+            Self::Packed32(records) => records.len(),
+            Self::TracePaths { node_counts, .. } => node_counts.len(),
+            Self::CountOnly(counts) => counts.len(),
+        }
+    }
+
+    fn sequence_trace_paths(&self) -> Vec<Vec<NodeId>> {
+        match self {
+            Self::TracePaths {
+                sequence_trace_paths,
+                ..
+            } => sequence_trace_paths.clone(),
+            Self::Full(_) | Self::Packed32(_) | Self::CountOnly(_) => Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FtoDagSnapshot {
+    pub fragment_len: usize,
+    pub nodes: Vec<Node>,
+    pub edges: Vec<WeightedEdge>,
+    pub edge_index_strategy: EdgeIndexStrategy,
+    pub provenance: ProvenanceSnapshot,
+    pub node_last_sequences: Vec<Option<SequenceId>>,
+}
+
+impl NodeProvenanceStorage {
+    fn new(strategy: ProvenanceStorageStrategy) -> Self {
+        match strategy {
+            ProvenanceStorageStrategy::FullRecords => Self::Full(Vec::new()),
+            ProvenanceStorageStrategy::Packed32 => Self::Packed32(Vec::new()),
+            ProvenanceStorageStrategy::TracePaths => Self::TracePaths(Vec::new()),
+            ProvenanceStorageStrategy::CountOnly => Self::CountOnly(Vec::new()),
+        }
+    }
+
+    fn strategy(&self) -> ProvenanceStorageStrategy {
+        match self {
+            Self::Full(_) => ProvenanceStorageStrategy::FullRecords,
+            Self::Packed32(_) => ProvenanceStorageStrategy::Packed32,
+            Self::TracePaths(_) => ProvenanceStorageStrategy::TracePaths,
+            Self::CountOnly(_) => ProvenanceStorageStrategy::CountOnly,
         }
     }
 
@@ -376,7 +428,7 @@ impl NodeSourceStorage {
         }
     }
 
-    fn add_record(&mut self, node_id: NodeId, record: SourceRecord) -> Result<()> {
+    fn add_record(&mut self, node_id: NodeId, record: ProvenanceRecord) -> Result<()> {
         let node_index = node_id.to_usize();
         match self {
             Self::Full(records) => records
@@ -386,7 +438,7 @@ impl NodeSourceStorage {
             Self::Packed32(records) => records
                 .get_mut(node_index)
                 .ok_or(DagError::MissingNode { node: node_index })?
-                .push(PackedSourceRecord::try_from_record(record)?),
+                .push(PackedProvenanceRecord::try_from_record(record)?),
             Self::TracePaths(counts) => {
                 let count = counts
                     .get_mut(node_index)
@@ -425,7 +477,7 @@ impl NodeSourceStorage {
         }
     }
 
-    fn records(&self, node_id: NodeId) -> Result<Vec<SourceRecord>> {
+    fn records(&self, node_id: NodeId) -> Result<Vec<ProvenanceRecord>> {
         let node_index = node_id.to_usize();
         match self {
             Self::Full(records) => records
@@ -438,15 +490,15 @@ impl NodeSourceStorage {
                     records
                         .iter()
                         .copied()
-                        .map(PackedSourceRecord::unpack)
+                        .map(PackedProvenanceRecord::unpack)
                         .collect()
                 })
                 .ok_or(DagError::MissingNode { node: node_index }),
             Self::TracePaths(_) => Err(DagError::UnsupportedOperation(
-                "node source records are not retained with TracePaths source storage",
+                "node provenance records are not retained with TracePaths provenance storage",
             )),
             Self::CountOnly(_) => Err(DagError::UnsupportedOperation(
-                "node source records are not retained with CountOnly source storage",
+                "node provenance records are not retained with CountOnly provenance storage",
             )),
         }
     }
@@ -465,10 +517,10 @@ impl NodeSourceStorage {
                 .iter()
                 .all(|record| record.sequence_id() != sequence_id)),
             Self::TracePaths(_) => Err(DagError::UnsupportedOperation(
-                "out-of-order duplicate source checks require retained node source records",
+                "out-of-order duplicate provenance checks require retained node provenance records",
             )),
             Self::CountOnly(_) => Err(DagError::UnsupportedOperation(
-                "out-of-order duplicate source checks require retained node source records",
+                "out-of-order duplicate provenance checks require retained node provenance records",
             )),
         }
     }
@@ -480,24 +532,50 @@ impl NodeSourceStorage {
     fn retains_trace_paths(&self) -> bool {
         matches!(self, Self::TracePaths(_))
     }
+
+    fn snapshot(&self, sequence_trace_paths: &[Vec<NodeId>]) -> ProvenanceSnapshot {
+        match self {
+            Self::Full(records) => ProvenanceSnapshot::Full(records.clone()),
+            Self::Packed32(records) => ProvenanceSnapshot::Packed32(records.clone()),
+            Self::TracePaths(node_counts) => ProvenanceSnapshot::TracePaths {
+                node_counts: node_counts.clone(),
+                sequence_trace_paths: sequence_trace_paths.to_vec(),
+            },
+            Self::CountOnly(counts) => ProvenanceSnapshot::CountOnly(counts.clone()),
+        }
+    }
+
+    fn from_snapshot(snapshot: &ProvenanceSnapshot) -> Self {
+        match snapshot {
+            ProvenanceSnapshot::Full(records) => Self::Full(records.clone()),
+            ProvenanceSnapshot::Packed32(records) => Self::Packed32(records.clone()),
+            ProvenanceSnapshot::TracePaths { node_counts, .. } => {
+                Self::TracePaths(node_counts.clone())
+            }
+            ProvenanceSnapshot::CountOnly(counts) => Self::CountOnly(counts.clone()),
+        }
+    }
 }
 
 impl FtoDag {
     pub fn new(fragment_len: usize) -> Self {
-        Self::with_source_storage(fragment_len, SourceStorageStrategy::FullRecords)
+        Self::with_provenance_storage(fragment_len, ProvenanceStorageStrategy::FullRecords)
     }
 
-    pub fn with_source_storage(fragment_len: usize, source_storage: SourceStorageStrategy) -> Self {
-        Self::with_source_and_edge_storage(
+    pub fn with_provenance_storage(
+        fragment_len: usize,
+        provenance_storage: ProvenanceStorageStrategy,
+    ) -> Self {
+        Self::with_provenance_and_edge_storage(
             fragment_len,
-            source_storage,
+            provenance_storage,
             EdgeIndexStrategy::GlobalHash,
         )
     }
 
-    pub fn with_source_and_edge_storage(
+    pub fn with_provenance_and_edge_storage(
         fragment_len: usize,
-        source_storage: SourceStorageStrategy,
+        provenance_storage: ProvenanceStorageStrategy,
         edge_index_strategy: EdgeIndexStrategy,
     ) -> Self {
         Self {
@@ -507,8 +585,8 @@ impl FtoDag {
             edge_index: EdgeIndexStorage::new(edge_index_strategy),
             parents: Vec::new(),
             children: Vec::new(),
-            source_table: SourceTable::new(),
-            node_sources: NodeSourceStorage::new(source_storage),
+            provenance_table: ProvenanceTable::new(),
+            node_provenance: NodeProvenanceStorage::new(provenance_storage),
             sequence_trace_paths: Vec::new(),
             node_last_sequences: Vec::new(),
             fragment_index: FragmentIndex::default(),
@@ -560,38 +638,38 @@ impl FtoDag {
             })
     }
 
-    pub fn source_table(&self) -> &SourceTable {
-        &self.source_table
+    pub fn provenance_table(&self) -> &ProvenanceTable {
+        &self.provenance_table
     }
 
-    pub fn source_storage_strategy(&self) -> SourceStorageStrategy {
-        self.node_sources.strategy()
+    pub fn provenance_storage_strategy(&self) -> ProvenanceStorageStrategy {
+        self.node_provenance.strategy()
     }
 
     pub fn edge_index_strategy(&self) -> EdgeIndexStrategy {
         self.edge_index.strategy()
     }
 
-    pub fn source_records(&self, node_id: NodeId) -> Result<Vec<SourceRecord>> {
-        self.node_sources.records(node_id)
+    pub fn provenance_records(&self, node_id: NodeId) -> Result<Vec<ProvenanceRecord>> {
+        self.node_provenance.records(node_id)
     }
 
-    pub fn source_record_count(&self, node_id: NodeId) -> Result<usize> {
-        self.node_sources.record_count(node_id)
+    pub fn provenance_record_count(&self, node_id: NodeId) -> Result<usize> {
+        self.node_provenance.record_count(node_id)
     }
 
-    pub fn retains_source_records(&self) -> bool {
-        self.node_sources.retains_records()
+    pub fn retains_provenance_records(&self) -> bool {
+        self.node_provenance.retains_records()
     }
 
     pub fn retains_sequence_trace_paths(&self) -> bool {
-        self.node_sources.retains_trace_paths()
+        self.node_provenance.retains_trace_paths()
     }
 
     pub fn sequence_trace_path(&self, sequence_id: SequenceId) -> Result<&[NodeId]> {
         if !self.retains_sequence_trace_paths() {
             return Err(DagError::UnsupportedOperation(
-                "sequence trace paths are only retained with TracePaths source storage",
+                "sequence trace paths are only retained with TracePaths provenance storage",
             ));
         }
         self.sequence_trace_paths
@@ -604,17 +682,28 @@ impl FtoDag {
             })
     }
 
+    pub(crate) fn sequence_trace_paths(&self) -> Result<&[Vec<NodeId>]> {
+        if !self.retains_sequence_trace_paths() {
+            return Err(DagError::UnsupportedOperation(
+                "sequence trace paths are only retained with TracePaths provenance storage",
+            ));
+        }
+        Ok(&self.sequence_trace_paths)
+    }
+
     pub fn can_node_accept_sequence(
         &self,
         node_id: NodeId,
         sequence_id: SequenceId,
     ) -> Result<bool> {
         let node_index = node_id.to_usize();
-        self.node_sources.ensure_node_exists(node_id)?;
+        self.node_provenance.ensure_node_exists(node_id)?;
         match self.node_last_sequences.get(node_index).copied().flatten() {
             Some(last_sequence_id) if last_sequence_id < sequence_id => Ok(true),
             Some(last_sequence_id) if last_sequence_id == sequence_id => Ok(false),
-            _ => self.node_sources.can_accept_sequence(node_id, sequence_id),
+            _ => self
+                .node_provenance
+                .can_accept_sequence(node_id, sequence_id),
         }
     }
 
@@ -642,7 +731,7 @@ impl FtoDag {
             kind,
             weight: Weight::new(0),
             flags: kind.flags(),
-            source_range: SourceRange::default(),
+            provenance_range: ProvenanceRange::default(),
         };
         self.fragment_index.insert(&fragment, kind, id);
         self.endpoint_index.record_node_kind(id, kind);
@@ -650,26 +739,35 @@ impl FtoDag {
         self.parents.push(Vec::new());
         self.children.push(Vec::new());
         self.edge_index.push_node();
-        self.node_sources.push_node();
+        self.node_provenance.push_node();
         self.node_last_sequences.push(None);
         Ok(id)
     }
 
-    pub fn add_source_record(&mut self, node_id: NodeId, record: SourceRecord) -> Result<()> {
+    pub fn add_provenance_record(
+        &mut self,
+        node_id: NodeId,
+        record: ProvenanceRecord,
+    ) -> Result<()> {
         let node_index = node_id.to_usize();
-        self.node_sources.add_record(node_id, record)?;
+        self.node_provenance.add_record(node_id, record)?;
         self.record_sequence_trace_path(node_id, record)?;
         let last_sequence = &mut self.node_last_sequences[node_index];
         if last_sequence.is_none_or(|last| last < record.sequence_id) {
             *last_sequence = Some(record.sequence_id);
         }
         let node = &mut self.nodes[node_index];
-        node.source_range = SourceRange::new(0, self.node_sources.record_count(node_id)? as u64);
+        node.provenance_range =
+            ProvenanceRange::new(0, self.node_provenance.record_count(node_id)? as u64);
         node.weight = Weight::new(node.weight.raw() + 1);
         Ok(())
     }
 
-    fn record_sequence_trace_path(&mut self, node_id: NodeId, record: SourceRecord) -> Result<()> {
+    fn record_sequence_trace_path(
+        &mut self,
+        node_id: NodeId,
+        record: ProvenanceRecord,
+    ) -> Result<()> {
         if !self.retains_sequence_trace_paths() {
             return Ok(());
         }
@@ -697,17 +795,17 @@ impl FtoDag {
 
     pub fn add_or_increment_edge(
         &mut self,
-        source: NodeId,
-        target: NodeId,
+        parent: NodeId,
+        child: NodeId,
         increment: Weight,
     ) -> Result<EdgeUpdate> {
-        if source.to_usize() >= self.nodes.len() || target.to_usize() >= self.nodes.len() {
+        if parent.to_usize() >= self.nodes.len() || child.to_usize() >= self.nodes.len() {
             return Err(DagError::InvalidEdge {
-                source: source.to_usize(),
-                target: target.to_usize(),
+                parent: parent.to_usize(),
+                child: child.to_usize(),
             });
         }
-        let key = EdgeKey { source, target };
+        let key = EdgeKey { parent, child };
         let (weight, inserted) = if let Some(edge_index) = self.edge_index.get(key) {
             let edge = &mut self.edges[edge_index];
             edge.weight = Weight::new(edge.weight.raw() + increment.raw());
@@ -719,12 +817,12 @@ impl FtoDag {
                 weight: increment,
             });
             self.edge_index.insert(key, edge_index);
-            self.children[source.to_usize()].push(target);
-            self.parents[target.to_usize()].push(source);
+            self.children[parent.to_usize()].push(child);
+            self.parents[child.to_usize()].push(parent);
             (increment, true)
         };
         if inserted {
-            self.endpoint_index.record_edge_insertion(source, target);
+            self.endpoint_index.record_edge_insertion(parent, child);
         }
         Ok(EdgeUpdate {
             key,
@@ -747,6 +845,78 @@ impl FtoDag {
             edge_count: self.edge_count(),
             fragment_len: self.fragment_len,
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> FtoDagSnapshot {
+        FtoDagSnapshot {
+            fragment_len: self.fragment_len,
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            edge_index_strategy: self.edge_index.strategy(),
+            provenance: self.node_provenance.snapshot(&self.sequence_trace_paths),
+            node_last_sequences: self.node_last_sequences.clone(),
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: FtoDagSnapshot) -> Result<Self> {
+        if snapshot.nodes.len() != snapshot.provenance.node_count() {
+            return Err(DagError::InvalidStorage(format!(
+                "node/provenance length mismatch: {} nodes vs {} provenance slots",
+                snapshot.nodes.len(),
+                snapshot.provenance.node_count()
+            )));
+        }
+        if snapshot.nodes.len() != snapshot.node_last_sequences.len() {
+            return Err(DagError::InvalidStorage(format!(
+                "node/node-last-sequence length mismatch: {} nodes vs {} markers",
+                snapshot.nodes.len(),
+                snapshot.node_last_sequences.len()
+            )));
+        }
+
+        let mut graph = Self {
+            fragment_len: snapshot.fragment_len,
+            nodes: snapshot.nodes,
+            edges: snapshot.edges,
+            edge_index: EdgeIndexStorage::new(snapshot.edge_index_strategy),
+            parents: vec![Vec::new(); snapshot.provenance.node_count()],
+            children: vec![Vec::new(); snapshot.provenance.node_count()],
+            provenance_table: ProvenanceTable::new(),
+            node_provenance: NodeProvenanceStorage::from_snapshot(&snapshot.provenance),
+            sequence_trace_paths: snapshot.provenance.sequence_trace_paths(),
+            node_last_sequences: snapshot.node_last_sequences,
+            fragment_index: FragmentIndex::default(),
+            endpoint_index: EndpointIndex::default(),
+        };
+
+        for (expected, node) in graph.nodes.iter().enumerate() {
+            if node.id.to_usize() != expected {
+                return Err(DagError::InvalidStorage(format!(
+                    "node id mismatch at index {expected}: found {}",
+                    node.id.to_usize()
+                )));
+            }
+            graph
+                .fragment_index
+                .insert(&node.fragment, node.kind, node.id);
+            graph.endpoint_index.record_node_kind(node.id, node.kind);
+        }
+
+        for (edge_index, edge) in graph.edges.iter().enumerate() {
+            let parent = edge.key.parent.to_usize();
+            let child = edge.key.child.to_usize();
+            if parent >= graph.nodes.len() || child >= graph.nodes.len() {
+                return Err(DagError::InvalidEdge { parent, child });
+            }
+            graph.edge_index.insert(edge.key, edge_index);
+            graph.children[parent].push(edge.key.child);
+            graph.parents[child].push(edge.key.parent);
+            graph
+                .endpoint_index
+                .record_edge_insertion(edge.key.parent, edge.key.child);
+        }
+
+        Ok(graph)
     }
 }
 

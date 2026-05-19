@@ -27,8 +27,10 @@ class TensorDag:
     edge_dst: np.ndarray
     edge_weight: np.ndarray
     topo_order: np.ndarray
-    node_state_left: np.ndarray
-    node_state_right: np.ndarray
+    node_coordinate_left: np.ndarray
+    node_coordinate_right: np.ndarray
+    node_window_left: np.ndarray
+    node_window_right: np.ndarray
     state_windows: Optional[PackedStateWindows] = None
     edge_overlaps: Optional[EdgeWindowOverlaps] = None
     node_flags: Optional[np.ndarray] = None
@@ -56,8 +58,13 @@ class TensorDag:
         n = self.node_count
         if self.node_weight.shape[0] != n:
             raise ArtifactValidationError("node_weight length does not match nodes")
-        if self.node_state_left.shape[0] != n or self.node_state_right.shape[0] != n:
-            raise ArtifactValidationError("state interval arrays must match nodes")
+        if (
+            self.node_coordinate_left.shape[0] != n
+            or self.node_coordinate_right.shape[0] != n
+            or self.node_window_left.shape[0] != n
+            or self.node_window_right.shape[0] != n
+        ):
+            raise ArtifactValidationError("coordinate/window interval arrays must match nodes")
         if not (
             self.edge_src.shape == self.edge_dst.shape == self.edge_weight.shape
         ):
@@ -80,18 +87,41 @@ class TensorDag:
             raise ArtifactValidationError("topological order violates graph edges")
         if self.metadata.global_state_count is not None:
             validate_state_intervals(
-                self.node_state_left,
-                self.node_state_right,
+                self.node_coordinate_left,
+                self.node_coordinate_right,
                 self.metadata.global_state_count,
             )
-        elif np.any(self.node_state_right < self.node_state_left):
+            validate_state_intervals(
+                self.node_window_left,
+                self.node_window_right,
+                self.metadata.global_state_count,
+            )
+        elif np.any(self.node_coordinate_right < self.node_coordinate_left) or np.any(
+            self.node_window_right < self.node_window_left
+        ):
             raise ArtifactValidationError("state interval right bound is before left")
+        if np.any(self.node_window_left > self.node_coordinate_left):
+            raise ArtifactValidationError(
+                "node_window_left must not exclude the raw coordinate left bound"
+            )
+        if np.any(self.node_window_right < self.node_coordinate_right):
+            raise ArtifactValidationError(
+                "node_window_right must not exclude the raw coordinate right bound"
+            )
         if self.state_windows is not None:
             if self.metadata.global_state_count is None:
                 raise ArtifactValidationError(
                     "global_state_count is required for packed windows"
                 )
             self.state_windows.validate(self.metadata.global_state_count)
+            if not np.array_equal(self.node_window_left, self.state_windows.left):
+                raise ArtifactValidationError(
+                    "node_window_left must match packed state-window left bounds"
+                )
+            if not np.array_equal(self.node_window_right, self.state_windows.right):
+                raise ArtifactValidationError(
+                    "node_window_right must match packed state-window right bounds"
+                )
         if self.edge_overlaps is not None:
             self.edge_overlaps.validate(self.edge_count)
             if self.state_windows is not None:

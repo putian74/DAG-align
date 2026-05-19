@@ -17,8 +17,10 @@ class SubgraphBatch:
     batch_id: str
     node_ids: np.ndarray
     edge_ids: np.ndarray
-    node_state_left: np.ndarray
-    node_state_right: np.ndarray
+    node_coordinate_left: np.ndarray
+    node_coordinate_right: np.ndarray
+    node_window_left: np.ndarray
+    node_window_right: np.ndarray
     state_windows: Optional[PackedStateWindows] = None
     edge_overlaps: Optional[EdgeWindowOverlaps] = None
     global_state_ids: Optional[np.ndarray] = None

@@ -3,7 +3,13 @@
 from .config import LossWeights, OptimizerConfig, SubgraphSamplingConfig, TrainingConfig
 from .dataset import PreparedTrainingBatch, TensorDagDataset, TensorGraphArtifact
 from .profiling import ProfilingConfig, ProfilingResult, ProfilingTimer
-from .trainer import FitResult, Trainer, TrainingStepInput, TrainingStepResult
+from .trainer import (
+    FitResult,
+    Trainer,
+    TrainingRuntimeArtifacts,
+    TrainingStepInput,
+    TrainingStepResult,
+)
 
 __all__ = [
     "FitResult",
@@ -17,6 +23,7 @@ __all__ = [
     "TensorDagDataset",
     "TensorGraphArtifact",
     "Trainer",
+    "TrainingRuntimeArtifacts",
     "TrainingConfig",
     "TrainingStepInput",
     "TrainingStepResult",

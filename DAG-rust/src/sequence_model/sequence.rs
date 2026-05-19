@@ -1,4 +1,4 @@
-//! Sequence records and streaming sources.
+//! Sequence records and streaming inputs.
 
 use crate::foundations::error::Result;
 use crate::sequence_model::alphabet::{Alphabet, SymbolId};
@@ -65,23 +65,23 @@ impl EncodedSequence {
     }
 }
 
-pub trait SequenceSource {
+pub trait SequenceInput {
     fn next_record(&mut self) -> Result<Option<SequenceRecord>>;
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct VecSequenceSource {
+pub struct VecSequenceInput {
     records: Vec<SequenceRecord>,
     cursor: usize,
 }
 
-impl VecSequenceSource {
+impl VecSequenceInput {
     pub fn new(records: Vec<SequenceRecord>) -> Self {
         Self { records, cursor: 0 }
     }
 }
 
-impl SequenceSource for VecSequenceSource {
+impl SequenceInput for VecSequenceInput {
     fn next_record(&mut self) -> Result<Option<SequenceRecord>> {
         if self.cursor >= self.records.len() {
             return Ok(None);

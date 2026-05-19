@@ -7,10 +7,11 @@
 - Initial plan created in `PLAN.md`.
 - Rust-first crate scaffold created with typed public contracts.
 - Detailed module-level implementation plans added to `PLAN.md`.
+- Legacy conversion now exports training-ready coordinate/window arrays, reference artifacts, initialization manifests, diagnostics JSON, and working CLI commands.
 
 ## Active phase
 
-**Next:** connect global PHMM coordinates and packed state-window export into legacy artifact generation.
+**Next:** use `legacy_current` initialization as the baseline path for end-to-end PHMM training, then add reference-path MSA preprocessing later as a comparison-track initializer.
 
 ## Completed
 
@@ -43,20 +44,29 @@
   - Added Rust `build_global_coordinates(...)` with DAG-align-style state-range propagation.
   - Added Rust `build_packed_windows(...)` and `build_edge_window_overlaps(...)`.
   - Added unit tests covering reference-path intervals and overlap construction.
+- Completed the first end-to-end preprocessing baseline:
+  - Extended the Python bridge to export optional legacy reference artifacts from `thr_*.npz`.
+  - Extended the bridge to export normalized `legacy_current` and bootstrap `reference_msa` initialization tracks under `initialization/*/manifest.json`.
+  - Added Rust `.npy` writers for generated coordinate and initialization-adjacent arrays.
+  - Wired Rust legacy conversion to derive or import a reference path, export training-ready coordinate/window arrays and `edge_state_*`, attach `global_state_count`, and validate at `TrainingReady` when coordinates are present.
+  - Added JSON read/write support for conversion diagnostics and a working CLI with `convert-legacy`, `validate`, and `diagnose`.
+  - Added integration coverage for training-ready conversion plus initialization manifest export.
+  - Established `legacy_current` as the first training baseline, with `reference_msa` kept as a later comparative initialization path rather than a blocker for baseline PHMM training.
+- Split raw coordinate spans from padded runtime windows explicitly:
+  - `node_coordinate_left/right` now carry propagated legal PHMM spans.
+  - `node_window_left/right` now carry the padded DP windows paired with `node_state_offset/len` and `edge_state_*`.
+  - Validation now treats the raw coordinate span and static window as separate contracts instead of overloading one interval pair.
 
 ## Pending phases
 
-1. Connect the new global-coordinate builder to legacy reference artifacts and export `node_state_left/right` plus reference arrays.
-2. Connect packed-window/edge-overlap builders to artifact export under `coordinates/`.
-3. Extend legacy conversion to optional reference artifacts (`thr_*.npz`) and initialization inputs (`ini/*.npy`).
-4. Add reference-path MSA preprocessing.
-5. Add initialization artifacts for `legacy_current` and `reference_msa`.
-6. Add state-sampling ranges and projections.
-7. Add DAG-rust input support.
-8. Add performance diagnostics and benchmarks.
+1. Complete baseline PHMM training using the current `legacy_current` initialization path.
+2. Add full reference-path MSA preprocessing beyond the current bootstrap `reference_msa` track for later initialization comparisons.
+3. Add state-sampling ranges and global/subgraph projection exports.
+4. Add DAG-rust input support.
+5. Add richer performance diagnostics and benchmarks.
 
 ## Open decisions
 
 - Whether the first legacy converter uses a temporary Python compatibility script before moving to Rust-first loading.
-- Exact manifest schema syntax and dtype naming.
-- How much legacy initialization compatibility is needed in the first implementation pass.
+- When to replace the remaining legacy bridge reads with fully Rust-native loaders/writers.
+- How much of the bootstrap `reference_msa` path should remain once full MSA preprocessing lands.

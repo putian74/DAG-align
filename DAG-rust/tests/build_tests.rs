@@ -14,7 +14,7 @@ fn first_sequence_initialization_preserves_repeated_occurrences() {
         .expect("first sequence initializes");
     assert_eq!(result.node_path.len(), 4);
     assert_eq!(result.inserted_edges, 3);
-    assert_eq!(result.source_records_added, 4);
+    assert_eq!(result.provenance_records_added, 4);
     assert_eq!(result.block_plan.new_nodes, result.node_path);
 
     let graph = builder.graph();
@@ -32,10 +32,15 @@ fn first_sequence_initialization_preserves_repeated_occurrences() {
 
     for (position, node) in graph.nodes().iter().enumerate() {
         assert_eq!(node.weight, Weight::new(1));
-        let sources = graph.source_records(node.id).expect("source range exists");
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].sequence_id, SequenceId::new(0));
-        assert_eq!(sources[0].position, SourcePosition::new(position as u64));
+        let provenance = graph
+            .provenance_records(node.id)
+            .expect("provenance range exists");
+        assert_eq!(provenance.len(), 1);
+        assert_eq!(provenance[0].sequence_id, SequenceId::new(0));
+        assert_eq!(
+            provenance[0].position,
+            ProvenancePosition::new(position as u64)
+        );
     }
 
     assert!(graph.validate().is_valid());
@@ -147,7 +152,7 @@ fn add_sequence_records_minimal_rejection_report() {
 }
 
 #[test]
-fn build_from_source_encodes_records_and_returns_cumulative_report() {
+fn build_from_input_encodes_records_and_returns_cumulative_report() {
     let alphabet = BuiltinAlphabet::dna_canonical();
     let encoder =
         DefaultFragmentEncoder::packed(BitWidth::new(alphabet.bits_per_symbol()).unwrap());
@@ -155,14 +160,14 @@ fn build_from_source_encodes_records_and_returns_cumulative_report() {
     config.graph_id = GraphId::new(11);
     config.min_initial_match_ratio = Some(SimilarityThreshold::from_basis_points(2_000).unwrap());
     let mut builder = FtoDagBuilder::new(config);
-    let mut source = VecSequenceSource::new(vec![
+    let mut input = VecSequenceInput::new(vec![
         SequenceRecord::new("seed", "ACGTACGT"),
         SequenceRecord::new("similar", "ACGTTCGT"),
         SequenceRecord::new("distant", "TTTTTTTT"),
     ]);
 
     let report = builder
-        .build_from_source(&mut source, &alphabet, &encoder)
+        .build_from_input(&mut input, &alphabet, &encoder)
         .unwrap();
 
     assert_eq!(
@@ -178,7 +183,7 @@ fn build_from_source_encodes_records_and_returns_cumulative_report() {
     );
     assert_eq!(report.attempted_sequences, 3);
     assert_eq!(report.total_nodes_created, builder.graph().node_count());
-    assert_eq!(report.total_source_records_added, 12);
+    assert_eq!(report.total_provenance_records_added, 12);
     assert!(builder.graph().validate().is_valid());
 }
 
@@ -479,7 +484,7 @@ fn add_sequence_reuses_monotone_anchors_and_inserts_unanchored_block() {
     };
 
     assert_eq!(result.node_path.len(), 6);
-    assert_eq!(result.source_records_added, 6);
+    assert_eq!(result.provenance_records_added, 6);
     assert_eq!(result.inserted_edges, 4);
     assert_eq!(builder.graph().node_count(), 9);
     assert_eq!(builder.graph().edge_count(), 9);
@@ -503,7 +508,7 @@ fn add_sequence_reuses_monotone_anchors_and_inserts_unanchored_block() {
     assert_eq!(builder.report().attempted_sequences, 1);
     assert_eq!(builder.report().total_nodes_created, 3);
     assert_eq!(builder.report().total_edges_inserted, 4);
-    assert_eq!(builder.report().total_source_records_added, 6);
+    assert_eq!(builder.report().total_provenance_records_added, 6);
     assert!(builder.graph().validate().is_valid());
 }
 
@@ -681,8 +686,8 @@ fn add_identical_repeat_sequence_uses_distinct_repeated_nodes() {
         ]
     );
     for node in builder.graph().nodes() {
-        let sources = builder.graph().source_records(node.id).unwrap();
-        assert_eq!(sources.len(), 2);
+        let provenance = builder.graph().provenance_records(node.id).unwrap();
+        assert_eq!(provenance.len(), 2);
         assert_eq!(node.weight, Weight::new(2));
     }
     assert!(builder.graph().validate().is_valid());

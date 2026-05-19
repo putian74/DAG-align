@@ -12,7 +12,7 @@ pub use crate::algorithms::build::{
 };
 pub use crate::algorithms::merge::{
     AnchorMap, MergeConfig, MergeDecision, MergeOrderingPolicy, MergeOrientation, MergePlan,
-    MergeStats, NodeRemap, RejectedMerge,
+    MergeStats, NodeRemap, RejectedMerge, merge_graphs,
 };
 pub use crate::algorithms::ordering::{
     GraphSketch, OrderingPolicy, PairingPlan, SequenceSketch, SimilarityBucket, SimilaritySketch,
@@ -27,26 +27,29 @@ pub use crate::algorithms::scheduler::{
 pub use crate::foundations::bit_encoding::{BitWidth, NodeFlags, PackedPair, PackedWindow};
 pub use crate::foundations::error::{DagError, Result};
 pub use crate::foundations::id::{
-    ChunkId, GlobalStateId, GraphId, NodeId, RoundId, SequenceId, SourcePosition,
+    ChunkId, GlobalStateId, GraphId, NodeId, ProvenancePosition, RoundId, SequenceId,
     TopologicalCoordinate, Weight,
 };
 pub use crate::graph_model::graph::{
     EdgeIndexStrategy, EdgeKey, EdgeUpdate, EndpointIndex, FragmentIndex, FtoDag, GraphStats, Node,
     NodeKind, WeightedEdge,
 };
+pub use crate::graph_model::provenance::{
+    PackedProvenanceRecord, ProvenanceRange, ProvenanceRecord, ProvenanceStorageStrategy,
+    ProvenanceTable,
+};
 pub use crate::graph_model::reference::{
     ExportProfile, InsertionRegion, ReferencePath, ReferencePathStrategy, StateInterval,
     SubgraphProjection, TensorExportLayout,
-};
-pub use crate::graph_model::source::{
-    PackedSourceRecord, SourceRange, SourceRecord, SourceStorageStrategy, SourceTable,
 };
 pub use crate::graph_model::topology::{
     Children, DagTopology, Parents, ReverseTopologicalOrder, TopologicalOrder, TraversalDirection,
     WeightedChildren, WeightedParents,
 };
 pub use crate::graph_model::validate::{GraphValidationError, ValidateGraph, ValidationReport};
-pub use crate::persistence::storage::{GraphFormatVersion, GraphStorage, StorageConfig};
+pub use crate::persistence::storage::{
+    GraphFormatVersion, GraphStorage, NativeGraphStorage, StorageConfig,
+};
 pub use crate::sequence_model::alphabet::{
     Alphabet, AlphabetKind, AmbiguityPolicy, BuiltinAlphabet, CustomAlphabet, NormalizationPolicy,
     SymbolId,
@@ -56,5 +59,5 @@ pub use crate::sequence_model::fragment::{
     FragmentWindows, PathPositionKind,
 };
 pub use crate::sequence_model::sequence::{
-    EncodedSequence, SequenceRecord, SequenceSource, VecSequenceSource,
+    EncodedSequence, SequenceInput, SequenceRecord, VecSequenceInput,
 };

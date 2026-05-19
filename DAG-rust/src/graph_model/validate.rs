@@ -8,10 +8,10 @@ use std::collections::HashSet;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GraphValidationError {
     InvalidNodeId { expected: usize, found: usize },
-    InvalidEdgeEndpoint { source: usize, target: usize },
+    InvalidEdgeEndpoint { parent: usize, child: usize },
     CycleDetected,
-    MismatchedSourceWeight { node: usize },
-    DuplicateSequenceSource { node: usize, sequence: usize },
+    MismatchedProvenanceWeight { node: usize },
+    DuplicateSequenceProvenance { node: usize, sequence: usize },
     MissingFragmentIndexEntry { node: usize },
     NodeKindInconsistency { node: usize },
 }
@@ -54,21 +54,23 @@ impl ValidateGraph for FtoDag {
                     .errors
                     .push(GraphValidationError::MissingFragmentIndexEntry { node: expected });
             }
-            match self.source_record_count(node.id) {
+            match self.provenance_record_count(node.id) {
                 Ok(count) => {
                     if count as u64 != node.weight.raw() {
                         report
                             .errors
-                            .push(GraphValidationError::MismatchedSourceWeight { node: expected });
+                            .push(GraphValidationError::MismatchedProvenanceWeight {
+                                node: expected,
+                            });
                     }
-                    if self.retains_source_records() {
-                        match self.source_records(node.id) {
+                    if self.retains_provenance_records() {
+                        match self.provenance_records(node.id) {
                             Ok(records) => {
                                 let mut sequences = HashSet::new();
                                 for record in records {
                                     if !sequences.insert(record.sequence_id) {
                                         report.errors.push(
-                                            GraphValidationError::DuplicateSequenceSource {
+                                            GraphValidationError::DuplicateSequenceProvenance {
                                                 node: expected,
                                                 sequence: record.sequence_id.to_usize(),
                                             },
@@ -76,41 +78,37 @@ impl ValidateGraph for FtoDag {
                                     }
                                 }
                             }
-                            Err(_) => {
-                                report
-                                    .errors
-                                    .push(GraphValidationError::MismatchedSourceWeight {
-                                        node: expected,
-                                    })
-                            }
+                            Err(_) => report.errors.push(
+                                GraphValidationError::MismatchedProvenanceWeight { node: expected },
+                            ),
                         }
                     }
                 }
                 Err(_) => report
                     .errors
-                    .push(GraphValidationError::MismatchedSourceWeight { node: expected }),
+                    .push(GraphValidationError::MismatchedProvenanceWeight { node: expected }),
             }
         }
         for edge in self.edges() {
-            if edge.key.source.to_usize() >= self.node_count()
-                || edge.key.target.to_usize() >= self.node_count()
+            if edge.key.parent.to_usize() >= self.node_count()
+                || edge.key.child.to_usize() >= self.node_count()
             {
                 report
                     .errors
                     .push(GraphValidationError::InvalidEdgeEndpoint {
-                        source: edge.key.source.to_usize(),
-                        target: edge.key.target.to_usize(),
+                        parent: edge.key.parent.to_usize(),
+                        child: edge.key.child.to_usize(),
                     });
             }
         }
         let mut has_parent = vec![false; self.node_count()];
         let mut has_child = vec![false; self.node_count()];
         for edge in self.edges() {
-            if edge.key.source.to_usize() < self.node_count()
-                && edge.key.target.to_usize() < self.node_count()
+            if edge.key.parent.to_usize() < self.node_count()
+                && edge.key.child.to_usize() < self.node_count()
             {
-                has_child[edge.key.source.to_usize()] = true;
-                has_parent[edge.key.target.to_usize()] = true;
+                has_child[edge.key.parent.to_usize()] = true;
+                has_parent[edge.key.child.to_usize()] = true;
             }
         }
         for node in self.endpoints().structural_roots() {

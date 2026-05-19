@@ -5,8 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Union
 
-from ad_phmm_align.exceptions import UnsupportedArtifactError
+from ad_phmm_align.exceptions import ArtifactValidationError
 from ad_phmm_align.graph.tensor_dag import TensorDag
+from ad_phmm_align.io.artifact_loader import TensorGraphArtifactLoader
+from ad_phmm_align.io.schema import SourceFormat
 
 
 class DagRustExportLoader:
@@ -18,6 +20,7 @@ class DagRustExportLoader:
     def load(self) -> TensorDag:
         """Load a DAG-rust export directory."""
 
-        raise UnsupportedArtifactError(
-            "DAG-rust export loading is not implemented yet."
-        )
+        artifact = TensorGraphArtifactLoader(self.export_dir).load_artifact()
+        if artifact.manifest.source_format is not SourceFormat.DAG_RUST:
+            raise ArtifactValidationError("artifact source_format is not dag_rust")
+        return artifact.graph
