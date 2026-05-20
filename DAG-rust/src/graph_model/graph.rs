@@ -2,7 +2,7 @@
 
 use crate::foundations::bit_encoding::NodeFlags;
 use crate::foundations::error::{DagError, Result};
-use crate::foundations::id::{NodeId, SequenceId, Weight};
+use crate::foundations::id::{NodeId, ProvenancePosition, SequenceId, Weight};
 use crate::graph_model::provenance::{
     PackedProvenanceRecord, ProvenanceRange, ProvenanceRecord, ProvenanceStorageStrategy,
     ProvenanceTable,
@@ -327,10 +327,150 @@ pub struct FtoDag {
     children: Vec<Vec<NodeId>>,
     provenance_table: ProvenanceTable,
     node_provenance: NodeProvenanceStorage,
-    sequence_trace_paths: Vec<Vec<NodeId>>,
+    sequence_trace_paths: SequenceTraceStore,
     node_last_sequences: Vec<Option<SequenceId>>,
     fragment_index: FragmentIndex,
     endpoint_index: EndpointIndex,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SequenceTraceStore {
+    offsets: Vec<u64>,
+    nodes: Vec<NodeId>,
+}
+
+impl Default for SequenceTraceStore {
+    fn default() -> Self {
+        Self {
+            offsets: vec![0],
+            nodes: Vec::new(),
+        }
+    }
+}
+
+impl SequenceTraceStore {
+    fn from_parts(offsets: Vec<u64>, nodes: Vec<NodeId>) -> Result<Self> {
+        if offsets.is_empty() {
+            return Err(DagError::InvalidStorage(
+                "trace-path offsets must include an initial zero".to_string(),
+            ));
+        }
+        if offsets[0] != 0 {
+            return Err(DagError::InvalidStorage(format!(
+                "trace-path offsets must start at 0, found {}",
+                offsets[0]
+            )));
+        }
+        let expected_end = u64::try_from(nodes.len()).map_err(|_| DagError::ValueDoesNotFit {
+            value: nodes.len() as u128,
+            bits: 64,
+        })?;
+        for window in offsets.windows(2) {
+            if window[0] > window[1] {
+                return Err(DagError::InvalidStorage(
+                    "trace-path offsets must be monotone".to_string(),
+                ));
+            }
+        }
+        if offsets[offsets.len() - 1] != expected_end {
+            return Err(DagError::InvalidStorage(format!(
+                "trace-path offsets end {} does not match stored node count {expected_end}",
+                offsets[offsets.len() - 1]
+            )));
+        }
+        Ok(Self { offsets, nodes })
+    }
+
+    fn path_count(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    fn offsets(&self) -> &[u64] {
+        &self.offsets
+    }
+
+    fn nodes(&self) -> &[NodeId] {
+        &self.nodes
+    }
+
+    fn path_bounds(&self, sequence_index: usize) -> Option<(usize, usize)> {
+        let start = *self.offsets.get(sequence_index)?;
+        let end = *self.offsets.get(sequence_index + 1)?;
+        let start = usize::try_from(start).ok()?;
+        let end = usize::try_from(end).ok()?;
+        Some((start, end))
+    }
+
+    fn path(&self, sequence_id: SequenceId) -> Option<&[NodeId]> {
+        let (start, end) = self.path_bounds(sequence_id.to_usize())?;
+        self.nodes.get(start..end)
+    }
+
+    fn iter(&self) -> SequenceTracePathIter<'_> {
+        SequenceTracePathIter {
+            store: self,
+            next_index: 0,
+        }
+    }
+
+    fn append_node(
+        &mut self,
+        sequence_id: SequenceId,
+        position: ProvenancePosition,
+        node_id: NodeId,
+    ) -> Result<()> {
+        let sequence_index = sequence_id.to_usize();
+        while self.path_count() < sequence_index + 1 {
+            self.offsets.push(self.nodes.len() as u64);
+        }
+        if sequence_index + 1 != self.path_count() {
+            return Err(DagError::InvalidRange {
+                start: sequence_index,
+                end: sequence_index.saturating_add(1),
+                len: self.path_count(),
+            });
+        }
+        let expected_position = self
+            .path_bounds(sequence_index)
+            .map(|(start, end)| end - start)
+            .ok_or(DagError::InvalidRange {
+                start: sequence_index,
+                end: sequence_index.saturating_add(1),
+                len: self.path_count(),
+            })?;
+        let position = usize::try_from(position.raw()).map_err(|_| DagError::ValueDoesNotFit {
+            value: position.raw() as u128,
+            bits: usize::BITS as u8,
+        })?;
+        if position != expected_position {
+            return Err(DagError::InvalidRange {
+                start: position,
+                end: position.saturating_add(1),
+                len: expected_position,
+            });
+        }
+        self.nodes.push(node_id);
+        self.offsets[sequence_index + 1] = self.nodes.len() as u64;
+        Ok(())
+    }
+}
+
+pub(crate) struct SequenceTracePathIter<'a> {
+    store: &'a SequenceTraceStore,
+    next_index: usize,
+}
+
+impl<'a> Iterator for SequenceTracePathIter<'a> {
+    type Item = &'a [NodeId];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let path = self
+            .store
+            .path_bounds(self.next_index)
+            .and_then(|(start, end)| self.store.nodes.get(start..end))?;
+        self.next_index += 1;
+        Some(path)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -347,7 +487,8 @@ pub(crate) enum ProvenanceSnapshot {
     Packed32(Vec<Vec<PackedProvenanceRecord>>),
     TracePaths {
         node_counts: Vec<u64>,
-        sequence_trace_paths: Vec<Vec<NodeId>>,
+        sequence_trace_offsets: Vec<u64>,
+        sequence_trace_nodes: Vec<NodeId>,
     },
     CountOnly(Vec<u64>),
 }
@@ -371,15 +512,6 @@ impl ProvenanceSnapshot {
         }
     }
 
-    fn sequence_trace_paths(&self) -> Vec<Vec<NodeId>> {
-        match self {
-            Self::TracePaths {
-                sequence_trace_paths,
-                ..
-            } => sequence_trace_paths.clone(),
-            Self::Full(_) | Self::Packed32(_) | Self::CountOnly(_) => Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -559,13 +691,14 @@ impl NodeProvenanceStorage {
         matches!(self, Self::TracePaths(_))
     }
 
-    fn snapshot(&self, sequence_trace_paths: &[Vec<NodeId>]) -> ProvenanceSnapshot {
+    fn snapshot(&self, sequence_trace_paths: &SequenceTraceStore) -> ProvenanceSnapshot {
         match self {
             Self::Full(records) => ProvenanceSnapshot::Full(records.clone()),
             Self::Packed32(records) => ProvenanceSnapshot::Packed32(records.clone()),
             Self::TracePaths(node_counts) => ProvenanceSnapshot::TracePaths {
                 node_counts: node_counts.clone(),
-                sequence_trace_paths: sequence_trace_paths.to_vec(),
+                sequence_trace_offsets: sequence_trace_paths.offsets().to_vec(),
+                sequence_trace_nodes: sequence_trace_paths.nodes().to_vec(),
             },
             Self::CountOnly(counts) => ProvenanceSnapshot::CountOnly(counts.clone()),
         }
@@ -613,7 +746,7 @@ impl FtoDag {
             children: Vec::new(),
             provenance_table: ProvenanceTable::new(),
             node_provenance: NodeProvenanceStorage::new(provenance_storage),
-            sequence_trace_paths: Vec::new(),
+            sequence_trace_paths: SequenceTraceStore::default(),
             node_last_sequences: Vec::new(),
             fragment_index: FragmentIndex::default(),
             endpoint_index: EndpointIndex::default(),
@@ -707,22 +840,30 @@ impl FtoDag {
             ));
         }
         self.sequence_trace_paths
-            .get(sequence_id.to_usize())
-            .map(Vec::as_slice)
+            .path(sequence_id)
             .ok_or(DagError::InvalidRange {
                 start: sequence_id.to_usize(),
                 end: sequence_id.to_usize().saturating_add(1),
-                len: self.sequence_trace_paths.len(),
+                len: self.sequence_trace_paths.path_count(),
             })
     }
 
-    pub(crate) fn sequence_trace_paths(&self) -> Result<&[Vec<NodeId>]> {
+    pub(crate) fn sequence_trace_path_count(&self) -> Result<usize> {
         if !self.retains_sequence_trace_paths() {
             return Err(DagError::UnsupportedOperation(
                 "sequence trace paths are only retained with TracePaths provenance storage",
             ));
         }
-        Ok(&self.sequence_trace_paths)
+        Ok(self.sequence_trace_paths.path_count())
+    }
+
+    pub(crate) fn sequence_trace_paths(&self) -> Result<SequenceTracePathIter<'_>> {
+        if !self.retains_sequence_trace_paths() {
+            return Err(DagError::UnsupportedOperation(
+                "sequence trace paths are only retained with TracePaths provenance storage",
+            ));
+        }
+        Ok(self.sequence_trace_paths.iter())
     }
 
     pub fn can_node_accept_sequence(
@@ -821,26 +962,8 @@ impl FtoDag {
         if !self.retains_sequence_trace_paths() {
             return Ok(());
         }
-        let sequence_index = record.sequence_id.to_usize();
-        if self.sequence_trace_paths.len() <= sequence_index {
-            self.sequence_trace_paths
-                .resize_with(sequence_index.saturating_add(1), Vec::new);
-        }
-        let position =
-            usize::try_from(record.position.raw()).map_err(|_| DagError::ValueDoesNotFit {
-                value: record.position.raw() as u128,
-                bits: usize::BITS as u8,
-            })?;
-        let path = &mut self.sequence_trace_paths[sequence_index];
-        if position != path.len() {
-            return Err(DagError::InvalidRange {
-                start: position,
-                end: position.saturating_add(1),
-                len: path.len(),
-            });
-        }
-        path.push(node_id);
-        Ok(())
+        self.sequence_trace_paths
+            .append_node(record.sequence_id, record.position, node_id)
     }
 
     pub fn add_or_increment_edge(
@@ -933,7 +1056,19 @@ impl FtoDag {
             children: vec![Vec::new(); snapshot.provenance.node_count()],
             provenance_table: ProvenanceTable::new(),
             node_provenance: NodeProvenanceStorage::from_snapshot(&snapshot.provenance),
-            sequence_trace_paths: snapshot.provenance.sequence_trace_paths(),
+            sequence_trace_paths: match &snapshot.provenance {
+                ProvenanceSnapshot::TracePaths {
+                    sequence_trace_offsets,
+                    sequence_trace_nodes,
+                    ..
+                } => SequenceTraceStore::from_parts(
+                    sequence_trace_offsets.clone(),
+                    sequence_trace_nodes.clone(),
+                )?,
+                ProvenanceSnapshot::Full(_)
+                | ProvenanceSnapshot::Packed32(_)
+                | ProvenanceSnapshot::CountOnly(_) => SequenceTraceStore::default(),
+            },
             node_last_sequences: snapshot.node_last_sequences,
             fragment_index: FragmentIndex::default(),
             endpoint_index: EndpointIndex::default(),

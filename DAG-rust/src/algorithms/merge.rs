@@ -118,8 +118,7 @@ pub fn merge_trace_path_graphs_as_count_only(
 }
 
 fn replay_trace_path_graphs(base: FtoDag, add: FtoDag, config: MergeConfig) -> Result<FtoDag> {
-    let base_sequence_offset = base.sequence_trace_paths()?.len();
-    let add_trace_paths = add.sequence_trace_paths()?;
+    let base_sequence_offset = base.sequence_trace_path_count()?;
 
     let mut build_config = BuildConfig::new(base.fragment_len());
     build_config.min_initial_match_ratio = config.min_initial_anchor_ratio;
@@ -128,7 +127,7 @@ fn replay_trace_path_graphs(base: FtoDag, add: FtoDag, config: MergeConfig) -> R
     build_config.topology_update_strategy = TopologyUpdateStrategy::IncrementalForwardRelaxation;
     let mut builder = FtoDagBuilder::from_graph(base, build_config)?;
 
-    for (sequence_offset, trace_path) in add_trace_paths.iter().enumerate() {
+    for (sequence_offset, trace_path) in add.sequence_trace_paths()?.enumerate() {
         if trace_path.is_empty() {
             continue;
         }

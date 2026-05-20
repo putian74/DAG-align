@@ -186,7 +186,7 @@ fn rebuild_graph_with_remap(
             }
         }
         ProvenanceStorageStrategy::TracePaths => {
-            for (sequence_index, path) in graph.sequence_trace_paths()?.iter().enumerate() {
+            for (sequence_index, path) in graph.sequence_trace_paths()?.enumerate() {
                 let sequence_id = SequenceId::try_from(sequence_index)?;
                 for (position, node_id) in path.iter().copied().enumerate() {
                     rebuilt.add_provenance_record(

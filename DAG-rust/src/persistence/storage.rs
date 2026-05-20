@@ -24,7 +24,7 @@ pub struct GraphFormatVersion {
 }
 
 impl GraphFormatVersion {
-    pub const CURRENT: Self = Self { major: 0, minor: 1 };
+    pub const CURRENT: Self = Self { major: 0, minor: 2 };
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -204,18 +204,20 @@ fn write_provenance_snapshot(
         }
         ProvenanceSnapshot::TracePaths {
             node_counts,
-            sequence_trace_paths,
+            sequence_trace_offsets,
+            sequence_trace_nodes,
         } => {
             write_u64(writer, node_counts.len() as u64, path)?;
             for count in node_counts {
                 write_u64(writer, *count, path)?;
             }
-            write_u64(writer, sequence_trace_paths.len() as u64, path)?;
-            for trace_path in sequence_trace_paths {
-                write_u64(writer, trace_path.len() as u64, path)?;
-                for node_id in trace_path {
-                    write_u32(writer, node_id.raw(), path)?;
-                }
+            write_u64(writer, sequence_trace_offsets.len() as u64, path)?;
+            for offset in sequence_trace_offsets {
+                write_u64(writer, *offset, path)?;
+            }
+            write_u64(writer, sequence_trace_nodes.len() as u64, path)?;
+            for node_id in sequence_trace_nodes {
+                write_u32(writer, node_id.raw(), path)?;
             }
             Ok(())
         }
@@ -262,19 +264,20 @@ fn read_provenance_snapshot(
             for _ in 0..node_count {
                 node_counts.push(read_u64(reader, path)?);
             }
-            let path_count = read_usize(reader, path)?;
-            let mut sequence_trace_paths = Vec::with_capacity(path_count);
-            for _ in 0..path_count {
-                let len = read_usize(reader, path)?;
-                let mut trace_path = Vec::with_capacity(len);
-                for _ in 0..len {
-                    trace_path.push(NodeId::new(read_u32(reader, path)?));
-                }
-                sequence_trace_paths.push(trace_path);
+            let offset_count = read_usize(reader, path)?;
+            let mut sequence_trace_offsets = Vec::with_capacity(offset_count);
+            for _ in 0..offset_count {
+                sequence_trace_offsets.push(read_u64(reader, path)?);
+            }
+            let trace_node_count = read_usize(reader, path)?;
+            let mut sequence_trace_nodes = Vec::with_capacity(trace_node_count);
+            for _ in 0..trace_node_count {
+                sequence_trace_nodes.push(NodeId::new(read_u32(reader, path)?));
             }
             Ok(ProvenanceSnapshot::TracePaths {
                 node_counts,
-                sequence_trace_paths,
+                sequence_trace_offsets,
+                sequence_trace_nodes,
             })
         }
         ProvenanceStorageStrategy::CountOnly => {
