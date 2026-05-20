@@ -4,7 +4,7 @@ use crate::foundations::error::{DagError, Result};
 use crate::foundations::id::{NodeId, ProvenancePosition, SequenceId, Weight};
 use crate::graph_model::graph::{
     EdgeIndexStrategy, EdgeKey, FtoDag, FtoDagSnapshot, Node, NodeKind, NodeProvenanceStorage,
-    ProvenanceSnapshot, SequenceTraceStore, WeightedEdge,
+    ProvenanceSnapshot, SequenceTraceStore, StoredFragmentKey, WeightedEdge,
 };
 use crate::graph_model::provenance::{
     PackedProvenanceRecord, ProvenanceRecord, ProvenanceStorageStrategy,
@@ -220,7 +220,7 @@ fn packed_version(version: GraphFormatVersion) -> u32 {
 
 fn write_node(writer: &mut impl Write, node: &Node, path: &Path) -> Result<()> {
     write_u32(writer, node.id.raw(), path)?;
-    write_fragment_key(writer, &node.fragment, path)?;
+    write_stored_fragment_key(writer, &node.fragment, path)?;
     write_u8(writer, encode_node_kind(node.kind), path)?;
     write_u64(writer, node.weight.raw(), path)?;
     write_u16(writer, node.flags.bits(), path)
@@ -229,7 +229,7 @@ fn write_node(writer: &mut impl Write, node: &Node, path: &Path) -> Result<()> {
 fn read_node(reader: &mut impl Read, path: &Path) -> Result<Node> {
     Ok(Node {
         id: NodeId::new(read_u32(reader, path)?),
-        fragment: read_fragment_key(reader, path)?,
+        fragment: read_stored_fragment_key(reader, path)?,
         kind: decode_node_kind(read_u8(reader, path)?)?,
         weight: Weight::new(read_u64(reader, path)?),
         flags: crate::foundations::bit_encoding::NodeFlags::from_bits(read_u16(reader, path)?),
@@ -342,6 +342,30 @@ fn read_provenance_record(reader: &mut impl Read, path: &Path) -> Result<Provena
     })
 }
 
+fn write_stored_fragment_key(
+    writer: &mut impl Write,
+    key: &StoredFragmentKey,
+    path: &Path,
+) -> Result<()> {
+    match key {
+        StoredFragmentKey::PackedInline {
+            packed_meta,
+            value_lo,
+            value_hi,
+        } => {
+            write_u8(writer, 0, path)?;
+            write_u8(writer, *packed_meta as u8, path)?;
+            write_u16(writer, (*packed_meta >> 8) as u16, path)?;
+            write_u128(
+                writer,
+                (u128::from(*value_hi) << 64) | u128::from(*value_lo),
+                path,
+            )
+        }
+        StoredFragmentKey::External(fragment) => write_fragment_key(writer, fragment, path),
+    }
+}
+
 fn write_fragment_key(writer: &mut impl Write, key: &FragmentKey, path: &Path) -> Result<()> {
     match key {
         FragmentKey::PackedInline {
@@ -379,13 +403,18 @@ fn write_fragment_key(writer: &mut impl Write, key: &FragmentKey, path: &Path) -
     }
 }
 
-fn read_fragment_key(reader: &mut impl Read, path: &Path) -> Result<FragmentKey> {
+fn read_stored_fragment_key(reader: &mut impl Read, path: &Path) -> Result<StoredFragmentKey> {
     match read_u8(reader, path)? {
-        0 => Ok(FragmentKey::PackedInline {
-            bits_per_symbol: read_u8(reader, path)?,
-            len: read_u16(reader, path)?,
-            value: read_u128(reader, path)?,
-        }),
+        0 => {
+            let bits_per_symbol = read_u8(reader, path)?;
+            let len = read_u16(reader, path)?;
+            let value = read_u128(reader, path)?;
+            Ok(StoredFragmentKey::PackedInline {
+                packed_meta: u32::from(bits_per_symbol) | (u32::from(len) << 8),
+                value_lo: value as u64,
+                value_hi: (value >> 64) as u64,
+            })
+        }
         1 => {
             let bits_per_symbol = read_u8(reader, path)?;
             let len = read_u32(reader, path)?;
@@ -394,11 +423,11 @@ fn read_fragment_key(reader: &mut impl Read, path: &Path) -> Result<FragmentKey>
             for _ in 0..word_count {
                 words.push(read_u64(reader, path)?);
             }
-            Ok(FragmentKey::PackedWords {
+            Ok(StoredFragmentKey::from(FragmentKey::PackedWords {
                 bits_per_symbol,
                 len,
                 words,
-            })
+            }))
         }
         2 => {
             let symbol_count = read_usize(reader, path)?;
@@ -406,7 +435,7 @@ fn read_fragment_key(reader: &mut impl Read, path: &Path) -> Result<FragmentKey>
             for _ in 0..symbol_count {
                 symbols.push(SymbolId::new(read_u16(reader, path)?));
             }
-            Ok(FragmentKey::Symbols(symbols))
+            Ok(StoredFragmentKey::from(FragmentKey::Symbols(symbols)))
         }
         tag => Err(DagError::InvalidStorage(format!(
             "unknown fragment-key tag {tag} in {}",

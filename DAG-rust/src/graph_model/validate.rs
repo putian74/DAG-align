@@ -48,7 +48,7 @@ impl ValidateGraph for FtoDag {
             }
             if !self
                 .fragment_index()
-                .contains(&node.fragment, node.kind, node.id)
+                .contains_stored(&node.fragment, node.kind, node.id)
             {
                 report
                     .errors

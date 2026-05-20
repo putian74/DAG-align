@@ -2139,7 +2139,7 @@ fn base_main_path_candidate_sets_for_test(
         let mut candidates = Vec::new();
         for base_node_id in base
             .fragment_index()
-            .nodes_for(&add_node.fragment, add_node.kind)
+            .nodes_for_stored(&add_node.fragment, add_node.kind)
             .iter()
             .copied()
         {
@@ -2155,7 +2155,7 @@ fn base_main_path_candidate_sets_for_test(
         sets.push(AnchorCandidateSet {
             position,
             kind: add_node.kind,
-            fragment: add_node.fragment.clone(),
+            fragment: add_node.fragment.to_fragment_key(),
             candidates,
         });
     }

@@ -26,7 +26,7 @@ fn first_sequence_initialization_preserves_repeated_occurrences() {
     let repeated_key = graph.nodes()[1].fragment.clone();
     let internal_repeats = graph
         .fragment_index()
-        .nodes_for(&repeated_key, NodeKind::Internal);
+        .nodes_for_stored(&repeated_key, NodeKind::Internal);
     assert_eq!(internal_repeats.len(), 2);
     assert_ne!(internal_repeats[0], internal_repeats[1]);
 

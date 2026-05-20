@@ -118,7 +118,7 @@ fn build_secondary_merge_keys(
     for node_id in topology.topological_order().iter().copied() {
         let node = graph.node(node_id)?;
         keys[node_id.to_usize()] = Some(SecondaryMergeKey {
-            fragment: node.fragment.clone(),
+            fragment: node.fragment.to_fragment_key(),
             kind: node.kind,
             forward_coordinate: config
                 .use_forward_coordinates

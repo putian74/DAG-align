@@ -9,6 +9,7 @@ use crate::graph_model::provenance::{
 use crate::sequence_model::fragment::FragmentKey;
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::{File, OpenOptions, remove_file};
 use std::hash::Hash;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -46,10 +47,103 @@ impl NodeKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Node {
     pub id: NodeId,
-    pub fragment: FragmentKey,
+    pub fragment: StoredFragmentKey,
     pub kind: NodeKind,
     pub weight: Weight,
     pub flags: NodeFlags,
+}
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub enum StoredFragmentKey {
+    PackedInline {
+        packed_meta: u32,
+        value_lo: u64,
+        value_hi: u64,
+    },
+    External(Box<FragmentKey>),
+}
+
+impl StoredFragmentKey {
+    const LEN_SHIFT: u32 = 8;
+
+    pub fn to_fragment_key(&self) -> FragmentKey {
+        match self {
+            Self::PackedInline {
+                packed_meta,
+                value_lo,
+                value_hi,
+            } => FragmentKey::packed_inline(
+                *packed_meta as u8,
+                (*packed_meta >> Self::LEN_SHIFT) as u16,
+                (u128::from(*value_hi) << 64) | u128::from(*value_lo),
+            ),
+            Self::External(fragment) => (**fragment).clone(),
+        }
+    }
+
+    fn matches_fragment_key(&self, fragment: &FragmentKey) -> bool {
+        match (self, fragment) {
+            (
+                Self::PackedInline {
+                    packed_meta,
+                    value_lo,
+                    value_hi,
+                },
+                FragmentKey::PackedInline {
+                    bits_per_symbol,
+                    len,
+                    value,
+                },
+            ) => {
+                *packed_meta == (u32::from(*bits_per_symbol) | (u32::from(*len) << Self::LEN_SHIFT))
+                    && *value_lo == *value as u64
+                    && *value_hi == (*value >> 64) as u64
+            }
+            (Self::External(stored), other) => stored.as_ref() == other,
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Debug for StoredFragmentKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.to_fragment_key().fmt(f)
+    }
+}
+
+impl From<FragmentKey> for StoredFragmentKey {
+    fn from(fragment: FragmentKey) -> Self {
+        match fragment {
+            FragmentKey::PackedInline {
+                bits_per_symbol,
+                len,
+                value,
+            } => Self::PackedInline {
+                packed_meta: u32::from(bits_per_symbol) | (u32::from(len) << Self::LEN_SHIFT),
+                value_lo: value as u64,
+                value_hi: (value >> 64) as u64,
+            },
+            other => Self::External(Box::new(other)),
+        }
+    }
+}
+
+impl From<StoredFragmentKey> for FragmentKey {
+    fn from(fragment: StoredFragmentKey) -> Self {
+        fragment.to_fragment_key()
+    }
+}
+
+impl PartialEq<FragmentKey> for StoredFragmentKey {
+    fn eq(&self, other: &FragmentKey) -> bool {
+        self.matches_fragment_key(other)
+    }
+}
+
+impl PartialEq<StoredFragmentKey> for FragmentKey {
+    fn eq(&self, other: &StoredFragmentKey) -> bool {
+        other.matches_fragment_key(self)
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -561,6 +655,27 @@ impl FragmentIndex {
         }
     }
 
+    pub fn insert_stored(&mut self, fragment: &StoredFragmentKey, kind: NodeKind, node_id: NodeId) {
+        match fragment {
+            StoredFragmentKey::PackedInline {
+                packed_meta,
+                value_lo,
+                value_hi,
+            } => self.packed_inline_entries.insert(
+                PackedInlineIndexKey {
+                    kind,
+                    packed_meta: *packed_meta,
+                    value_lo: *value_lo,
+                    value_hi: *value_hi,
+                },
+                node_id,
+            ),
+            StoredFragmentKey::External(fragment) => {
+                self.entries.insert((kind, (**fragment).clone()), node_id);
+            }
+        }
+    }
+
     pub fn nodes_for(&self, fragment: &FragmentKey, kind: NodeKind) -> &[NodeId] {
         if let Some(key) = PackedInlineIndexKey::from_fragment(fragment, kind) {
             return self.packed_inline_entries.get(&key);
@@ -568,8 +683,35 @@ impl FragmentIndex {
         self.entries.get(&(kind, fragment.clone()))
     }
 
+    pub fn nodes_for_stored(&self, fragment: &StoredFragmentKey, kind: NodeKind) -> &[NodeId] {
+        match fragment {
+            StoredFragmentKey::PackedInline {
+                packed_meta,
+                value_lo,
+                value_hi,
+            } => self.packed_inline_entries.get(&PackedInlineIndexKey {
+                kind,
+                packed_meta: *packed_meta,
+                value_lo: *value_lo,
+                value_hi: *value_hi,
+            }),
+            StoredFragmentKey::External(fragment) => {
+                self.entries.get(&(kind, (**fragment).clone()))
+            }
+        }
+    }
+
     pub fn contains(&self, fragment: &FragmentKey, kind: NodeKind, node_id: NodeId) -> bool {
         self.nodes_for(fragment, kind).contains(&node_id)
+    }
+
+    pub fn contains_stored(
+        &self,
+        fragment: &StoredFragmentKey,
+        kind: NodeKind,
+        node_id: NodeId,
+    ) -> bool {
+        self.nodes_for_stored(fragment, kind).contains(&node_id)
     }
 
     pub fn clear(&mut self) {
@@ -1737,7 +1879,7 @@ impl FtoDag {
         let id = NodeId::try_from(self.nodes.len())?;
         let node = Node {
             id,
-            fragment: fragment.clone(),
+            fragment: StoredFragmentKey::from(fragment.clone()),
             kind,
             weight: Weight::new(0),
             flags: kind.flags(),
@@ -1838,7 +1980,7 @@ impl FtoDag {
         self.fragment_index.clear();
         for node in &self.nodes {
             self.fragment_index
-                .insert(&node.fragment, node.kind, node.id);
+                .insert_stored(&node.fragment, node.kind, node.id);
         }
     }
 
@@ -1957,7 +2099,7 @@ impl FtoDag {
             }
             graph
                 .fragment_index
-                .insert(&node.fragment, node.kind, node.id);
+                .insert_stored(&node.fragment, node.kind, node.id);
             graph.endpoint_index.record_node_kind(node.id, node.kind);
         }
 

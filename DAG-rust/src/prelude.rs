@@ -32,7 +32,7 @@ pub use crate::foundations::id::{
 };
 pub use crate::graph_model::graph::{
     EdgeIndexStrategy, EdgeKey, EdgeUpdate, EndpointIndex, FragmentIndex, FtoDag, GraphStats, Node,
-    NodeKind, WeightedEdge,
+    NodeKind, StoredFragmentKey, WeightedEdge,
 };
 pub use crate::graph_model::provenance::{
     PackedProvenanceRecord, ProvenanceRange, ProvenanceRecord, ProvenanceStorageStrategy,
