@@ -14,11 +14,24 @@ use crate::coordinates::{
 use crate::diagnostics::{ConversionDiagnostics, Diagnostic, DiagnosticSeverity, ProfilingSummary};
 use crate::error::{PreAdPrepError, Result};
 use crate::export::{
-    ArraySpec, DataType, SourceFormat, TensorGraphArtifact, TensorGraphManifest, write_npy_1d,
+    ArraySpec, DataType, SourceFormat, TensorGraphArtifact, TensorGraphManifest, read_npy_1d_u64,
+    read_npy_2d_f64, write_npy_1d,
 };
 use crate::graph::{AdjacencyCsr, NodeFlags, TensorGraph};
-use crate::init::InitializationBundle;
+use crate::init::{
+    InitialPhmmManifest, InitializationBundle, InitializationTrack, TRANSITION_ORDER,
+    write_initialization_track,
+};
+use crate::reference_msa::{
+    ReferenceMsaConfig, ReferenceMsaResult, ReferenceMsaScoring,
+    build_reference_msa_against_reference, collect_weighted_sequence_paths,
+    emission_probability_tables, insertion_ranges,
+};
 use crate::validate::{ArtifactValidationLevel, validate_tensor_graph_artifact};
+
+const LEGACY_PHMM_BASE_ORDER: [&str; 4] = ["A", "T", "C", "G"];
+const LEGACY_SYMBOL_FLOOR_LOG_PROB: f64 = -36.841361487904734;
+const LEGACY_SYMBOL_FLOOR_DESCRIPTION: &str = "log(1e-16)";
 
 /// Input paths for one current DAG-align graph directory.
 #[derive(Debug, Clone)]
@@ -112,11 +125,8 @@ impl LegacyAdapter for LegacyDagAlignAdapter {
         let mut graph = core.to_tensor_graph();
 
         let reference_core_path = output_dir.join("diagnostics").join("reference_core.json");
-        let reference_path = if reference_core_path.exists() {
-            Some(read_reference_core(&reference_core_path)?.to_reference_path())
-        } else {
-            Some(derive_reference_path_from_graph(&graph))
-        };
+        let mut pending_reference_messages: Vec<(String, String)> = Vec::new();
+        let reference_path = Some(derive_reference_path_from_graph(&graph));
 
         let mut global_state_count = None;
         if let Some(reference_path) = reference_path {
@@ -141,6 +151,38 @@ impl LegacyAdapter for LegacyDagAlignAdapter {
             graph.state_windows = Some(windows);
             graph.edge_overlaps = Some(overlaps);
             global_state_count = Some(coordinates.global_state_count);
+            if options.include_initialization {
+                if reference_core_path.exists() {
+                    pending_reference_messages.push((
+                        "legacy_reference_artifact_retained".into(),
+                        "legacy thr_*.npz reference artifacts were preserved for diagnostics, but max-weight graph reference path is used for coordinates and reference_msa initialization".into(),
+                    ));
+                }
+                if let Some(alphabet_size) = initialization_alphabet_size(&core, &graph) {
+                    if try_write_reference_msa_initialization(
+                        &output_dir,
+                        &graph,
+                        &coordinates.reference_path,
+                        alphabet_size,
+                    )? {
+                        pending_reference_messages.push((
+                            "reference_msa_generated".into(),
+                            "reference-path MSA initialization was generated from decoded source provenance".into(),
+                        ));
+                    } else {
+                        pending_reference_messages.push((
+                            "reference_msa_fallback".into(),
+                            "decoded source provenance was unavailable; preserved existing bootstrap reference_msa initialization if present".into(),
+                        ));
+                    }
+                    pending_reference_messages.extend(normalize_legacy_initialization_tracks(
+                        &output_dir,
+                        alphabet_size,
+                        &core.alphabet,
+                        &core.symbol_encoding,
+                    )?);
+                }
+            }
         } else if options.require_state_windows {
             return Err(PreAdPrepError::Validation(
                 "state windows were required but no reference path could be constructed".into(),
@@ -193,6 +235,9 @@ impl LegacyAdapter for LegacyDagAlignAdapter {
         let mut diagnostics = ConversionDiagnostics::default();
         for diagnostic in core.diagnostics {
             diagnostics.report.push(diagnostic.into());
+        }
+        for (code, message) in pending_reference_messages {
+            diagnostics.report.warning(code, message);
         }
         if global_state_count.is_some() {
             diagnostics.report.warning(
@@ -292,11 +337,6 @@ fn read_graph_core(path: &Path) -> Result<GraphCoreJson> {
     Ok(serde_json::from_str(&contents)?)
 }
 
-fn read_reference_core(path: &Path) -> Result<ReferenceCoreJson> {
-    let contents = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&contents)?)
-}
-
 #[derive(Debug, Deserialize)]
 struct GraphCoreJson {
     node_symbol: Vec<u16>,
@@ -356,23 +396,6 @@ impl GraphCoreJson {
             &graph.edge_src,
         ));
         graph
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ReferenceCoreJson {
-    ref_node_ids: Vec<i64>,
-}
-
-impl ReferenceCoreJson {
-    fn to_reference_path(&self) -> ReferencePath {
-        ReferencePath {
-            node_ids: self
-                .ref_node_ids
-                .iter()
-                .map(|&node_id| usize::try_from(node_id).ok())
-                .collect(),
-        }
     }
 }
 
@@ -507,9 +530,6 @@ fn write_reference_artifacts_from_coordinates(
     let reference_dir = output_dir.join("reference");
     let ref_node_path = reference_dir.join("ref_node_ids.npy");
     let ref_symbols_path = reference_dir.join("ref_sequence_symbols.npy");
-    if ref_node_path.exists() && ref_symbols_path.exists() {
-        return Ok(());
-    }
     let ref_node_ids: Vec<i64> = coordinates
         .reference_path
         .node_ids
@@ -525,6 +545,419 @@ fn write_reference_artifacts_from_coordinates(
     write_npy_1d(ref_node_path, &ref_node_ids)?;
     write_npy_1d(ref_symbols_path, &ref_sequence_symbols)?;
     Ok(())
+}
+
+fn try_write_reference_msa_initialization(
+    output_dir: &Path,
+    graph: &TensorGraph,
+    reference_path: &ReferencePath,
+    alphabet_size: usize,
+) -> Result<bool> {
+    let source_sequence_id_path = output_dir.join("source").join("source_sequence_id.npy");
+    let source_position_path = output_dir.join("source").join("source_position.npy");
+    let node_source_offset_path = output_dir.join("source").join("node_source_offset.npy");
+    let node_source_len_path = output_dir.join("source").join("node_source_len.npy");
+    if !source_sequence_id_path.exists()
+        || !source_position_path.exists()
+        || !node_source_offset_path.exists()
+        || !node_source_len_path.exists()
+    {
+        return Ok(false);
+    }
+
+    let source_sequence_id = read_npy_1d_u64(&source_sequence_id_path)?;
+    let source_position = read_npy_1d_u64(&source_position_path)?;
+    let node_source_offset = to_usize_vec(read_npy_1d_u64(&node_source_offset_path)?)?;
+    let node_source_len = to_usize_vec(read_npy_1d_u64(&node_source_len_path)?)?;
+    let paths = collect_weighted_sequence_paths(
+        graph,
+        &source_sequence_id,
+        &source_position,
+        &node_source_offset,
+        &node_source_len,
+    )?;
+    if paths.is_empty() {
+        return Ok(false);
+    }
+
+    let reference_symbols = reference_path
+        .node_ids
+        .iter()
+        .map(|node_id| {
+            node_id
+                .map(|node_id| graph.node_symbol[node_id])
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let config = ReferenceMsaConfig {
+        scoring: ReferenceMsaScoring::identity(alphabet_size, 2, -1, -5, -1),
+        ..ReferenceMsaConfig::default()
+    };
+    let result =
+        build_reference_msa_against_reference(&paths, reference_path, &reference_symbols, &config)?;
+    let global_state_count = reference_path.global_state_count();
+    if result.reference_path.global_state_count() != global_state_count {
+        return Err(PreAdPrepError::Validation(
+            "reference_msa result disagrees with coordinate reference path length".into(),
+        ));
+    }
+
+    let (match_probs, insert_probs) = emission_probability_tables(&result, alphabet_size, 1e-3)?;
+    let insert_ranges = insertion_ranges(&result.longest_insertions);
+    write_reference_insert_ranges(output_dir, &insert_ranges)?;
+    let transition_logits = bootstrap_transition_logits(global_state_count, &insert_ranges);
+    let match_emission = match_probs
+        .into_iter()
+        .map(|value| value.max(1e-16).ln())
+        .collect::<Vec<_>>();
+    let insert_emission = insert_probs
+        .into_iter()
+        .map(|value| value.max(1e-16).ln())
+        .collect::<Vec<_>>();
+    let metadata = reference_msa_metadata(&result, alphabet_size, &insert_ranges);
+    let manifest = write_initialization_track(
+        output_dir,
+        InitializationTrack::ReferenceMsa,
+        global_state_count,
+        alphabet_size,
+        &match_emission,
+        &insert_emission,
+        &transition_logits,
+        metadata,
+    )?;
+    let diagnostics_path = output_dir
+        .join("diagnostics")
+        .join("init_reference_msa.json");
+    fs::write(diagnostics_path, serde_json::to_vec_pretty(&manifest)?)?;
+    Ok(true)
+}
+
+fn normalize_legacy_initialization_tracks(
+    output_dir: &Path,
+    target_alphabet_size: usize,
+    graph_alphabet: &[String],
+    symbol_encoding: &BTreeMap<String, u16>,
+) -> Result<Vec<(String, String)>> {
+    let mut messages = Vec::new();
+    for track in [
+        InitializationTrack::LegacyCurrent,
+        InitializationTrack::ReferenceMsa,
+    ] {
+        if normalize_legacy_initialization_track(
+            output_dir,
+            track,
+            target_alphabet_size,
+            graph_alphabet,
+            symbol_encoding,
+        )? {
+            messages.push((
+                format!("{}_normalized", track.as_manifest_str()),
+                format!(
+                    "{} initialization was normalized from legacy A,T,C,G emissions into graph symbol encoding [{}]",
+                    track.as_manifest_str(),
+                    graph_alphabet.join(",")
+                ),
+            ));
+        }
+    }
+    Ok(messages)
+}
+
+fn normalize_legacy_initialization_track(
+    output_dir: &Path,
+    track: InitializationTrack,
+    target_alphabet_size: usize,
+    graph_alphabet: &[String],
+    symbol_encoding: &BTreeMap<String, u16>,
+) -> Result<bool> {
+    let manifest_path = InitialPhmmManifest::manifest_path(output_dir, track);
+    if !manifest_path.exists() {
+        return Ok(false);
+    }
+    let manifest = InitialPhmmManifest::read_from_path(&manifest_path)?;
+    if manifest.alphabet_size == target_alphabet_size {
+        return Ok(false);
+    }
+    if manifest.alphabet_size != LEGACY_PHMM_BASE_ORDER.len() {
+        return Err(PreAdPrepError::Validation(format!(
+            "initialization track {} has alphabet_size {}, but only {}-column legacy A,T,C,G normalization to graph alphabet size {} is supported",
+            track.as_manifest_str(),
+            manifest.alphabet_size,
+            LEGACY_PHMM_BASE_ORDER.len(),
+            target_alphabet_size
+        )));
+    }
+
+    let (match_rows, match_cols, match_emission) =
+        read_npy_2d_f64(output_dir.join(&manifest.match_emission.path))?;
+    let (insert_rows, insert_cols, insert_emission) =
+        read_npy_2d_f64(output_dir.join(&manifest.insert_emission.path))?;
+    let (transition_rows, transition_cols, transition_logits) =
+        read_npy_2d_f64(output_dir.join(&manifest.transition_logits.path))?;
+
+    if match_rows != manifest.global_state_count || match_cols != manifest.alphabet_size {
+        return Err(PreAdPrepError::Validation(format!(
+            "initialization track {} match_emission array shape [{}, {}] does not match manifest [{}, {}]",
+            track.as_manifest_str(),
+            match_rows,
+            match_cols,
+            manifest.global_state_count,
+            manifest.alphabet_size
+        )));
+    }
+    if insert_rows != manifest.global_state_count + 1 || insert_cols != manifest.alphabet_size {
+        return Err(PreAdPrepError::Validation(format!(
+            "initialization track {} insert_emission array shape [{}, {}] does not match manifest [{}, {}]",
+            track.as_manifest_str(),
+            insert_rows,
+            insert_cols,
+            manifest.global_state_count + 1,
+            manifest.alphabet_size
+        )));
+    }
+    if transition_rows != manifest.global_state_count + 1
+        || transition_cols != TRANSITION_ORDER.len()
+    {
+        return Err(PreAdPrepError::Validation(format!(
+            "initialization track {} transition_logits array shape [{}, {}] does not match manifest [{}, {}]",
+            track.as_manifest_str(),
+            transition_rows,
+            transition_cols,
+            manifest.global_state_count + 1,
+            TRANSITION_ORDER.len()
+        )));
+    }
+
+    let normalized_match = expand_legacy_emission_table(
+        &match_emission,
+        match_rows,
+        match_cols,
+        target_alphabet_size,
+        symbol_encoding,
+    )?;
+    let normalized_insert = expand_legacy_emission_table(
+        &insert_emission,
+        insert_rows,
+        insert_cols,
+        target_alphabet_size,
+        symbol_encoding,
+    )?;
+    let mut metadata = manifest.metadata;
+    metadata.push((
+        "source_alphabet_order".into(),
+        LEGACY_PHMM_BASE_ORDER.join(","),
+    ));
+    metadata.push(("normalized_to_graph_encoding".into(), "true".into()));
+    metadata.push(("graph_alphabet".into(), graph_alphabet.join(",")));
+    metadata.push((
+        "unsupported_symbol_fill".into(),
+        LEGACY_SYMBOL_FLOOR_DESCRIPTION.into(),
+    ));
+    let normalized_manifest = write_initialization_track(
+        output_dir,
+        track,
+        manifest.global_state_count,
+        target_alphabet_size,
+        &normalized_match,
+        &normalized_insert,
+        &transition_logits,
+        metadata,
+    )?;
+    fs::write(
+        output_dir
+            .join("diagnostics")
+            .join(format!("init_{}.json", track.as_manifest_str())),
+        serde_json::to_vec_pretty(&normalized_manifest)?,
+    )?;
+    Ok(true)
+}
+
+fn expand_legacy_emission_table(
+    source: &[f64],
+    rows: usize,
+    cols: usize,
+    target_alphabet_size: usize,
+    symbol_encoding: &BTreeMap<String, u16>,
+) -> Result<Vec<f64>> {
+    if cols == target_alphabet_size {
+        return Ok(source.to_vec());
+    }
+    if cols != LEGACY_PHMM_BASE_ORDER.len() {
+        return Err(PreAdPrepError::Validation(format!(
+            "cannot normalize legacy emission table with {} columns into graph alphabet size {}",
+            cols, target_alphabet_size
+        )));
+    }
+    let mut expanded = vec![LEGACY_SYMBOL_FLOOR_LOG_PROB; rows * target_alphabet_size];
+    for (source_col, symbol) in LEGACY_PHMM_BASE_ORDER.iter().enumerate() {
+        let target_col = usize::from(*symbol_encoding.get(*symbol).ok_or_else(|| {
+            PreAdPrepError::Validation(format!(
+                "graph symbol encoding is missing canonical legacy symbol {}",
+                symbol
+            ))
+        })?);
+        if target_col >= target_alphabet_size {
+            return Err(PreAdPrepError::Validation(format!(
+                "graph symbol {} maps to column {}, outside target alphabet size {}",
+                symbol, target_col, target_alphabet_size
+            )));
+        }
+        for row in 0..rows {
+            expanded[row * target_alphabet_size + target_col] = source[row * cols + source_col];
+        }
+    }
+    Ok(expanded)
+}
+
+fn initialization_alphabet_size(core: &GraphCoreJson, graph: &TensorGraph) -> Option<usize> {
+    let from_encoding = core
+        .symbol_encoding
+        .values()
+        .copied()
+        .max()
+        .map(|value| value as usize + 1);
+    let from_graph = graph
+        .node_symbol
+        .iter()
+        .copied()
+        .max()
+        .map(|value| value as usize + 1);
+    from_encoding.or(from_graph)
+}
+
+fn to_usize_vec(values: Vec<u64>) -> Result<Vec<usize>> {
+    values
+        .into_iter()
+        .map(|value| {
+            usize::try_from(value).map_err(|_| {
+                PreAdPrepError::Validation(format!(
+                    "NumPy value {} cannot fit into usize on this platform",
+                    value
+                ))
+            })
+        })
+        .collect()
+}
+
+fn write_reference_insert_ranges(
+    output_dir: &Path,
+    insert_ranges: &[(usize, usize)],
+) -> Result<()> {
+    if insert_ranges.is_empty() {
+        return Ok(());
+    }
+    let reference_dir = output_dir.join("reference");
+    let left = insert_ranges
+        .iter()
+        .map(|(start, _)| *start as i64)
+        .collect::<Vec<_>>();
+    let right = insert_ranges
+        .iter()
+        .map(|(_, end)| *end as i64)
+        .collect::<Vec<_>>();
+    write_npy_1d(reference_dir.join("insert_region_left.npy"), &left)?;
+    write_npy_1d(reference_dir.join("insert_region_right.npy"), &right)?;
+    Ok(())
+}
+
+fn bootstrap_transition_logits(
+    global_state_count: usize,
+    insert_ranges: &[(usize, usize)],
+) -> Vec<f64> {
+    let me = (0.5_f64).ln();
+    let md = -2.0_f64;
+    let mi = -5.0_f64;
+    let ii = (0.5_f64).ln();
+    let dm = (0.5_f64).ln();
+    let pi_mid = [1.0_f64, 1.0_f64, 1.0_f64];
+
+    let n_positions = global_state_count + 1;
+    let mm_base = (1.0 - md.exp() - mi.exp()).ln();
+    let im_base = (1.0 - ii.exp()).ln();
+    let dd_base = (1.0 - dm.exp()).ln();
+    let high_mi = (mi.exp() + 0.1).ln();
+
+    let mut _mi = vec![mi; n_positions];
+    let mut _md = vec![md; n_positions];
+    let mut _mm = vec![mm_base; n_positions];
+    for &(left, right) in insert_ranges {
+        let start = left.min(n_positions);
+        let stop = right.min(n_positions);
+        for value in &mut _mi[start..stop] {
+            *value = high_mi;
+        }
+    }
+
+    let pi_sum = pi_mid.iter().sum::<f64>();
+    _mi[0] = (pi_mid[1] / pi_sum).ln();
+    _md[0] = (pi_mid[2] / pi_sum).ln();
+    _mm[0] = (pi_mid[0] / pi_sum).ln();
+    _mm[n_positions - 1] = me;
+    _mi[n_positions - 1] = (1.0 - me.exp()).ln();
+
+    let _ii = vec![ii; n_positions];
+    let _im = vec![im_base; n_positions];
+    let _id = vec![f64::NEG_INFINITY; n_positions];
+    let mut _dm = vec![dm; n_positions];
+    let mut _dd = vec![dd_base; n_positions];
+    let _di = vec![f64::NEG_INFINITY; n_positions];
+    _dm[0] = f64::NEG_INFINITY;
+    _dd[0] = f64::NEG_INFINITY;
+    _dd[n_positions - 1] = f64::NEG_INFINITY;
+    _dm[n_positions - 1] = 0.0;
+
+    let columns = [&_mm, &_md, &_mi, &_dm, &_dd, &_di, &_im, &_id, &_ii];
+    let mut values = Vec::with_capacity(n_positions * TRANSITION_ORDER.len());
+    for row in 0..n_positions {
+        for column in &columns {
+            values.push(column[row]);
+        }
+    }
+    values
+}
+
+fn reference_msa_metadata(
+    result: &ReferenceMsaResult,
+    alphabet_size: usize,
+    insert_ranges: &[(usize, usize)],
+) -> Vec<(String, String)> {
+    vec![
+        ("source".into(), "reference_path_msa".into()),
+        ("alphabet_size".into(), alphabet_size.to_string()),
+        (
+            "path_count".into(),
+            result.path_alignments.len().to_string(),
+        ),
+        ("total_weight".into(), result.total_weight.to_string()),
+        ("insert_range_count".into(), insert_ranges.len().to_string()),
+        (
+            "minimum_state_count".into(),
+            result
+                .state_bands
+                .minimum
+                .included_column_indices
+                .len()
+                .to_string(),
+        ),
+        (
+            "canonical_state_count".into(),
+            result
+                .state_bands
+                .canonical
+                .included_column_indices
+                .len()
+                .to_string(),
+        ),
+        (
+            "maximum_state_count".into(),
+            result
+                .state_bands
+                .maximum
+                .included_column_indices
+                .len()
+                .to_string(),
+        ),
+    ]
 }
 
 fn add_generated_manifest_arrays(

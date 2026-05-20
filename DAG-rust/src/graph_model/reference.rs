@@ -39,7 +39,6 @@ pub struct SubgraphProjection {
 pub enum ExportProfile {
     GraphOnly,
     GraphWithReference,
-    AdPhmmTraining,
     CoordinateWindow,
     Diagnostics,
 }

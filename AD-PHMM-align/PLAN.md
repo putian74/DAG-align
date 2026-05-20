@@ -48,6 +48,8 @@ Initial public interfaces should support:
 Initial public interfaces should support:
 
 - `TrainingConfig` with optimizer, loss weights, subgraph sampling, device, reproducibility, and profiling options;
+- independent sub-configs for each escape mechanism so multi-start, warm restarts, annealing, anchor release, branch-and-perturb, and support expansion can be turned on/off separately;
+- independent regularization switches so transition anchoring, emission anchoring, emission smoothness, logit L2, and active-state penalties can be ablated separately from their weights;
 - `TrainingStepInput` as the boundary between data preparation and PHMM training;
 - `TrainingStepResult` with total loss, component losses, metrics, step index, batch ID, and profiling results;
 - `FitResult` for high-level training summaries and checkpoint metadata;
@@ -59,15 +61,30 @@ CPU time and memory profiling should be available before heavy optimization begi
 
 ## Baseline execution strategy
 
-The first end-to-end training path should be built in the following order:
+The first end-to-end baseline should be built in the following order:
 
-1. load and validate `tensor_graph.v1` plus `legacy_current` initialization artifacts;
-2. build a CPU reference implementation for forward, backward, posterior summaries, soft-Viterbi, and hard Viterbi on tiny DAGs;
-3. lift the same packed-window recurrences to PyTorch tensors without changing the graph/coordinate contracts;
-4. add CUDA-oriented wavefront scheduling and kernel-friendly tensor layouts only after the reference path is numerically stable;
-5. use `reference_msa` initialization only after the baseline path is already training correctly.
+1. complete the preprocessing side of the inference path from sequence dataset / legacy graph inputs through graph building, merging, main-path/reference computation, and `tensor_graph.v1` export plus `legacy_current` initialization artifacts;
+2. load and validate those artifacts in AD-PHMM-align;
+3. complete a CPU reference implementation for forward, backward, posterior summaries, hard Viterbi, soft Viterbi, entropy, scaled-SP, and initialization-aware regularization on tiny DAGs;
+4. make the trainer execute that full CPU inference/objective path correctly and reproducibly;
+5. only then lift the same packed-window recurrences to PyTorch tensors without changing the graph/coordinate contracts;
+6. add CUDA-oriented wavefront scheduling and kernel-friendly tensor layouts only after the reference path is numerically stable;
+7. use `reference_msa` initialization only after the baseline path is already correct end to end.
 
-This keeps correctness, range semantics, and branching/merging behavior fixed before heavy GPU optimization begins.
+This keeps correctness, range semantics, branching/merging behavior, and end-to-end objective semantics fixed before heavy GPU optimization begins.
+
+## Primary near-term milestone
+
+Before backend acceleration or broader training refinement, the repository should first expose **one complete and correct inference execution path** covering:
+
+1. sequence dataset / legacy graph input;
+2. graph building, merging, and main-path/reference computation on the preprocessing side;
+3. PHMM initialization through `legacy_current`;
+4. CPU forward/backward, posterior, hard/soft Viterbi;
+5. entropy, scaled-SP, and regularization computation;
+6. trainer-side orchestration and reporting.
+
+PyTorch and CUDA work should be treated as follow-on phases once this baseline is validated.
 
 ## Algorithm priorities
 
@@ -144,14 +161,14 @@ Planned decode flow:
 3. project local packed states back to global PHMM state IDs;
 4. merge sequence-wise path assignments into alignment columns keyed by global PHMM state positions plus insertion slots;
 5. emit both:
-   - a compact internal alignment-column representation for metrics/losses;
+   - a `ValSparseMSA`-backed hard alignment artifact for metrics/losses and downstream analysis;
    - a materialized alignment artifact for evaluation/export.
 
 This means `eval/decode.py` should eventually distinguish:
 
 - **state traceback**: packed/local/global PHMM state path;
-- **alignment assembly**: column-centric representation suitable for entropy and SP scoring;
-- **format export**: FASTA/zip-like output for reporting and comparison with legacy DAG-align.
+- **alignment assembly**: column-centric representation suitable for entropy and SP scoring, with `ValSparseMSA` as the primary MSA form;
+- **format export**: FASTA/debug export for reporting and comparison with legacy DAG-align.
 
 ### 2. Entropy and sum-of-pairs scoring
 
@@ -317,6 +334,8 @@ This makes NLL the primary optimization driver early on and prevents the alignme
 
 The design should not rely on SGD noise alone to escape poor local minima. The first optimization stack should include explicit exploration and recovery mechanisms.
 
+Implementation rule: every mechanism in this section must have its own config gate and parameter block. The trainer should be able to enable/disable each mechanism independently for ablation and should record the active mechanism set in checkpoints and fit summaries.
+
 #### A. Multi-start from a common structured initializer
 
 For each graph/training run, launch a small ensemble of runs from the same chosen initialization track (`legacy_current` first), but with controlled structured perturbations:
@@ -426,6 +445,13 @@ That gives the project multiple escape routes without making the first trainer o
 ### 5. Regularization design
 
 Regularization should be tied to the initialization pathways and profile structure rather than treated as generic weight decay.
+
+Implementation rule: every regularization term in this section must have both:
+
+- a scalar weight;
+- an independent boolean/config switch for ablation studies.
+
+Setting a regularizer weight to zero should disable its contribution numerically, but the explicit switch is still required so ablation runs can prove that the code path itself is inactive.
 
 The first exact regularization set should be:
 
@@ -671,11 +697,12 @@ If the recurrence code grows, it should split further into:
 5. Implement CPU reference forward/backward on tiny DAGs, including branch fan-out and merge log-sum-exp.
 6. Implement posterior summaries and likelihood losses on top of the CPU reference path.
 7. Implement hard and soft Viterbi on the same packed recurrence layout, including sparse backpointer storage for reachable packed cells.
-8. Lift the reference recurrences to PyTorch tensors with dependency-safe wavefront scheduling.
-9. Profile the PyTorch backend, then optimize the CUDA-oriented path for packed windows, segmented merge reductions, and overlap transfer kernels.
-10. Add losses, metrics, subgraph SGD, checkpointing, and profiling reports on top of the stabilized PyTorch backend.
-11. Compare `reference_msa` initialization against the `legacy_current` baseline once the end-to-end training path is stable.
-12. Iterate with `Pre-AD-prep` whenever training needs additional exported arrays, diagnostics, or layout changes.
+8. Complete the full CPU inference/objective execution path in trainer orchestration, including decoded metrics and baseline reporting.
+9. Lift the reference recurrences to PyTorch tensors with dependency-safe wavefront scheduling.
+10. Profile the PyTorch backend, then optimize the CUDA-oriented path for packed windows, segmented merge reductions, and overlap transfer kernels.
+11. Add subgraph SGD, checkpointing, and profiling reports on top of the stabilized PyTorch backend.
+12. Compare `reference_msa` initialization against the `legacy_current` baseline once the end-to-end training path is stable.
+13. Iterate with `Pre-AD-prep` whenever training needs additional exported arrays, diagnostics, or layout changes.
 
 ## Detailed execution plan
 
@@ -726,6 +753,12 @@ Acceptance targets:
 - diamond-graph likelihood matches hand-computed small examples;
 - forward and backward agree on total log-likelihood within numerical tolerance.
 
+Status update:
+
+- A first dense NumPy CPU baseline is now implemented for tiny DAGs.
+- The current reference path favors clarity and inspectability over packed-kernel efficiency and uses the exported node windows plus normalized incoming-edge merge weights.
+- This CPU path is the validation target for later PyTorch and CUDA implementations.
+
 ### Phase D: CPU hard/soft Viterbi
 
 Implement:
@@ -740,6 +773,11 @@ Acceptance targets:
 - decoded states always lie inside effective ranges;
 - low-temperature soft-Viterbi approaches hard-Viterbi on tiny fixtures;
 - branch/merge backpointers reconstruct valid DAG-respecting paths.
+
+Status update:
+
+- A first CPU hard-Viterbi decoder with backpointers and a soft-Viterbi score baseline is now implemented on the same reference state layout.
+- The next work here should focus on alignment assembly and backend parity, not on creating a second independent CPU recurrence family.
 
 ### Phase E: PyTorch wavefront backend
 
@@ -756,12 +794,17 @@ Acceptance targets:
 - autograd flows through forward likelihood and soft-Viterbi objectives;
 - profiling captures per-step wall/CPU/device memory metrics.
 
+Implementation rule:
+
+- do not advance this phase ahead of the full CPU inference/objective baseline;
+- PyTorch is a backend lift of a validated path, not the place where inference semantics are first defined.
+
 ### Phase F: alignment assembly and metric stack
 
 Implement:
 
 - hard-Viterbi traceback to global PHMM state paths;
-- alignment-column assembly from decoded paths;
+- alignment-column assembly from decoded paths into `ValSparseMSA`;
 - hard decoded entropy and SP metrics compatible with legacy reporting;
 - detached monitoring metrics separated from differentiable training losses.
 
@@ -770,6 +813,32 @@ Acceptance targets:
 - decoded alignments can be materialized from Viterbi outputs on tiny fixtures;
 - hard SP/entropy agree with hand-computed small examples;
 - decoded alignments preserve global PHMM state identity through subgraph projection.
+
+Priority note:
+
+- this phase is part of the required first complete inference baseline, not an optional post-optimization extra.
+
+Legacy baseline to preserve conceptually:
+
+- current DAG-align does **not** score SP/entropy from a naive dense MSA first;
+- it decodes Viterbi states into a compressed alignment-column representation (`zipalign`) plus insertion-length metadata and column index metadata;
+- SP and entropy are then computed column-wise from that compressed representation using counts, not sequence-pair enumeration.
+
+Implementation guidance:
+
+1. keep the legacy idea of a **sparse column-count representation** as the primary hard-decoded alignment artifact;
+2. avoid making dense alignment matrices the canonical internal form;
+3. separate:
+   - sequence/state traceback,
+   - sparse column assembly in `ValSparseMSA`,
+   - optional dense export for FASTA/debug only.
+
+Planned improvement over legacy DAG-align:
+
+- replace Python object-array `zipalign`/`ListsColMSA` with `ValSparseMSA` plus typed column metadata keyed by global PHMM match state plus insertion slot;
+- use exported source/provenance arrays directly instead of legacy `seqiddb` lookups and ad hoc source intersections;
+- compute hard SP/entropy from column counts directly, with optional sparse per-sequence detail only when export/debug requires it;
+- make the same column/count abstraction reusable for both hard decoded metrics and soft posterior-based surrogates.
 
 ### Phase G: loss and regularization stack
 
@@ -785,6 +854,11 @@ Acceptance targets:
 - every component can be enabled/disabled independently;
 - hard metrics and soft loss terms are logged separately;
 - loss decomposition is stable enough for step-by-step debugging.
+
+Status update:
+
+- The CPU baseline now includes initial likelihood, posterior-entropy, soft pairwise, and initialization-aware regularization components plus trainer-side on/off gating for ablation.
+- Loss calibration and decoded hard-metric alignment remain follow-on work before the backend lift is considered complete.
 
 ### Phase H: state-position sampling
 

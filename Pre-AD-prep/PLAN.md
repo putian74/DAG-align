@@ -16,6 +16,18 @@ It consumes current DAG-align graph artifacts or future DAG-rust graph exports, 
 
 AD-PHMM-align should not parse legacy DAG-align pickle/object arrays directly in mature workflows. It should consume Pre-AD-prep outputs.
 
+## Primary near-term milestone
+
+The first priority across `DAG-rust/`, `Pre-AD-prep/`, and `AD-PHMM-align/` is one **complete and correct inference execution path**:
+
+1. sequence dataset / legacy graph input;
+2. graph building, merging, and main-path/reference computation;
+3. typed tensor-graph export and `legacy_current` initialization export;
+4. AD-side forward/backward, posterior, hard/soft Viterbi;
+5. entropy, scaled-SP, and regularization evaluation.
+
+That means Pre-AD-prep should prioritize deterministic, validated artifact production that is sufficient to run the full CPU inference baseline before backend acceleration or broader training refinements become the focus.
+
 ## Output artifact contract
 
 Pre-AD-prep should produce a stable directory format:
@@ -151,6 +163,11 @@ The first legacy preprocessing baseline is now end to end:
 - `tensor_graph.v1` now reaches `TrainingReady` for legacy fixtures when a reference path can be imported or derived.
 
 The Rust adapter and AD-PHMM-align manifest schema must stay synchronized for source format, alphabet, symbol encoding, array identity, half-open state interval semantics, diagnostics, profiling metadata, coordinate/window array names, and initialization manifest layout.
+
+Near-term execution priority:
+
+- ensure the exported typed artifact path is sufficient for one end-to-end inference baseline first;
+- treat sampling, comparative initialization, and backend-oriented extras as follow-on phases once that baseline is correct.
 
 ## Detailed module implementation plans
 

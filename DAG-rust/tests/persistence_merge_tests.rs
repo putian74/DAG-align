@@ -24,7 +24,46 @@ fn build_graph(sequences: &[&str], provenance: ProvenanceStorageStrategy) -> Fto
             .unwrap();
     }
 
-    builder.into_graph()
+    builder.finalize_graph().unwrap()
+}
+
+fn key(raw: u16) -> FragmentKey {
+    FragmentKey::symbols(vec![SymbolId::new(raw)])
+}
+
+fn build_branching_count_only_graph() -> FtoDag {
+    let mut graph = FtoDag::with_provenance_storage(1, ProvenanceStorageStrategy::CountOnly);
+    let start = graph.add_node(key(0), NodeKind::Start).unwrap();
+    let branch_a = graph.add_node(key(1), NodeKind::Internal).unwrap();
+    let branch_b = graph.add_node(key(2), NodeKind::Internal).unwrap();
+    let end = graph.add_node(key(3), NodeKind::End).unwrap();
+
+    graph
+        .add_or_increment_edge(start, branch_a, Weight::new(1))
+        .unwrap();
+    graph
+        .add_or_increment_edge(start, branch_b, Weight::new(1))
+        .unwrap();
+    graph
+        .add_or_increment_edge(branch_a, end, Weight::new(1))
+        .unwrap();
+    graph
+        .add_or_increment_edge(branch_b, end, Weight::new(1))
+        .unwrap();
+
+    for (position, node) in [start, branch_a, branch_b, end].into_iter().enumerate() {
+        graph
+            .add_provenance_record(
+                node,
+                ProvenanceRecord {
+                    sequence_id: SequenceId::new(0),
+                    position: ProvenancePosition::new(position as u64),
+                },
+            )
+            .unwrap();
+    }
+
+    graph
 }
 
 fn temp_graph_path(label: &str) -> PathBuf {
@@ -163,4 +202,59 @@ fn merge_graphs_replays_trace_paths_into_expected_graph() {
         );
     }
     assert!(merged.validate().is_valid());
+}
+
+#[test]
+fn merge_trace_path_graphs_as_count_only_matches_direct_count_only_build() {
+    let left_sequences = ["ACGTA", "ACGTT"];
+    let right_sequences = ["ACCTA", "ACCTT"];
+    let left = build_graph(&left_sequences, ProvenanceStorageStrategy::TracePaths);
+    let right = build_graph(&right_sequences, ProvenanceStorageStrategy::TracePaths);
+    let expected = build_graph(
+        &["ACGTA", "ACGTT", "ACCTA", "ACCTT"],
+        ProvenanceStorageStrategy::CountOnly,
+    );
+
+    let merged =
+        merge_trace_path_graphs_as_count_only(left, right, MergeConfig::default()).unwrap();
+
+    assert_graph_structure_eq(&merged, &expected);
+    assert_eq!(
+        merged.provenance_storage_strategy(),
+        ProvenanceStorageStrategy::CountOnly
+    );
+    assert!(merged.validate().is_valid());
+}
+
+#[test]
+fn merge_graphs_count_only_is_stubbed_for_now() {
+    let left = build_graph(&["AACCA"], ProvenanceStorageStrategy::CountOnly);
+    let right = build_graph(&["GACCG"], ProvenanceStorageStrategy::CountOnly);
+
+    let error = merge_graphs(left, right, MergeConfig::default()).unwrap_err();
+    assert!(
+        matches!(error, DagError::UnsupportedOperation(message) if message.contains("CountOnly graph merge is a stub"))
+    );
+}
+
+#[test]
+fn secondary_merge_graph_count_only_is_noop_stub() {
+    let graph = build_branching_count_only_graph();
+    let expected_node_count = graph.node_count();
+    let expected_edge_count = graph.edge_count();
+    let expected_total_provenance = total_provenance_records(&graph);
+    let merged = secondary_merge_graph(graph, SecondaryMergeConfig::default()).unwrap();
+
+    assert_eq!(merged.node_count(), expected_node_count);
+    assert_eq!(merged.edge_count(), expected_edge_count);
+    assert_eq!(total_provenance_records(&merged), expected_total_provenance);
+    assert!(merged.validate().is_valid());
+}
+
+fn total_provenance_records(graph: &FtoDag) -> usize {
+    graph
+        .nodes()
+        .iter()
+        .map(|node| node.weight.raw() as usize)
+        .sum()
 }

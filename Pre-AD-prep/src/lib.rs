@@ -10,6 +10,7 @@ pub mod export;
 pub mod graph;
 pub mod init;
 pub mod legacy;
+pub mod reference_msa;
 pub mod source;
 pub mod validate;
 
@@ -22,7 +23,7 @@ pub use diagnostics::{ConversionDiagnostics, Diagnostic, DiagnosticReport, Profi
 pub use error::{PreAdPrepError, Result};
 pub use export::{
     ArraySpec, DataType, SourceFormat, StateIntervalSemantics, TensorGraphArtifact,
-    TensorGraphManifest, write_npy_1d, write_npy_2d,
+    TensorGraphManifest, read_npy_1d_u64, read_npy_2d_f64, write_npy_1d, write_npy_2d,
 };
 pub use graph::{AdjacencyCsr, NodeFlags, TensorGraph, TopologicalLevels};
 pub use init::{
@@ -31,6 +32,11 @@ pub use init::{
 };
 pub use legacy::{
     LegacyAdapter, LegacyConversionOptions, LegacyDagAlignAdapter, LegacyDagAlignInput,
+};
+pub use reference_msa::{
+    PathAlignmentOp, PathToReferenceAlignment, ReferenceMsaColumn, ReferenceMsaColumnKind,
+    ReferenceMsaConfig, ReferenceMsaResult, ReferenceMsaScoring, ReferenceStateBands,
+    StateSelection, WeightedSequencePath, build_reference_msa, select_max_weight_reference_path,
 };
 pub use source::{
     NodeSourceRanges, SequenceTable, SourceDecodeStatus, SourceRecordTable, SourceTables,

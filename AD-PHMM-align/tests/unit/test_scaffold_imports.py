@@ -62,20 +62,48 @@ def test_edge_overlap_contract_checks_window_bounds() -> None:
 
 def test_training_contract_imports() -> None:
     from ad_phmm_align.train import (
+        EscapeConfig,
+        HardInferenceSummary,
+        InferenceSummary,
         LossWeights,
         PreparedTrainingBatch,
         ProfilingConfig,
         ProfilingResult,
+        RegularizationConfig,
+        SoftInferenceSummary,
         TrainingStepInput,
         TrainingStepResult,
     )
 
     assert LossWeights().negative_log_likelihood == 1.0
+    assert EscapeConfig().multi_start.enabled is False
     assert ProfilingConfig().enabled is True
     assert ProfilingResult(wall_seconds=0.0).wall_seconds == 0.0
+    assert RegularizationConfig().transition_anchor is True
+    assert HardInferenceSummary
+    assert InferenceSummary
     assert PreparedTrainingBatch
+    assert SoftInferenceSummary
     assert TrainingStepInput
     assert TrainingStepResult
+
+
+def test_soft_and_hard_path_facades_import() -> None:
+    from ad_phmm_align.losses import soft_alignment_entropy, soft_pairwise_score
+    from ad_phmm_align.phmm.hard_path import prepare_viterbi_input, viterbi_decode
+    from ad_phmm_align.phmm.soft_path import (
+        forward_log_likelihood,
+        posterior_occupancy,
+        soft_viterbi_score,
+    )
+
+    assert soft_alignment_entropy
+    assert soft_pairwise_score
+    assert prepare_viterbi_input
+    assert viterbi_decode
+    assert forward_log_likelihood
+    assert posterior_occupancy
+    assert soft_viterbi_score
 
 
 def test_artifact_loader_and_initialization_loader(tmp_path) -> None:
@@ -90,6 +118,8 @@ def test_artifact_loader_and_initialization_loader(tmp_path) -> None:
     root = Path(tmp_path) / "tensor_graph.v1"
     (root / "graph").mkdir(parents=True)
     (root / "coordinates").mkdir(parents=True)
+    (root / "source").mkdir(parents=True)
+    (root / "reference").mkdir(parents=True)
     (root / "initialization" / "legacy_current").mkdir(parents=True)
 
     np.save(root / "graph" / "node_symbol.npy", np.array([0, 1], dtype=np.uint16))
@@ -116,6 +146,33 @@ def test_artifact_loader_and_initialization_loader(tmp_path) -> None:
     np.save(root / "coordinates" / "edge_state_src_offset.npy", np.array([1], dtype=np.uint64))
     np.save(root / "coordinates" / "edge_state_dst_offset.npy", np.array([0], dtype=np.uint64))
     np.save(root / "coordinates" / "edge_state_overlap_len.npy", np.array([1], dtype=np.uint64))
+    np.save(root / "source" / "sequence_id.npy", np.array([0, 1], dtype=np.uint64))
+    np.save(
+        root / "source" / "sequence_name_offset.npy",
+        np.array([0, 4, 8], dtype=np.uint64),
+    )
+    np.save(
+        root / "source" / "sequence_name_bytes.npy",
+        np.frombuffer(b"seqAseqB", dtype=np.uint8),
+    )
+    np.save(
+        root / "source" / "node_source_offset.npy",
+        np.array([0, 1], dtype=np.uint64),
+    )
+    np.save(root / "source" / "node_source_len.npy", np.array([1, 1], dtype=np.uint64))
+    np.save(
+        root / "source" / "source_sequence_id.npy",
+        np.array([0, 1], dtype=np.uint64),
+    )
+    np.save(
+        root / "source" / "source_position.npy",
+        np.array([10, 11], dtype=np.uint64),
+    )
+    np.save(root / "reference" / "ref_node_ids.npy", np.array([0, 1], dtype=np.int64))
+    np.save(
+        root / "reference" / "ref_sequence_symbols.npy",
+        np.array([0, 1], dtype=np.uint16),
+    )
 
     manifest = {
         "format_name": "ad_phmm_tensor_graph",
@@ -124,7 +181,7 @@ def test_artifact_loader_and_initialization_loader(tmp_path) -> None:
         "source_graph_dir": str(root / "legacy"),
         "node_count": 2,
         "edge_count": 1,
-        "sequence_count": 0,
+        "sequence_count": 2,
         "global_state_count": 3,
         "alphabet": ["A", "T", "C", "G"],
         "symbol_encoding": [["A", 0], ["T", 1], ["C", 2], ["G", 3]],
@@ -146,6 +203,15 @@ def test_artifact_loader_and_initialization_loader(tmp_path) -> None:
             {"name": "edge_state_src_offset", "path": "coordinates/edge_state_src_offset.npy", "dtype": "u64", "shape": [1], "required": True},
             {"name": "edge_state_dst_offset", "path": "coordinates/edge_state_dst_offset.npy", "dtype": "u64", "shape": [1], "required": True},
             {"name": "edge_state_overlap_len", "path": "coordinates/edge_state_overlap_len.npy", "dtype": "u64", "shape": [1], "required": True},
+            {"name": "sequence_id", "path": "source/sequence_id.npy", "dtype": "u64", "shape": [2], "required": True},
+            {"name": "sequence_name_offset", "path": "source/sequence_name_offset.npy", "dtype": "u64", "shape": [3], "required": True},
+            {"name": "sequence_name_bytes", "path": "source/sequence_name_bytes.npy", "dtype": "utf8_bytes", "shape": [8], "required": True},
+            {"name": "node_source_offset", "path": "source/node_source_offset.npy", "dtype": "u64", "shape": [2], "required": True},
+            {"name": "node_source_len", "path": "source/node_source_len.npy", "dtype": "u64", "shape": [2], "required": True},
+            {"name": "source_sequence_id", "path": "source/source_sequence_id.npy", "dtype": "u64", "shape": [2], "required": True},
+            {"name": "source_position", "path": "source/source_position.npy", "dtype": "u64", "shape": [2], "required": True},
+            {"name": "ref_node_ids", "path": "reference/ref_node_ids.npy", "dtype": "i64", "shape": [2], "required": True},
+            {"name": "ref_sequence_symbols", "path": "reference/ref_sequence_symbols.npy", "dtype": "u16", "shape": [2], "required": True},
         ],
     }
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -199,6 +265,10 @@ def test_artifact_loader_and_initialization_loader(tmp_path) -> None:
     assert artifact.graph.edge_count == 1
     assert artifact.graph.state_windows is not None
     assert artifact.graph.edge_overlaps is not None
+    assert artifact.graph.extra is not None
+    assert artifact.graph.extra["sequence_names"] == ["seqA", "seqB"]
+    assert artifact.graph.extra["sequence_count"] == 2
+    assert artifact.graph.extra["source_sequence_id"].tolist() == [0, 1]
 
     initial = InitialPhmmArtifactLoader(root).load()
     assert initial.manifest.track.value == "legacy_current"
@@ -206,6 +276,33 @@ def test_artifact_loader_and_initialization_loader(tmp_path) -> None:
 
     loaded = load_initial_parameters(root)
     assert loaded.metadata["transition_order"][0] == "_mm"
+
+    from ad_phmm_align.train import EscapeConfig, MultiStartConfig, Trainer, TrainingConfig
+
+    fit_result = Trainer(
+        TrainingConfig(
+            graph_path=root,
+            initialization_path=root,
+            output_dir=root / "out",
+            max_steps=1,
+            escape=EscapeConfig(
+                multi_start=MultiStartConfig(
+                    enabled=True,
+                    replicas=2,
+                    transition_logit_std=0.0,
+                    emission_logit_std=0.0,
+                    temperature_std=0.0,
+                )
+            ),
+        )
+    ).fit()
+    assert fit_result.steps_completed == 2
+    assert fit_result.final_loss is not None
+    assert fit_result.metrics["optimization_ready"] is False
+    assert fit_result.metrics["cpu_reference_ready"] is True
+    assert fit_result.metrics["hard_decode_status"] == "viterbi_only"
+    assert fit_result.metadata["initialization_track"] == "legacy_current"
+    assert fit_result.metadata["replica_ids"] == ("replica-0", "replica-1")
 
 
 def test_transition_logit_view_and_effective_support() -> None:

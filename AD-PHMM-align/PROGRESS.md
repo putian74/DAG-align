@@ -48,21 +48,31 @@ It should not own legacy DAG-align pickle/object conversion or CPU-heavy preproc
     - `node_coordinate_left/right` carry raw propagated legal spans.
     - `node_window_left/right` carry the static padded DP windows that must match packed-window arrays.
     - `TensorDag`, loaders, and public batch contracts now distinguish those two interval layers directly.
+- Implemented the first CPU dense-reference training core for tiny DAGs:
+  - Added NumPy forward/backward recurrences over the global PHMM state axis with DAG branch fan-out and merge reductions through normalized incoming-edge weights.
+  - Added posterior occupancy summaries from the CPU reference forward/backward path.
+  - Added hard Viterbi decoding with backpointer capture and a soft-Viterbi score baseline.
+  - Added CPU-reference likelihood, entropy, pairwise-score, and regularization helpers.
+  - Upgraded the trainer scaffold so a baseline step now computes real CPU-reference losses/metrics instead of only dry-run validation metadata.
+  - Added unit coverage for forward/backward likelihood parity, posterior shapes, Viterbi/soft-Viterbi behavior, and trainer execution on tiny synthetic artifacts.
+- Split soft and hard inference into explicit path modules and threaded both through trainer-side inference summaries.
+- Added a baseline sequence-batch subgraph sampler:
+  - materializes provenance-aware sampled `TensorDag` views;
+  - supports optional global-state range clipping through `StateMaskSpec`;
+  - lets trainer step execution run on sampled subgraphs instead of only full-graph batches.
 
 ## Active phase
 
-**Next:** implement the CPU reference forward/backward and hard/soft Viterbi recurrences on top of the now-typed loader, effective-support, and wavefront scaffolds.
+**Next:** complete and validate the full inference baseline end to end: preprocessing-produced graph/init artifacts -> sampled/full `TensorDag` batches -> CPU forward/backward/posterior -> hard/soft Viterbi -> hard/soft entropy and scaled-SP -> trainer reporting. Only after that baseline is correct should the same recurrences be lifted to the PyTorch wavefront backend.
 
 ## Pending phases
 
-1. Implement CPU reference forward/backward for branching/merging DAGs.
-2. Implement soft-Viterbi and hard Viterbi over the same packed-window layout.
-3. Lift the reference kernels to a PyTorch wavefront backend.
-4. Profile and optimize CUDA-oriented merge-reduction and overlap-transfer hotspots.
-5. Implement losses and metrics.
-6. Implement subgraph SGD with global state projections.
-7. Compare `reference_msa` initialization after baseline training is stable.
-8. Add DAG-rust/Pre-AD-prep migration tests and benchmarks.
+1. Finish the complete CPU inference/objective path, especially robust `ValSparseMSA`-based hard decode/metrics and exported sampling/projection integration from Pre-AD-prep.
+2. Lift the reference kernels to a PyTorch wavefront backend.
+3. Profile and optimize CUDA-oriented merge-reduction and overlap-transfer hotspots.
+4. Extend baseline sequence-batch sampling into full subgraph SGD with exported state projections.
+5. Compare `reference_msa` initialization after baseline training is stable.
+6. Add DAG-rust/Pre-AD-prep migration tests and benchmarks.
 
 ## Alternating iteration workflow
 

@@ -4,12 +4,14 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pre_ad_prep::{
-    ArraySpec, ArtifactValidationLevel, CoordinateMode, DataType, LegacyAdapter,
-    LegacyConversionOptions, LegacyDagAlignAdapter, LegacyDagAlignInput, PackedStateWindows,
-    PreAdPrepError, ReferencePath, SequenceTable, SourceFormat, SourceRecordTable, StateInterval,
-    StateIntervalSemantics, TensorGraph, TensorGraphArtifact, TensorGraphManifest, Validate,
-    WindowBuildConfig, build_edge_window_overlaps, build_global_coordinates, build_packed_windows,
-    validate_tensor_graph_artifact,
+    ArraySpec, ArtifactValidationLevel, CoordinateMode, DataType, InitializationTrack,
+    LegacyAdapter, LegacyConversionOptions, LegacyDagAlignAdapter, LegacyDagAlignInput,
+    PackedStateWindows, PathAlignmentOp, PreAdPrepError, ReferenceMsaColumnKind,
+    ReferenceMsaConfig, ReferencePath, SequenceTable, SourceFormat, SourceRecordTable,
+    StateInterval, StateIntervalSemantics, TensorGraph, TensorGraphArtifact, TensorGraphManifest,
+    Validate, WeightedSequencePath, WindowBuildConfig, build_edge_window_overlaps,
+    build_global_coordinates, build_packed_windows, build_reference_msa, read_npy_2d_f64,
+    select_max_weight_reference_path, validate_tensor_graph_artifact,
 };
 
 #[test]
@@ -179,6 +181,115 @@ fn packed_windows_and_edge_overlaps_follow_intersections() {
 }
 
 #[test]
+fn reference_msa_keeps_preprocessing_logic_in_pre_ad_prep() {
+    let paths = vec![
+        WeightedSequencePath {
+            representative_sequence_id: 0,
+            sequence_ids: vec![0, 1],
+            node_ids: vec![0, 1, 2, 3],
+            symbols: vec![0, 1, 2, 3],
+            weight: 2,
+        },
+        WeightedSequencePath {
+            representative_sequence_id: 2,
+            sequence_ids: vec![2],
+            node_ids: vec![10, 12, 13],
+            symbols: vec![0, 2, 3],
+            weight: 1,
+        },
+        WeightedSequencePath {
+            representative_sequence_id: 3,
+            sequence_ids: vec![3],
+            node_ids: vec![20, 21, 22, 23, 24],
+            symbols: vec![0, 1, 3, 2, 3],
+            weight: 1,
+        },
+    ];
+
+    let reference_index = select_max_weight_reference_path(&paths).unwrap();
+    assert_eq!(reference_index, 0);
+
+    let result =
+        build_reference_msa(&paths, reference_index, &ReferenceMsaConfig::default()).unwrap();
+    assert_eq!(
+        result.reference_path.node_ids,
+        vec![Some(0), Some(1), Some(2), Some(3)]
+    );
+    assert_eq!(result.total_weight, 4);
+    assert_eq!(result.longest_insertions, vec![0, 0, 1, 0, 0]);
+    assert_eq!(
+        result.columns[2].kind,
+        ReferenceMsaColumnKind::Insert {
+            anchor_index: 2,
+            slot: 0
+        }
+    );
+    assert_eq!(result.columns[2].primary_node_id, Some(22));
+    assert_eq!(result.columns[1].gap_fraction_basis_points, 2500);
+    assert_eq!(result.columns[2].gap_fraction_basis_points, 7500);
+    assert_eq!(
+        result.state_bands.minimum.included_column_indices,
+        vec![0, 1, 3, 4]
+    );
+    assert_eq!(
+        result.state_bands.canonical.included_column_indices,
+        vec![0, 1, 3, 4]
+    );
+    assert_eq!(
+        result.state_bands.maximum.included_column_indices,
+        vec![0, 1, 3, 4]
+    );
+
+    let insertion_alignment = result
+        .path_alignments
+        .iter()
+        .find(|alignment| alignment.sequence_ids == vec![3])
+        .unwrap();
+    assert!(insertion_alignment.operations.iter().any(|operation| {
+        matches!(
+            operation,
+            PathAlignmentOp::Insert {
+                anchor_index: 2,
+                slot: 0,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn reference_msa_reference_path_feeds_coordinate_builder() {
+    let graph = TensorGraph::new(
+        vec![0, 1, 2, 3],
+        vec![1.0, 1.0, 1.0, 1.0],
+        vec![0, 1, 2],
+        vec![1, 2, 3],
+        vec![1.0, 1.0, 1.0],
+        vec![0, 1, 2, 3],
+    );
+    let result = build_reference_msa(
+        &[WeightedSequencePath {
+            representative_sequence_id: 0,
+            sequence_ids: vec![0],
+            node_ids: vec![0, 1, 2, 3],
+            symbols: vec![0, 1, 2, 3],
+            weight: 1,
+        }],
+        0,
+        &ReferenceMsaConfig::default(),
+    )
+    .unwrap();
+
+    let coordinates =
+        build_global_coordinates(&graph, result.reference_path.clone(), CoordinateMode::Hmm)
+            .unwrap();
+    assert_eq!(coordinates.global_state_count, 4);
+    assert_eq!(coordinates.reference_path, result.reference_path);
+    assert_eq!(coordinates.node_intervals[0], StateInterval::new(0, 1));
+    assert_eq!(coordinates.node_intervals[3], StateInterval::new(3, 3));
+}
+
+#[test]
 fn legacy_input_paths_are_consistent() {
     let input = LegacyDagAlignInput::from_graph_dir(PathBuf::from("graph-dir"));
     let options = LegacyConversionOptions::default();
@@ -273,6 +384,8 @@ fn legacy_adapter_converts_tiny_dag_align_graph_with_object_bridge() {
     );
     assert!(output_dir.join("source/sequence_id.npy").exists());
     assert!(output_dir.join("source/node_source_offset.npy").exists());
+    assert!(output_dir.join("source/source_sequence_id.npy").exists());
+    assert!(output_dir.join("source/source_position.npy").exists());
     assert!(
         output
             .artifact
@@ -287,6 +400,40 @@ fn legacy_adapter_converts_tiny_dag_align_graph_with_object_bridge() {
             .require_array("source_packed")
             .is_some()
     );
+    let reference_msa = output
+        .initializations
+        .get(InitializationTrack::ReferenceMsa)
+        .unwrap();
+    let legacy_current = output
+        .initializations
+        .get(InitializationTrack::LegacyCurrent)
+        .unwrap();
+    assert_eq!(legacy_current.global_state_count, 3);
+    assert_eq!(legacy_current.alphabet_size, 6);
+    assert!(
+        legacy_current
+            .metadata
+            .iter()
+            .any(|(key, value)| key == "normalized_to_graph_encoding" && value == "true")
+    );
+    assert_eq!(reference_msa.global_state_count, 3);
+    assert_eq!(reference_msa.alphabet_size, 6);
+    assert!(
+        reference_msa
+            .metadata
+            .iter()
+            .any(|(key, value)| key == "source" && value == "reference_path_msa")
+    );
+    let (legacy_match_rows, legacy_match_cols, legacy_match) =
+        read_npy_2d_f64(output_dir.join("initialization/legacy_current/match_emission.npy"))
+            .unwrap();
+    assert_eq!((legacy_match_rows, legacy_match_cols), (3, 6));
+    assert!((legacy_match[0].exp() - 0.9).abs() < 1e-12);
+    assert!((legacy_match[1].exp() - 0.03).abs() < 1e-12);
+    assert!((legacy_match[2].exp() - 0.02).abs() < 1e-12);
+    assert!((legacy_match[3].exp() - 0.05).abs() < 1e-12);
+    assert!(legacy_match[4] < -30.0);
+    assert!(legacy_match[5] < -30.0);
 
     let artifact = TensorGraphArtifact::read_manifest(&output_dir).unwrap();
     let graph_report =
@@ -323,8 +470,13 @@ fn create_tiny_legacy_npz(graph_dir: &Path) {
         .arg(
             r#"
 import numpy as np
+import pickle
+from types import SimpleNamespace
 from pathlib import Path
 graph_dir = Path(__import__('sys').argv[1])
+graph = SimpleNamespace(firstBitofOSM=2, allBitofOSM=4)
+with (graph_dir / "graph.pkl").open("wb") as handle:
+    pickle.dump(graph, handle)
 edgeWeightDict = np.array([[0, 1, 2], [1, 2, 3]], dtype=object)
 fragments = np.array(["AA", "AC", "AG"])
 weights = np.array([2, 3, 4], dtype=np.uint32)
@@ -338,13 +490,13 @@ np.savez(
     startNodeSet=startNodeSet,
     endNodeSet=endNodeSet,
 )
-np.save(graph_dir / "v_id.npy", np.array([["seq1", "g_0"]], dtype=object))
+np.save(graph_dir / "v_id.npy", np.array([["seq1", "g_0"], ["seq2", "g_1"]], dtype=object))
 np.save(
     graph_dir / "osm.npy",
     np.array([
-        np.array([1, 2], dtype=np.uint64),
-        np.array([3, 4, 5], dtype=np.uint64),
-        np.array([6, 7, 8, 9], dtype=np.uint64),
+        np.array([0, 4], dtype=np.uint64),
+        np.array([1], dtype=np.uint64),
+        np.array([2, 5], dtype=np.uint64),
     ], dtype=object),
 )
 np.savez(

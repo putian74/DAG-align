@@ -1,4 +1,5 @@
 use dag_rust::prelude::*;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -407,6 +408,345 @@ fn local_saved_sars_cov2_trace_path_merge_comparison_reports() {
 }
 
 #[test]
+#[ignore = "profiles local SARS-CoV-2 CountOnly graph merge against direct build"]
+fn local_sars_cov2_count_only_merge_comparison_reports() {
+    if std::env::var_os("DAG_RUST_RUN_COUNT_ONLY_MERGE_TESTS").is_none() {
+        return;
+    }
+    if std::env::var_os("DAG_RUST_ENABLE_COUNT_ONLY_STUBBED_TEST_BODY").is_none() {
+        println!("count_only_merge_comparison skipped=native_count_only_merge_stub");
+        return;
+    }
+    if !Path::new(SARS_COV2_ARCHIVE).exists() {
+        return;
+    }
+
+    let records = load_sars_cov2_full_sequences(2_000);
+    assert_eq!(
+        records.len(),
+        2_000,
+        "expected 2000 full SARS-CoV-2 records"
+    );
+
+    let left_start = Instant::now();
+    let left = build_profile_graph(
+        &records[..1_000],
+        ProvenanceStorageStrategy::CountOnly,
+        EdgeIndexStrategy::LowDegreeHybrid,
+    );
+    let left_secs = left_start.elapsed().as_secs_f64();
+
+    let right_start = Instant::now();
+    let right = build_profile_graph(
+        &records[1_000..],
+        ProvenanceStorageStrategy::CountOnly,
+        EdgeIndexStrategy::LowDegreeHybrid,
+    );
+    let right_secs = right_start.elapsed().as_secs_f64();
+
+    let merge_start = Instant::now();
+    let merged = merge_graphs(left, right, optimized_merge_config()).unwrap();
+    let merge_secs = merge_start.elapsed().as_secs_f64();
+    assert!(merged.validate().is_valid());
+
+    let scratch_start = Instant::now();
+    let scratch = build_profile_graph(
+        &records,
+        ProvenanceStorageStrategy::CountOnly,
+        EdgeIndexStrategy::LowDegreeHybrid,
+    );
+    let scratch_secs = scratch_start.elapsed().as_secs_f64();
+    assert!(scratch.validate().is_valid());
+
+    let merged_provenance = total_provenance_records(&merged);
+    let scratch_provenance = total_provenance_records(&scratch);
+    assert_eq!(
+        merged_provenance, scratch_provenance,
+        "CountOnly merge must preserve total provenance count"
+    );
+
+    let memory = MemoryUsage::current();
+    println!(
+        "count_only_merge_comparison left_build_secs={:.3} right_build_secs={:.3} merge_secs={:.3} scratch_build_secs={:.3} speedup_vs_scratch={:.3} merged_nodes={} merged_edges={} merged_provenance_records={} merged_compression_ratio={:.6} scratch_nodes={} scratch_edges={} scratch_provenance_records={} scratch_compression_ratio={:.6} rss_mib={} peak_rss_mib={}",
+        left_secs,
+        right_secs,
+        merge_secs,
+        scratch_secs,
+        scratch_secs / merge_secs,
+        merged.node_count(),
+        merged.edge_count(),
+        merged_provenance,
+        merged_provenance as f64 / merged.node_count() as f64,
+        scratch.node_count(),
+        scratch.edge_count(),
+        scratch_provenance,
+        scratch_provenance as f64 / scratch.node_count() as f64,
+        memory.rss_mib(),
+        memory.peak_rss_mib(),
+    );
+}
+
+#[test]
+#[ignore = "profiles local SARS-CoV-2 TracePaths merge against fresh direct build"]
+fn local_sars_cov2_trace_path_merge_comparison_reports_fresh_builds() {
+    if std::env::var_os("DAG_RUST_RUN_TRACE_PATH_MERGE_TESTS").is_none() {
+        return;
+    }
+    if !Path::new(SARS_COV2_ARCHIVE).exists() {
+        return;
+    }
+
+    let records = load_sars_cov2_full_sequences(2_000);
+    assert_eq!(
+        records.len(),
+        2_000,
+        "expected 2000 full SARS-CoV-2 records"
+    );
+
+    let left_start = Instant::now();
+    let left = build_profile_graph(
+        &records[..1_000],
+        ProvenanceStorageStrategy::TracePaths,
+        EdgeIndexStrategy::LowDegreeHybrid,
+    );
+    let left_secs = left_start.elapsed().as_secs_f64();
+
+    let right_start = Instant::now();
+    let right = build_profile_graph(
+        &records[1_000..],
+        ProvenanceStorageStrategy::TracePaths,
+        EdgeIndexStrategy::LowDegreeHybrid,
+    );
+    let right_secs = right_start.elapsed().as_secs_f64();
+
+    let merge_start = Instant::now();
+    let merged = merge_graphs(left, right, optimized_merge_config()).unwrap();
+    let merge_secs = merge_start.elapsed().as_secs_f64();
+    assert!(merged.validate().is_valid());
+
+    let scratch_start = Instant::now();
+    let scratch = build_profile_graph(
+        &records,
+        ProvenanceStorageStrategy::TracePaths,
+        EdgeIndexStrategy::LowDegreeHybrid,
+    );
+    let scratch_secs = scratch_start.elapsed().as_secs_f64();
+    assert_graph_structure_eq(&merged, &scratch);
+    assert!(scratch.validate().is_valid());
+
+    let merged_provenance = total_provenance_records(&merged);
+    let memory = MemoryUsage::current();
+    println!(
+        "trace_path_merge_comparison left_build_secs={:.3} right_build_secs={:.3} merge_secs={:.3} scratch_build_secs={:.3} speedup_vs_scratch={:.3} nodes={} edges={} provenance_records={} compression_ratio={:.6} rss_mib={} peak_rss_mib={}",
+        left_secs,
+        right_secs,
+        merge_secs,
+        scratch_secs,
+        scratch_secs / merge_secs,
+        merged.node_count(),
+        merged.edge_count(),
+        merged_provenance,
+        merged_provenance as f64 / merged.node_count() as f64,
+        memory.rss_mib(),
+        memory.peak_rss_mib(),
+    );
+}
+
+#[test]
+#[ignore = "compares fresh TracePaths and CountOnly subgraphs and merge outputs on the same local dataset"]
+fn local_trace_path_and_count_only_merge_difference_reports() {
+    if std::env::var_os("DAG_RUST_RUN_MERGE_DIFF_ANALYSIS").is_none() {
+        return;
+    }
+    if std::env::var_os("DAG_RUST_ENABLE_COUNT_ONLY_STUBBED_TEST_BODY").is_none() {
+        println!("trace_count_merge_difference skipped=native_count_only_merge_stub");
+        return;
+    }
+    if !Path::new(SARS_COV2_ARCHIVE).exists() {
+        return;
+    }
+
+    let records = load_sars_cov2_full_sequences(2_000);
+    assert_eq!(
+        records.len(),
+        2_000,
+        "expected 2000 full SARS-CoV-2 records"
+    );
+
+    let left_trace = build_profile_graph(
+        &records[..1_000],
+        ProvenanceStorageStrategy::TracePaths,
+        EdgeIndexStrategy::LowDegreeHybrid,
+    );
+    let right_trace = build_profile_graph(
+        &records[1_000..],
+        ProvenanceStorageStrategy::TracePaths,
+        EdgeIndexStrategy::LowDegreeHybrid,
+    );
+    let scratch_trace = build_profile_graph(
+        &records,
+        ProvenanceStorageStrategy::TracePaths,
+        EdgeIndexStrategy::LowDegreeHybrid,
+    );
+
+    let left_count = build_profile_graph(
+        &records[..1_000],
+        ProvenanceStorageStrategy::CountOnly,
+        EdgeIndexStrategy::LowDegreeHybrid,
+    );
+    let right_count = build_profile_graph(
+        &records[1_000..],
+        ProvenanceStorageStrategy::CountOnly,
+        EdgeIndexStrategy::LowDegreeHybrid,
+    );
+    let scratch_count = build_profile_graph(
+        &records,
+        ProvenanceStorageStrategy::CountOnly,
+        EdgeIndexStrategy::LowDegreeHybrid,
+    );
+
+    assert_graph_structure_eq(&left_trace, &left_count);
+    assert_graph_structure_eq(&right_trace, &right_count);
+    assert_graph_structure_eq(&scratch_trace, &scratch_count);
+
+    let native_plan = simulate_count_only_merge_plan(left_count.clone(), right_count.clone());
+    let merged_trace = merge_graphs(
+        left_trace.clone(),
+        right_trace.clone(),
+        optimized_merge_config(),
+    )
+    .unwrap();
+    let merged_trace_as_count =
+        merge_trace_path_graphs_as_count_only(left_trace, right_trace, optimized_merge_config())
+            .unwrap();
+    let merged_count_pre_secondary =
+        simulate_count_only_merge_without_secondary(left_count.clone(), right_count.clone());
+    let merged_count = merge_graphs(left_count, right_count, optimized_merge_config()).unwrap();
+    assert_graph_structure_eq(&merged_trace, &scratch_trace);
+    assert_graph_structure_eq(&merged_trace_as_count, &scratch_count);
+    let (trace_secondary, trace_secondary_stats) =
+        dag_rust::algorithms::postprocess::secondary_merge_graph_with_stats(
+            merged_trace.clone(),
+            SecondaryMergeConfig::default(),
+        )
+        .unwrap();
+
+    let diff = graph_structure_difference(&merged_count, &merged_trace);
+    let detailed = analyze_count_vs_trace_merge_difference(&merged_count, &merged_trace);
+    let secondary_risk = analyze_trace_secondary_merge_risk(&merged_trace);
+    let trace_branch_loss = analyze_branch_constraint_delta(&merged_trace, &merged_count);
+    let count_secondary_branch_loss =
+        analyze_branch_constraint_delta(&merged_count_pre_secondary, &merged_count);
+    println!(
+        "trace_count_native_plan orientation={:?} main_path_len={} main_path_weight={} anchored_nodes={} anchored_weight={} total_add_nodes={} total_add_weight={} anchored_start={} anchored_internal={} anchored_end={} add_roots={} add_sinks={} anchored_roots={} anchored_sinks={} fresh_nodes={}",
+        native_plan.plan.orientation,
+        native_plan.main_path_len,
+        native_plan.main_path_weight,
+        native_plan.plan.matched_nodes,
+        native_plan.anchored_add_weight,
+        native_plan.add_graph.node_count(),
+        native_plan.total_add_weight,
+        native_plan.anchored_start_count,
+        native_plan.anchored_internal_count,
+        native_plan.anchored_end_count,
+        native_plan.add_graph.endpoints().structural_roots().len(),
+        native_plan.add_graph.endpoints().structural_sinks().len(),
+        native_plan.anchored_root_count,
+        native_plan.anchored_sink_count,
+        native_plan
+            .add_graph
+            .node_count()
+            .saturating_sub(native_plan.plan.matched_nodes),
+    );
+    println!(
+        "trace_replay_count_control identical_to_trace={} identical_to_scratch_count={} count_nodes={} count_edges={}",
+        graph_structure_difference(&merged_trace_as_count, &merged_trace).is_none(),
+        graph_structure_difference(&merged_trace_as_count, &scratch_count).is_none(),
+        merged_trace_as_count.node_count(),
+        merged_trace_as_count.edge_count(),
+    );
+    println!(
+        "trace_count_merge_difference identical={} count_nodes={} trace_nodes={} count_edges={} trace_edges={} detail={}",
+        diff.is_none(),
+        merged_count.node_count(),
+        merged_trace.node_count(),
+        merged_count.edge_count(),
+        merged_trace.edge_count(),
+        diff.unwrap_or_else(|| "none".to_string()),
+    );
+    println!(
+        "trace_count_merge_phase_summary pre_secondary_nodes={} pre_secondary_edges={} final_count_nodes={} final_count_edges={} pre_secondary_diff={} final_diff={}",
+        merged_count_pre_secondary.node_count(),
+        merged_count_pre_secondary.edge_count(),
+        merged_count.node_count(),
+        merged_count.edge_count(),
+        graph_structure_difference(&merged_count_pre_secondary, &merged_trace)
+            .unwrap_or_else(|| "none".to_string()),
+        graph_structure_difference(&merged_count, &merged_trace)
+            .unwrap_or_else(|| "none".to_string()),
+    );
+    println!(
+        "trace_count_merge_phase_kinds pre_secondary={} final_count={} trace={}",
+        graph_kind_summary(&merged_count_pre_secondary),
+        graph_kind_summary(&merged_count),
+        graph_kind_summary(&merged_trace),
+    );
+    println!(
+        "trace_count_merge_difference_summary differing_keys={} trace_excess_nodes={} preserved_weight_keys={} multiplicity_histogram={:?}",
+        detailed.differing_key_count,
+        detailed.trace_excess_nodes,
+        detailed.preserved_weight_key_count,
+        detailed.trace_multiplicity_histogram,
+    );
+    println!(
+        "trace_count_merge_difference_topological first_mismatch={} fragment_kind_deltas={:?}",
+        detailed.first_topological_mismatch, detailed.fragment_kind_deltas,
+    );
+    println!(
+        "trace_count_merge_secondary_match identical={} removed_nodes={} merged_nodes={} risk_duplicate_keys={} risk_duplicate_nodes={} risk_conflicting_keys={} multiplicity_histogram={:?}",
+        graph_structure_difference(&trace_secondary, &merged_count).is_none(),
+        trace_secondary_stats.removed_nodes,
+        trace_secondary_stats.merged_nodes,
+        secondary_risk.duplicate_key_count,
+        secondary_risk.duplicate_node_count,
+        secondary_risk.conflicting_neighborhood_key_count,
+        secondary_risk.multiplicity_histogram,
+    );
+    println!(
+        "trace_count_branch_constraint_summary trace_branch_nodes={} count_branch_nodes={} trace_fan_in_nodes={} count_fan_in_nodes={} trace_fan_out_nodes={} count_fan_out_nodes={} trace_excess_branch_pattern_nodes={}",
+        trace_branch_loss.left_branch_nodes,
+        trace_branch_loss.right_branch_nodes,
+        trace_branch_loss.left_fan_in_nodes,
+        trace_branch_loss.right_fan_in_nodes,
+        trace_branch_loss.left_fan_out_nodes,
+        trace_branch_loss.right_fan_out_nodes,
+        trace_branch_loss.left_excess_branch_pattern_nodes,
+    );
+    println!(
+        "count_secondary_branch_constraint_summary pre_secondary_branch_nodes={} final_branch_nodes={} pre_secondary_fan_in_nodes={} final_fan_in_nodes={} pre_secondary_fan_out_nodes={} final_fan_out_nodes={} pre_secondary_excess_branch_pattern_nodes={}",
+        count_secondary_branch_loss.left_branch_nodes,
+        count_secondary_branch_loss.right_branch_nodes,
+        count_secondary_branch_loss.left_fan_in_nodes,
+        count_secondary_branch_loss.right_fan_in_nodes,
+        count_secondary_branch_loss.left_fan_out_nodes,
+        count_secondary_branch_loss.right_fan_out_nodes,
+        count_secondary_branch_loss.left_excess_branch_pattern_nodes,
+    );
+    for example in detailed.examples {
+        println!("trace_count_merge_difference_example {example}");
+    }
+    for example in secondary_risk.examples {
+        println!("trace_count_secondary_risk_example {example}");
+    }
+    for example in trace_branch_loss.examples {
+        println!("trace_count_branch_constraint_example {example}");
+    }
+    for example in count_secondary_branch_loss.examples {
+        println!("count_secondary_branch_constraint_example {example}");
+    }
+}
+
+#[test]
 #[ignore = "reports optimized hierarchy merges from saved 250/500/1000 TracePaths building blocks"]
 fn local_saved_sars_cov2_trace_path_hierarchy_merge_comparison_reports() {
     if std::env::var_os("DAG_RUST_RUN_SAVED_MERGE_TESTS").is_none() {
@@ -766,7 +1106,7 @@ fn build_profile_graph(
         DefaultFragmentEncoder::packed(BitWidth::new(alphabet.bits_per_symbol()).unwrap());
     let mut config = BuildConfig::new(31);
     config.min_initial_match_ratio = Some(SimilarityThreshold::from_basis_points(100).unwrap());
-    config.topology_update_strategy = TopologyUpdateStrategy::IncrementalForwardOnly;
+    config.topology_update_strategy = TopologyUpdateStrategy::IncrementalForwardRelaxation;
     config.provenance_storage_strategy = provenance_storage_strategy;
     config.edge_index_strategy = edge_index_strategy;
     let mut builder = FtoDagBuilder::new(config);
@@ -781,7 +1121,7 @@ fn build_profile_graph(
             )
             .expect("record integrates or rejects");
     }
-    builder.into_graph()
+    builder.finalize_graph().expect("profile graph finalizes")
 }
 
 #[derive(Clone, Debug)]
@@ -864,7 +1204,7 @@ fn build_and_save_trace_path_graph(
         }
     }
     let report = builder.report().clone();
-    let graph = builder.into_graph();
+    let graph = builder.finalize_graph().expect("saved graph finalizes");
     let topology_start = Instant::now();
     DagTopology::try_from_graph(&graph).expect("saved TracePaths graph remains acyclic");
     let topology_secs = topology_start.elapsed().as_secs_f64();
@@ -1206,6 +1546,852 @@ fn assert_graph_structure_eq(left: &FtoDag, right: &FtoDag) {
     assert_eq!(left.edges(), right.edges(), "weighted edge list differs");
 }
 
+fn graph_structure_difference(left: &FtoDag, right: &FtoDag) -> Option<String> {
+    if left.node_count() != right.node_count() {
+        return Some(format!(
+            "node count differs: left={} right={}",
+            left.node_count(),
+            right.node_count()
+        ));
+    }
+    if left.edge_count() != right.edge_count() {
+        return Some(format!(
+            "edge count differs: left={} right={}",
+            left.edge_count(),
+            right.edge_count()
+        ));
+    }
+
+    let endpoint_diff = endpoint_index_difference(left.endpoints(), right.endpoints());
+    if endpoint_diff != "none" {
+        return Some(endpoint_diff);
+    }
+
+    for (index, (left_node, right_node)) in left.nodes().iter().zip(right.nodes()).enumerate() {
+        if left_node.id != right_node.id {
+            return Some(format!(
+                "node {index} id differs: left={:?} right={:?}",
+                left_node.id, right_node.id
+            ));
+        }
+        if left_node.fragment != right_node.fragment {
+            return Some(format!("node {index} fragment differs"));
+        }
+        if left_node.kind != right_node.kind {
+            return Some(format!(
+                "node {index} kind differs: left={:?} right={:?}",
+                left_node.kind, right_node.kind
+            ));
+        }
+        if left_node.weight != right_node.weight {
+            return Some(format!(
+                "node {index} weight differs: left={:?} right={:?}",
+                left_node.weight, right_node.weight
+            ));
+        }
+        if left.provenance_record_count(left_node.id).ok()
+            != right.provenance_record_count(right_node.id).ok()
+        {
+            return Some(format!(
+                "node {index} provenance count differs: left={:?} right={:?}",
+                left.provenance_record_count(left_node.id).ok(),
+                right.provenance_record_count(right_node.id).ok()
+            ));
+        }
+    }
+
+    if let Some((index, (left_edge, right_edge))) = left
+        .edges()
+        .iter()
+        .zip(right.edges())
+        .enumerate()
+        .find(|(_, (left_edge, right_edge))| left_edge != right_edge)
+    {
+        return Some(format!(
+            "edge {index} differs: left={:?} right={:?}",
+            left_edge, right_edge
+        ));
+    }
+
+    None
+}
+
+#[derive(Clone, Debug)]
+struct GraphNodeNeighborhood {
+    node_id: NodeId,
+    weight: u64,
+    parents: Vec<String>,
+    children: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct GraphKeyGroup {
+    total_weight: u64,
+    neighborhoods: Vec<GraphNodeNeighborhood>,
+}
+
+#[derive(Clone, Debug)]
+struct CountTraceDifferenceAnalysis {
+    differing_key_count: usize,
+    trace_excess_nodes: usize,
+    preserved_weight_key_count: usize,
+    trace_multiplicity_histogram: BTreeMap<usize, usize>,
+    first_topological_mismatch: String,
+    fragment_kind_deltas: Vec<String>,
+    examples: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TraceSecondaryMergeRiskAnalysis {
+    duplicate_key_count: usize,
+    duplicate_node_count: usize,
+    conflicting_neighborhood_key_count: usize,
+    multiplicity_histogram: BTreeMap<usize, usize>,
+    examples: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct BranchConstraintDeltaAnalysis {
+    left_branch_nodes: usize,
+    right_branch_nodes: usize,
+    left_fan_in_nodes: usize,
+    right_fan_in_nodes: usize,
+    left_fan_out_nodes: usize,
+    right_fan_out_nodes: usize,
+    left_excess_branch_pattern_nodes: usize,
+    examples: Vec<String>,
+}
+
+fn analyze_count_vs_trace_merge_difference(
+    count_graph: &FtoDag,
+    trace_graph: &FtoDag,
+) -> CountTraceDifferenceAnalysis {
+    let count_groups = graph_key_groups(count_graph);
+    let trace_groups = graph_key_groups(trace_graph);
+    let mut keys = trace_groups.keys().cloned().collect::<Vec<_>>();
+    keys.sort_unstable();
+
+    let mut differing_key_count = 0;
+    let mut trace_excess_nodes = 0;
+    let mut preserved_weight_key_count = 0;
+    let mut trace_multiplicity_histogram = BTreeMap::new();
+    let mut examples = Vec::new();
+
+    for key in keys {
+        let Some(trace_group) = trace_groups.get(&key) else {
+            continue;
+        };
+        let count_group = count_groups.get(&key);
+        let trace_len = trace_group.neighborhoods.len();
+        let count_len = count_group.map_or(0, |group| group.neighborhoods.len());
+        if trace_len == count_len {
+            continue;
+        }
+
+        differing_key_count += 1;
+        trace_excess_nodes += trace_len.saturating_sub(count_len);
+        *trace_multiplicity_histogram.entry(trace_len).or_insert(0) += 1;
+
+        let count_weight = count_group.map_or(0, |group| group.total_weight);
+        if count_weight == trace_group.total_weight {
+            preserved_weight_key_count += 1;
+        }
+
+        if examples.len() < 12 {
+            let trace_nodes = trace_group
+                .neighborhoods
+                .iter()
+                .map(format_node_neighborhood)
+                .collect::<Vec<_>>()
+                .join(" || ");
+            let count_nodes = count_group
+                .map(|group| {
+                    group
+                        .neighborhoods
+                        .iter()
+                        .map(format_node_neighborhood)
+                        .collect::<Vec<_>>()
+                        .join(" || ")
+                })
+                .unwrap_or_else(|| "none".to_string());
+            examples.push(format!(
+                "key={key} trace_nodes={trace_len} count_nodes={count_len} trace_weight={} count_weight={} trace_details=[{}] count_details=[{}]",
+                trace_group.total_weight,
+                count_weight,
+                trace_nodes,
+                count_nodes
+            ));
+        }
+    }
+
+    CountTraceDifferenceAnalysis {
+        differing_key_count,
+        trace_excess_nodes,
+        preserved_weight_key_count,
+        trace_multiplicity_histogram,
+        first_topological_mismatch: first_topological_mismatch(count_graph, trace_graph),
+        fragment_kind_deltas: fragment_kind_count_deltas(count_graph, trace_graph),
+        examples,
+    }
+}
+
+fn analyze_trace_secondary_merge_risk(trace_graph: &FtoDag) -> TraceSecondaryMergeRiskAnalysis {
+    let groups = graph_key_groups(trace_graph);
+    let mut duplicate_key_count = 0;
+    let mut duplicate_node_count = 0;
+    let mut conflicting_neighborhood_key_count = 0;
+    let mut multiplicity_histogram = BTreeMap::new();
+    let mut examples = Vec::new();
+
+    let mut keys = groups.keys().cloned().collect::<Vec<_>>();
+    keys.sort_unstable();
+    for key in keys {
+        let group = &groups[&key];
+        let multiplicity = group.neighborhoods.len();
+        if multiplicity <= 1 {
+            continue;
+        }
+        duplicate_key_count += 1;
+        duplicate_node_count += multiplicity;
+        *multiplicity_histogram.entry(multiplicity).or_insert(0) += 1;
+
+        let unique_neighborhoods = group
+            .neighborhoods
+            .iter()
+            .map(neighborhood_signature)
+            .collect::<HashSet<_>>();
+        if unique_neighborhoods.len() > 1 {
+            conflicting_neighborhood_key_count += 1;
+        }
+        if examples.len() < 12 {
+            let detail = group
+                .neighborhoods
+                .iter()
+                .map(format_node_neighborhood)
+                .collect::<Vec<_>>()
+                .join(" || ");
+            examples.push(format!(
+                "key={key} multiplicity={} total_weight={} unique_neighborhoods={} details=[{}]",
+                multiplicity,
+                group.total_weight,
+                unique_neighborhoods.len(),
+                detail
+            ));
+        }
+    }
+
+    TraceSecondaryMergeRiskAnalysis {
+        duplicate_key_count,
+        duplicate_node_count,
+        conflicting_neighborhood_key_count,
+        multiplicity_histogram,
+        examples,
+    }
+}
+
+fn analyze_branch_constraint_delta(
+    left_graph: &FtoDag,
+    right_graph: &FtoDag,
+) -> BranchConstraintDeltaAnalysis {
+    let left_patterns = graph_branch_pattern_counts(left_graph);
+    let right_patterns = graph_branch_pattern_counts(right_graph);
+
+    let left_branch_nodes = count_branch_nodes(left_graph);
+    let right_branch_nodes = count_branch_nodes(right_graph);
+    let left_fan_in_nodes = count_fan_in_nodes(left_graph);
+    let right_fan_in_nodes = count_fan_in_nodes(right_graph);
+    let left_fan_out_nodes = count_fan_out_nodes(left_graph);
+    let right_fan_out_nodes = count_fan_out_nodes(right_graph);
+
+    let mut deltas = Vec::new();
+    let mut left_excess_branch_pattern_nodes = 0;
+    for (key, left_count) in left_patterns {
+        let right_count = right_patterns.get(&key).copied().unwrap_or(0);
+        if left_count > right_count {
+            let delta = left_count - right_count;
+            left_excess_branch_pattern_nodes += delta;
+            deltas.push((delta, left_count, right_count, key));
+        }
+    }
+    deltas.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then(right.1.cmp(&left.1))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+
+    let examples = deltas
+        .into_iter()
+        .take(12)
+        .map(|(delta, left_count, right_count, key)| {
+            format!(
+                "pattern={key} left_count={left_count} right_count={right_count} left_minus_right={delta}"
+            )
+        })
+        .collect();
+
+    BranchConstraintDeltaAnalysis {
+        left_branch_nodes,
+        right_branch_nodes,
+        left_fan_in_nodes,
+        right_fan_in_nodes,
+        left_fan_out_nodes,
+        right_fan_out_nodes,
+        left_excess_branch_pattern_nodes,
+        examples,
+    }
+}
+
+fn graph_branch_pattern_counts(graph: &FtoDag) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for node in graph.nodes() {
+        let parent_count = graph.parents(node.id).expect("branch parents exist").len();
+        let child_count = graph
+            .children(node.id)
+            .expect("branch children exist")
+            .len();
+        if parent_count <= 1 && child_count <= 1 {
+            continue;
+        }
+        let key = format!(
+            "fragment={:?}|kind={:?}|in={parent_count}|out={child_count}",
+            node.fragment, node.kind
+        );
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn count_branch_nodes(graph: &FtoDag) -> usize {
+    graph
+        .nodes()
+        .iter()
+        .filter(|node| {
+            let parent_count = graph.parents(node.id).expect("branch parents exist").len();
+            let child_count = graph
+                .children(node.id)
+                .expect("branch children exist")
+                .len();
+            parent_count > 1 || child_count > 1
+        })
+        .count()
+}
+
+fn count_fan_in_nodes(graph: &FtoDag) -> usize {
+    graph
+        .nodes()
+        .iter()
+        .filter(|node| graph.parents(node.id).expect("fan-in parents exist").len() > 1)
+        .count()
+}
+
+fn count_fan_out_nodes(graph: &FtoDag) -> usize {
+    graph
+        .nodes()
+        .iter()
+        .filter(|node| {
+            graph
+                .children(node.id)
+                .expect("fan-out children exist")
+                .len()
+                > 1
+        })
+        .count()
+}
+
+fn simulate_count_only_merge_without_secondary(left: FtoDag, right: FtoDag) -> FtoDag {
+    let selected = simulate_count_only_merge_plan(left, right);
+    apply_count_only_merge_plan_without_secondary(
+        selected.base_graph,
+        selected.add_graph,
+        &selected.plan,
+    )
+}
+
+#[derive(Clone, Debug)]
+struct SelectedCountOnlyMergePlan {
+    base_graph: FtoDag,
+    add_graph: FtoDag,
+    plan: PlannedCountOnlyMergeForTest,
+    main_path_len: usize,
+    main_path_weight: u64,
+    total_add_weight: u64,
+    anchored_add_weight: u64,
+    anchored_start_count: usize,
+    anchored_internal_count: usize,
+    anchored_end_count: usize,
+    anchored_root_count: usize,
+    anchored_sink_count: usize,
+}
+
+fn simulate_count_only_merge_plan(left: FtoDag, right: FtoDag) -> SelectedCountOnlyMergePlan {
+    let right_into_left =
+        plan_count_only_merge_for_test(&left, &right, MergeOrientation::RightIntoLeft);
+    let left_into_right =
+        plan_count_only_merge_for_test(&right, &left, MergeOrientation::LeftIntoRight);
+    if prefer_count_only_plan_for_test(&left_into_right, &right_into_left) {
+        build_selected_count_only_plan(right, left, left_into_right)
+    } else {
+        build_selected_count_only_plan(left, right, right_into_left)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlannedCountOnlyMergeForTest {
+    orientation: MergeOrientation,
+    anchors: AnchorMap,
+    score: u64,
+    matched_nodes: usize,
+    main_path: Vec<NodeId>,
+}
+
+fn plan_count_only_merge_for_test(
+    base: &FtoDag,
+    add: &FtoDag,
+    orientation: MergeOrientation,
+) -> PlannedCountOnlyMergeForTest {
+    let base_topology = DagTopology::try_from_graph(base).unwrap();
+    let add_topology = DagTopology::try_from_graph(add).unwrap();
+    let add_main_path = max_weight_path_for_test(add, &add_topology);
+    let candidate_sets =
+        base_main_path_candidate_sets_for_test(base, &base_topology, add, &add_main_path);
+    let anchor_path = select_monotone_anchor_path_with_graph(&candidate_sets, base);
+    let anchors = anchor_map_from_main_path_for_test(&add_main_path, &anchor_path);
+    let score = anchor_score_for_test(base, add, &anchors);
+    PlannedCountOnlyMergeForTest {
+        orientation,
+        matched_nodes: anchors.pairs.len(),
+        anchors,
+        score,
+        main_path: add_main_path,
+    }
+}
+
+fn prefer_count_only_plan_for_test(
+    candidate: &PlannedCountOnlyMergeForTest,
+    current: &PlannedCountOnlyMergeForTest,
+) -> bool {
+    candidate.score > current.score
+        || (candidate.score == current.score && candidate.matched_nodes > current.matched_nodes)
+        || (candidate.score == current.score
+            && candidate.matched_nodes == current.matched_nodes
+            && matches!(candidate.orientation, MergeOrientation::RightIntoLeft)
+            && matches!(current.orientation, MergeOrientation::LeftIntoRight))
+}
+
+fn build_selected_count_only_plan(
+    base_graph: FtoDag,
+    add_graph: FtoDag,
+    plan: PlannedCountOnlyMergeForTest,
+) -> SelectedCountOnlyMergePlan {
+    let total_add_weight = add_graph.nodes().iter().map(|node| node.weight.raw()).sum();
+    let main_path_weight = plan
+        .main_path
+        .iter()
+        .map(|node_id| add_graph.node(*node_id).unwrap().weight.raw())
+        .sum();
+    let anchored_add_weight = plan
+        .anchors
+        .pairs
+        .iter()
+        .map(|(add_node, _)| add_graph.node(*add_node).unwrap().weight.raw())
+        .sum();
+    let mut anchored_start_count = 0;
+    let mut anchored_internal_count = 0;
+    let mut anchored_end_count = 0;
+    let mut anchored_root_count = 0;
+    let mut anchored_sink_count = 0;
+    let root_set: HashSet<NodeId> = add_graph
+        .endpoints()
+        .structural_roots()
+        .iter()
+        .copied()
+        .collect();
+    let sink_set: HashSet<NodeId> = add_graph
+        .endpoints()
+        .structural_sinks()
+        .iter()
+        .copied()
+        .collect();
+    for (add_node, _) in &plan.anchors.pairs {
+        let node = add_graph.node(*add_node).unwrap();
+        match node.kind {
+            NodeKind::Start => anchored_start_count += 1,
+            NodeKind::Internal => anchored_internal_count += 1,
+            NodeKind::End => anchored_end_count += 1,
+            NodeKind::Singleton => {}
+        }
+        if root_set.contains(add_node) {
+            anchored_root_count += 1;
+        }
+        if sink_set.contains(add_node) {
+            anchored_sink_count += 1;
+        }
+    }
+
+    SelectedCountOnlyMergePlan {
+        base_graph,
+        add_graph,
+        main_path_len: plan.main_path.len(),
+        main_path_weight,
+        total_add_weight,
+        anchored_add_weight,
+        anchored_start_count,
+        anchored_internal_count,
+        anchored_end_count,
+        anchored_root_count,
+        anchored_sink_count,
+        plan,
+    }
+}
+
+fn apply_count_only_merge_plan_without_secondary(
+    mut base: FtoDag,
+    add: FtoDag,
+    plan: &PlannedCountOnlyMergeForTest,
+) -> FtoDag {
+    let add_topology = DagTopology::try_from_graph(&add).unwrap();
+    let mut remap = vec![None; add.node_count()];
+    for (add_node, base_node) in &plan.anchors.pairs {
+        remap[add_node.to_usize()] = Some(*base_node);
+    }
+
+    for add_node in add_topology.topological_order() {
+        if remap[add_node.to_usize()].is_some() {
+            continue;
+        }
+        let source = add.node(*add_node).unwrap();
+        let merged = base.add_node(source.fragment.clone(), source.kind).unwrap();
+        remap[add_node.to_usize()] = Some(merged);
+    }
+
+    for edge in add.edges() {
+        let parent = remap[edge.key.parent.to_usize()].unwrap();
+        let child = remap[edge.key.child.to_usize()].unwrap();
+        if parent == child {
+            continue;
+        }
+        base.add_or_increment_edge(parent, child, edge.weight)
+            .unwrap();
+    }
+
+    for node in add.nodes() {
+        let merged = remap[node.id.to_usize()].unwrap();
+        base.add_provenance_count(merged, node.weight.raw())
+            .unwrap();
+    }
+
+    base
+}
+
+fn max_weight_path_for_test(graph: &FtoDag, topology: &DagTopology) -> Vec<NodeId> {
+    let mut scores = vec![0_u64; graph.node_count()];
+    let mut previous = vec![None; graph.node_count()];
+
+    for node_id in topology.topological_order().iter().copied() {
+        let node_score = graph.node(node_id).unwrap().weight.raw();
+        let mut best_parent_score = 0_u64;
+        let mut best_parent = None;
+        for parent in graph.parents(node_id).unwrap().iter().copied() {
+            let candidate_score = scores[parent.to_usize()];
+            if candidate_score > best_parent_score
+                || (candidate_score == best_parent_score
+                    && best_parent.is_none_or(|current| parent < current))
+            {
+                best_parent_score = candidate_score;
+                best_parent = Some(parent);
+            }
+        }
+        scores[node_id.to_usize()] = best_parent_score + node_score;
+        previous[node_id.to_usize()] = best_parent;
+    }
+
+    let mut best_end = None;
+    for node_id in graph.endpoints().structural_sinks().iter().copied() {
+        let score = scores[node_id.to_usize()];
+        if best_end.is_none_or(|current: NodeId| {
+            score > scores[current.to_usize()]
+                || (score == scores[current.to_usize()] && node_id < current)
+        }) {
+            best_end = Some(node_id);
+        }
+    }
+    let mut cursor = best_end.or_else(|| topology.topological_order().last().copied());
+    let mut path = Vec::new();
+    while let Some(node_id) = cursor {
+        path.push(node_id);
+        cursor = previous[node_id.to_usize()];
+    }
+    path.reverse();
+    path
+}
+
+fn base_main_path_candidate_sets_for_test(
+    base: &FtoDag,
+    base_topology: &DagTopology,
+    add: &FtoDag,
+    add_main_path: &[NodeId],
+) -> Vec<AnchorCandidateSet> {
+    let mut sets = Vec::with_capacity(add_main_path.len());
+    for (position, add_node_id) in add_main_path.iter().copied().enumerate() {
+        let add_node = add.node(add_node_id).unwrap();
+        let mut candidates = Vec::new();
+        for base_node_id in base
+            .fragment_index()
+            .nodes_for(&add_node.fragment, add_node.kind)
+            .iter()
+            .copied()
+        {
+            let base_node = base.node(base_node_id).unwrap();
+            candidates.push(AnchorCandidate {
+                node: base_node_id,
+                kind: base_node.kind,
+                coordinate: Some(base_topology.forward_coordinate(base_node_id).unwrap()),
+                reverse_coordinate: Some(base_topology.reverse_coordinate(base_node_id).unwrap()),
+                weight: base_node.weight,
+            });
+        }
+        sets.push(AnchorCandidateSet {
+            position,
+            kind: add_node.kind,
+            fragment: add_node.fragment.clone(),
+            candidates,
+        });
+    }
+    sets
+}
+
+fn anchor_map_from_main_path_for_test(
+    add_main_path: &[NodeId],
+    anchor_path: &AnchorPath,
+) -> AnchorMap {
+    AnchorMap {
+        pairs: anchor_path
+            .decisions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, decision)| match decision {
+                AnchorDecision::Matched(base_node) => Some((add_main_path[index], *base_node)),
+                AnchorDecision::Unmatched(_) => None,
+            })
+            .collect(),
+    }
+}
+
+fn anchor_score_for_test(base: &FtoDag, add: &FtoDag, anchors: &AnchorMap) -> u64 {
+    anchors
+        .pairs
+        .iter()
+        .map(|(add_node, base_node)| {
+            add.node(*add_node).unwrap().weight.raw() + base.node(*base_node).unwrap().weight.raw()
+        })
+        .sum()
+}
+
+fn graph_kind_summary(graph: &FtoDag) -> String {
+    let starts = graph
+        .nodes()
+        .iter()
+        .filter(|node| matches!(node.kind, NodeKind::Start))
+        .count();
+    let internals = graph
+        .nodes()
+        .iter()
+        .filter(|node| matches!(node.kind, NodeKind::Internal))
+        .count();
+    let ends = graph
+        .nodes()
+        .iter()
+        .filter(|node| matches!(node.kind, NodeKind::End))
+        .count();
+    let singletons = graph
+        .nodes()
+        .iter()
+        .filter(|node| matches!(node.kind, NodeKind::Singleton))
+        .count();
+    format!(
+        "start={} internal={} end={} singleton={} roots={} sinks={}",
+        starts,
+        internals,
+        ends,
+        singletons,
+        graph.endpoints().structural_roots().len(),
+        graph.endpoints().structural_sinks().len(),
+    )
+}
+
+fn first_topological_mismatch(count_graph: &FtoDag, trace_graph: &FtoDag) -> String {
+    let count_len = count_graph.node_count();
+    let trace_len = trace_graph.node_count();
+    let shared = count_len.min(trace_len);
+    for index in 0..shared {
+        let count_node = &count_graph.nodes()[index];
+        let trace_node = &trace_graph.nodes()[index];
+        if count_node.fragment != trace_node.fragment
+            || count_node.kind != trace_node.kind
+            || count_node.weight != trace_node.weight
+        {
+            let count_window = node_window(count_graph, index, 3);
+            let trace_window = node_window(trace_graph, index, 3);
+            return format!(
+                "index={} count_node={:?}/{:?}/{:?} trace_node={:?}/{:?}/{:?} count_window={:?} trace_window={:?}",
+                index,
+                count_node.fragment,
+                count_node.kind,
+                count_node.weight,
+                trace_node.fragment,
+                trace_node.kind,
+                trace_node.weight,
+                count_window,
+                trace_window
+            );
+        }
+    }
+    if count_len != trace_len {
+        return format!(
+            "all shared prefix nodes match; lengths differ count={} trace={}",
+            count_len, trace_len
+        );
+    }
+    "none".to_string()
+}
+
+fn node_window(graph: &FtoDag, center: usize, radius: usize) -> Vec<String> {
+    let start = center.saturating_sub(radius);
+    let end = (center + radius + 1).min(graph.node_count());
+    graph.nodes()[start..end]
+        .iter()
+        .map(|node| {
+            format!(
+                "{}:{:?}:{:?}:{:?}",
+                node.id.to_usize(),
+                node.fragment,
+                node.kind,
+                node.weight
+            )
+        })
+        .collect()
+}
+
+fn fragment_kind_count_deltas(count_graph: &FtoDag, trace_graph: &FtoDag) -> Vec<String> {
+    let mut count_map = HashMap::<String, usize>::new();
+    let mut trace_map = HashMap::<String, usize>::new();
+    for node in count_graph.nodes() {
+        *count_map
+            .entry(format!("{:?}|{:?}", node.fragment, node.kind))
+            .or_insert(0) += 1;
+    }
+    for node in trace_graph.nodes() {
+        *trace_map
+            .entry(format!("{:?}|{:?}", node.fragment, node.kind))
+            .or_insert(0) += 1;
+    }
+    let mut keys = trace_map.keys().cloned().collect::<Vec<_>>();
+    keys.sort_unstable();
+    let mut deltas = keys
+        .into_iter()
+        .filter_map(|key| {
+            let trace = trace_map.get(&key).copied().unwrap_or(0);
+            let count = count_map.get(&key).copied().unwrap_or(0);
+            (trace != count).then(|| (trace.saturating_sub(count), trace, count, key))
+        })
+        .collect::<Vec<_>>();
+    deltas.sort_by(|left, right| right.cmp(left));
+    deltas
+        .into_iter()
+        .take(12)
+        .map(|(delta, trace, count, key)| {
+            format!("key={key} trace_count={trace} count_count={count} trace_minus_count={delta}")
+        })
+        .collect()
+}
+
+fn graph_key_groups(graph: &FtoDag) -> HashMap<String, GraphKeyGroup> {
+    let topology = DagTopology::try_from_graph(graph).expect("graph is acyclic for diff analysis");
+    let mut groups = HashMap::new();
+    for node_id in topology.topological_order().iter().copied() {
+        let node = graph.node(node_id).expect("diff node exists");
+        let key = format!(
+            "fragment={:?}|kind={:?}|forward={}|reverse={}",
+            node.fragment,
+            node.kind,
+            topology
+                .forward_coordinate(node_id)
+                .expect("forward coordinate exists")
+                .raw(),
+            topology
+                .reverse_coordinate(node_id)
+                .expect("reverse coordinate exists")
+                .raw(),
+        );
+        let group = groups.entry(key).or_insert_with(|| GraphKeyGroup {
+            total_weight: 0,
+            neighborhoods: Vec::new(),
+        });
+        group.total_weight += node.weight.raw();
+        group.neighborhoods.push(GraphNodeNeighborhood {
+            node_id,
+            weight: node.weight.raw(),
+            parents: graph
+                .parents(node_id)
+                .expect("diff parents exist")
+                .iter()
+                .copied()
+                .map(|parent| node_signature(graph, &topology, parent))
+                .collect(),
+            children: graph
+                .children(node_id)
+                .expect("diff children exist")
+                .iter()
+                .copied()
+                .map(|child| node_signature(graph, &topology, child))
+                .collect(),
+        });
+    }
+    for group in groups.values_mut() {
+        group
+            .neighborhoods
+            .sort_by_key(|neighborhood| neighborhood.node_id.to_usize());
+    }
+    groups
+}
+
+fn node_signature(graph: &FtoDag, topology: &DagTopology, node_id: NodeId) -> String {
+    let node = graph.node(node_id).expect("signature node exists");
+    format!(
+        "{}:{:?}:{:?}:f{}:r{}",
+        node_id.to_usize(),
+        node.fragment,
+        node.kind,
+        topology
+            .forward_coordinate(node_id)
+            .expect("forward coordinate exists")
+            .raw(),
+        topology
+            .reverse_coordinate(node_id)
+            .expect("reverse coordinate exists")
+            .raw(),
+    )
+}
+
+fn format_node_neighborhood(node: &GraphNodeNeighborhood) -> String {
+    format!(
+        "id={} weight={} parents={:?} children={:?}",
+        node.node_id.to_usize(),
+        node.weight,
+        node.parents,
+        node.children,
+    )
+}
+
+fn neighborhood_signature(node: &GraphNodeNeighborhood) -> String {
+    format!(
+        "weight={} parents={:?} children={:?}",
+        node.weight, node.parents, node.children
+    )
+}
+
 fn assert_endpoint_index_eq(left: &EndpointIndex, right: &EndpointIndex) {
     let mut left_sequence_starts = left.sequence_starts().to_vec();
     let mut right_sequence_starts = right.sequence_starts().to_vec();
@@ -1233,6 +2419,51 @@ fn assert_endpoint_index_eq(left: &EndpointIndex, right: &EndpointIndex) {
     );
     assert_eq!(left_roots, right_roots, "structural roots differ");
     assert_eq!(left_sinks, right_sinks, "structural sinks differ");
+}
+
+fn endpoint_index_difference(left: &EndpointIndex, right: &EndpointIndex) -> String {
+    let mut left_sequence_starts = left.sequence_starts().to_vec();
+    let mut right_sequence_starts = right.sequence_starts().to_vec();
+    let mut left_sequence_ends = left.sequence_ends().to_vec();
+    let mut right_sequence_ends = right.sequence_ends().to_vec();
+    let mut left_roots = left.structural_roots().to_vec();
+    let mut right_roots = right.structural_roots().to_vec();
+    let mut left_sinks = left.structural_sinks().to_vec();
+    let mut right_sinks = right.structural_sinks().to_vec();
+    left_sequence_starts.sort_unstable();
+    right_sequence_starts.sort_unstable();
+    left_sequence_ends.sort_unstable();
+    right_sequence_ends.sort_unstable();
+    left_roots.sort_unstable();
+    right_roots.sort_unstable();
+    left_sinks.sort_unstable();
+    right_sinks.sort_unstable();
+
+    if left_sequence_starts != right_sequence_starts {
+        return format!(
+            "sequence starts differ: left={:?} right={:?}",
+            left_sequence_starts, right_sequence_starts
+        );
+    }
+    if left_sequence_ends != right_sequence_ends {
+        return format!(
+            "sequence ends differ: left={:?} right={:?}",
+            left_sequence_ends, right_sequence_ends
+        );
+    }
+    if left_roots != right_roots {
+        return format!(
+            "roots differ: left={:?} right={:?}",
+            left_roots, right_roots
+        );
+    }
+    if left_sinks != right_sinks {
+        return format!(
+            "sinks differ: left={:?} right={:?}",
+            left_sinks, right_sinks
+        );
+    }
+    "none".to_string()
 }
 
 fn seconds(duration: Duration) -> f64 {

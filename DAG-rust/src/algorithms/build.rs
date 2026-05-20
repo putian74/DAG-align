@@ -1,5 +1,6 @@
 //! Incremental sequence-to-FTO-DAG construction interfaces.
 
+use crate::algorithms::postprocess::{SecondaryMergeConfig, secondary_merge_graph};
 use crate::foundations::error::DagError;
 use crate::foundations::error::Result;
 use crate::foundations::id::{
@@ -409,6 +410,10 @@ impl FtoDagBuilder {
 
     pub fn into_graph(self) -> FtoDag {
         self.graph
+    }
+
+    pub fn finalize_graph(self) -> Result<FtoDag> {
+        secondary_merge_graph(self.graph, SecondaryMergeConfig::default())
     }
 
     pub fn initialize_from_encoded<E: FragmentEncoder>(

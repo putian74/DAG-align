@@ -3,9 +3,10 @@
 use crate::algorithms::build::{
     BuildConfig, FtoDagBuilder, SimilarityThreshold, TopologyUpdateStrategy,
 };
-use crate::foundations::error::Result;
+use crate::foundations::error::{DagError, Result};
 use crate::foundations::id::{GraphId, NodeId};
 use crate::graph_model::graph::FtoDag;
+use crate::graph_model::provenance::ProvenanceStorageStrategy;
 use crate::sequence_model::fragment::{FragmentOccurrence, PathPositionKind};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -71,16 +72,52 @@ pub enum MergeDecision {
     Reject(RejectedMerge),
 }
 
-pub fn merge_graphs(base: FtoDag, add: FtoDag, config: MergeConfig) -> Result<FtoDag> {
-    if base.fragment_len() != add.fragment_len() {
+pub fn merge_graphs(left: FtoDag, right: FtoDag, config: MergeConfig) -> Result<FtoDag> {
+    if left.fragment_len() != right.fragment_len() {
         return Err(crate::foundations::error::DagError::InvalidStorage(
             format!(
                 "cannot merge graphs with fragment lengths {} and {}",
-                base.fragment_len(),
-                add.fragment_len()
+                left.fragment_len(),
+                right.fragment_len()
             ),
         ));
     }
+    if left.provenance_storage_strategy() != right.provenance_storage_strategy() {
+        return Err(crate::foundations::error::DagError::InvalidStorage(
+            format!(
+                "cannot merge graphs with different provenance storage {:?} and {:?}",
+                left.provenance_storage_strategy(),
+                right.provenance_storage_strategy()
+            ),
+        ));
+    }
+    match left.provenance_storage_strategy() {
+        ProvenanceStorageStrategy::TracePaths => replay_trace_path_graphs(left, right, config),
+        ProvenanceStorageStrategy::CountOnly => merge_count_only_graphs(left, right),
+        ProvenanceStorageStrategy::FullRecords | ProvenanceStorageStrategy::Packed32 => {
+            Err(DagError::UnsupportedOperation(
+                "merge_graphs currently supports TracePaths and CountOnly provenance storage",
+            ))
+        }
+    }
+}
+
+pub fn merge_trace_path_graphs_as_count_only(
+    left: FtoDag,
+    right: FtoDag,
+    config: MergeConfig,
+) -> Result<FtoDag> {
+    if left.provenance_storage_strategy() != ProvenanceStorageStrategy::TracePaths
+        || right.provenance_storage_strategy() != ProvenanceStorageStrategy::TracePaths
+    {
+        return Err(DagError::InvalidStorage(
+            "merge_trace_path_graphs_as_count_only requires TracePaths inputs".to_string(),
+        ));
+    }
+    merge_graphs(left, right, config)?.to_count_only()
+}
+
+fn replay_trace_path_graphs(base: FtoDag, add: FtoDag, config: MergeConfig) -> Result<FtoDag> {
     let base_sequence_offset = base.sequence_trace_paths()?.len();
     let add_trace_paths = add.sequence_trace_paths()?;
 
@@ -102,7 +139,13 @@ pub fn merge_graphs(base: FtoDag, add: FtoDag, config: MergeConfig) -> Result<Ft
         builder.add_sequence_from_occurrences(sequence_id, occurrences)?;
     }
 
-    Ok(builder.into_graph())
+    builder.finalize_graph()
+}
+
+fn merge_count_only_graphs(_left: FtoDag, _right: FtoDag) -> Result<FtoDag> {
+    Err(DagError::UnsupportedOperation(
+        "native CountOnly graph merge is a stub until skeleton/corridor merge sketches are implemented",
+    ))
 }
 
 fn occurrences_from_trace_path(

@@ -50,6 +50,21 @@ _REQUIRED_GRAPH_ARRAYS = (
     "node_window_right",
 )
 
+_OPTIONAL_GRAPH_EXTRA_ARRAYS = (
+    "sequence_id",
+    "sequence_name_offset",
+    "sequence_name_bytes",
+    "source_packed",
+    "source_sequence_id",
+    "source_position",
+    "node_source_offset",
+    "node_source_len",
+    "ref_node_ids",
+    "ref_sequence_symbols",
+    "insert_region_left",
+    "insert_region_right",
+)
+
 
 @dataclass(frozen=True)
 class LoadedInitialPhmmArtifact:
@@ -114,6 +129,18 @@ def _load_optional_array(root: Path, spec: Optional[ArraySpec]) -> Optional[np.n
         return _load_array(root, spec)
     except FileNotFoundError:
         return None
+
+
+def _decode_utf8_table(offsets: np.ndarray, payload: np.ndarray) -> list[str]:
+    byte_buffer = payload.tobytes()
+    names: list[str] = []
+    for index in range(int(offsets.shape[0]) - 1):
+        start = int(offsets[index])
+        end = int(offsets[index + 1])
+        if start < 0 or end < start or end > len(byte_buffer):
+            raise ArtifactValidationError("sequence_name offsets exceed sequence_name_bytes")
+        names.append(byte_buffer[start:end].decode("utf-8"))
+    return names
 
 
 class TensorGraphArtifactLoader:
@@ -199,6 +226,21 @@ class TensorGraphArtifactLoader:
                 length=_load_array(self.root, manifest.arrays["edge_state_overlap_len"]),
             )
 
+        extra_arrays = {
+            name: array
+            for name in _OPTIONAL_GRAPH_EXTRA_ARRAYS
+            if (array := _load_optional_array(self.root, manifest.arrays.get(name))) is not None
+        }
+        if (
+            "sequence_name_offset" in extra_arrays
+            and "sequence_name_bytes" in extra_arrays
+        ):
+            extra_arrays["sequence_names"] = _decode_utf8_table(
+                extra_arrays["sequence_name_offset"],
+                extra_arrays["sequence_name_bytes"],
+            )
+        extra_arrays["sequence_count"] = int(manifest.sequence_count)
+
         graph = TensorDag(
             metadata=manifest.metadata,
             node_symbol=_load_array(self.root, manifest.arrays["node_symbol"]),
@@ -222,6 +264,7 @@ class TensorGraphArtifactLoader:
                 "manifest_arrays": tuple(manifest.arrays.keys()),
                 "symbol_encoding": dict(manifest.symbol_encoding),
                 "source_format": manifest.source_format.value,
+                **extra_arrays,
             },
         )
         graph.validate()

@@ -12,14 +12,14 @@ pub use crate::algorithms::build::{
 };
 pub use crate::algorithms::merge::{
     AnchorMap, MergeConfig, MergeDecision, MergeOrderingPolicy, MergeOrientation, MergePlan,
-    MergeStats, NodeRemap, RejectedMerge, merge_graphs,
+    MergeStats, NodeRemap, RejectedMerge, merge_graphs, merge_trace_path_graphs_as_count_only,
 };
 pub use crate::algorithms::ordering::{
     GraphSketch, OrderingPolicy, PairingPlan, SequenceSketch, SimilarityBucket, SimilaritySketch,
     SketchConfig,
 };
 pub use crate::algorithms::postprocess::{
-    PostprocessStats, ResolutionConfig, SecondaryMergeConfig,
+    PostprocessStats, ResolutionConfig, SecondaryMergeConfig, secondary_merge_graph,
 };
 pub use crate::algorithms::scheduler::{
     BuildScheduler, ChunkPlan, MemoryBudget, MergeRoundPlan, ProgressEvent, ProgressSink,

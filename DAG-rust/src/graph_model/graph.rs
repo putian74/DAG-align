@@ -455,6 +455,24 @@ impl NodeProvenanceStorage {
         Ok(())
     }
 
+    fn add_count(&mut self, node_id: NodeId, count: u64) -> Result<()> {
+        let node_index = node_id.to_usize();
+        match self {
+            Self::CountOnly(counts) => {
+                let slot = counts
+                    .get_mut(node_index)
+                    .ok_or(DagError::MissingNode { node: node_index })?;
+                *slot += count;
+                Ok(())
+            }
+            Self::Full(_) | Self::Packed32(_) | Self::TracePaths(_) => {
+                Err(DagError::UnsupportedOperation(
+                    "bulk provenance count transfer is only supported with CountOnly provenance storage",
+                ))
+            }
+        }
+    }
+
     fn record_count(&self, node_id: NodeId) -> Result<usize> {
         let node_index = node_id.to_usize();
         match self {
@@ -650,6 +668,14 @@ impl FtoDag {
         self.edge_index.strategy()
     }
 
+    pub fn to_count_only(&self) -> Result<Self> {
+        let mut snapshot = self.snapshot();
+        snapshot.provenance = ProvenanceSnapshot::CountOnly(
+            self.nodes.iter().map(|node| node.weight.raw()).collect(),
+        );
+        Self::from_snapshot(snapshot)
+    }
+
     pub fn provenance_records(&self, node_id: NodeId) -> Result<Vec<ProvenanceRecord>> {
         self.node_provenance.records(node_id)
     }
@@ -760,6 +786,22 @@ impl FtoDag {
         node.provenance_range =
             ProvenanceRange::new(0, self.node_provenance.record_count(node_id)? as u64);
         node.weight = Weight::new(node.weight.raw() + 1);
+        Ok(())
+    }
+
+    pub fn add_provenance_count(&mut self, node_id: NodeId, count: u64) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let node_index = node_id.to_usize();
+        self.node_provenance.add_count(node_id, count)?;
+        let node = self
+            .nodes
+            .get_mut(node_index)
+            .ok_or(DagError::MissingNode { node: node_index })?;
+        node.provenance_range =
+            ProvenanceRange::new(0, self.node_provenance.record_count(node_id)? as u64);
+        node.weight = Weight::new(node.weight.raw() + count);
         Ok(())
     }
 

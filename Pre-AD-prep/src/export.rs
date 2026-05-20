@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -316,6 +316,211 @@ pub fn write_npy_2d<T: NpyElement>(
         ));
     }
     write_npy(path, values, &[rows, cols])
+}
+
+pub fn read_npy_1d_u64(path: impl AsRef<Path>) -> Result<Vec<u64>> {
+    read_npy_1d(path, DataType::U64, |bytes| {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(bytes);
+        Ok(u64::from_le_bytes(raw))
+    })
+}
+
+pub fn read_npy_2d_f64(path: impl AsRef<Path>) -> Result<(usize, usize, Vec<f64>)> {
+    read_npy_2d(path, DataType::F64, |bytes| {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(bytes);
+        Ok(f64::from_le_bytes(raw))
+    })
+}
+
+fn read_npy_1d<T>(
+    path: impl AsRef<Path>,
+    expected_dtype: DataType,
+    decode: impl Fn(&[u8]) -> Result<T>,
+) -> Result<Vec<T>> {
+    let path = path.as_ref();
+    let mut file = fs::File::open(path)?;
+    let header = read_npy_header(&mut file, path, expected_dtype)?;
+    if header.shape.len() != 1 {
+        return Err(PreAdPrepError::Validation(format!(
+            "NumPy array {} must be one-dimensional, found shape {:?}",
+            path.display(),
+            header.shape
+        )));
+    }
+    let payload = fs::read(path)?;
+    let payload = &payload[header.data_offset..];
+    let element_size = dtype_width(expected_dtype);
+    if payload.len() % element_size != 0 {
+        return Err(PreAdPrepError::Validation(format!(
+            "NumPy payload length {} is not divisible by element size {} for {}",
+            payload.len(),
+            element_size,
+            path.display()
+        )));
+    }
+    payload
+        .chunks_exact(element_size)
+        .map(decode)
+        .collect::<Result<Vec<_>>>()
+}
+
+fn read_npy_2d<T>(
+    path: impl AsRef<Path>,
+    expected_dtype: DataType,
+    decode: impl Fn(&[u8]) -> Result<T>,
+) -> Result<(usize, usize, Vec<T>)> {
+    let path = path.as_ref();
+    let mut file = fs::File::open(path)?;
+    let header = read_npy_header(&mut file, path, expected_dtype)?;
+    if header.shape.len() != 2 {
+        return Err(PreAdPrepError::Validation(format!(
+            "NumPy array {} must be two-dimensional, found shape {:?}",
+            path.display(),
+            header.shape
+        )));
+    }
+    let payload = fs::read(path)?;
+    let payload = &payload[header.data_offset..];
+    let element_size = dtype_width(expected_dtype);
+    if payload.len() % element_size != 0 {
+        return Err(PreAdPrepError::Validation(format!(
+            "NumPy payload length {} is not divisible by element size {} for {}",
+            payload.len(),
+            element_size,
+            path.display()
+        )));
+    }
+    let values = payload
+        .chunks_exact(element_size)
+        .map(decode)
+        .collect::<Result<Vec<_>>>()?;
+    if header.shape[0].checked_mul(header.shape[1]) != Some(values.len()) {
+        return Err(PreAdPrepError::Validation(format!(
+            "NumPy array {} shape {:?} does not match payload element count {}",
+            path.display(),
+            header.shape,
+            values.len()
+        )));
+    }
+    Ok((header.shape[0], header.shape[1], values))
+}
+
+fn read_npy_header(
+    file: &mut fs::File,
+    path: &Path,
+    expected_dtype: DataType,
+) -> Result<NpyHeader> {
+    let mut magic = [0u8; 6];
+    file.read_exact(&mut magic)?;
+    if &magic != b"\x93NUMPY" {
+        return Err(PreAdPrepError::Validation(format!(
+            "file is not a NumPy .npy array: {}",
+            path.display()
+        )));
+    }
+
+    let mut version = [0u8; 2];
+    file.read_exact(&mut version)?;
+    let header_len = match version {
+        [1, 0] => {
+            let mut len_bytes = [0u8; 2];
+            file.read_exact(&mut len_bytes)?;
+            u16::from_le_bytes(len_bytes) as usize
+        }
+        [2, 0] | [3, 0] => {
+            let mut len_bytes = [0u8; 4];
+            file.read_exact(&mut len_bytes)?;
+            u32::from_le_bytes(len_bytes) as usize
+        }
+        other => {
+            return Err(PreAdPrepError::Unsupported(format!(
+                "unsupported .npy version {}.{}",
+                other[0], other[1]
+            )));
+        }
+    };
+
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact(&mut header_bytes)?;
+    let header = String::from_utf8(header_bytes).map_err(|error| {
+        PreAdPrepError::Validation(format!("invalid .npy header utf8: {error}"))
+    })?;
+
+    let descr = extract_header_value(&header, "'descr':")?
+        .trim_matches('\'')
+        .to_string();
+    if !expected_dtype.matches_npy_descr(&descr) {
+        return Err(PreAdPrepError::Validation(format!(
+            "NumPy array {} has dtype {}, expected {}",
+            path.display(),
+            descr,
+            expected_dtype.as_manifest_str()
+        )));
+    }
+    let shape = parse_shape(&extract_header_value(&header, "'shape':")?)?;
+    Ok(NpyHeader {
+        data_offset: 6 + 2 + if version == [1, 0] { 2 } else { 4 } + header_len,
+        shape,
+    })
+}
+
+struct NpyHeader {
+    data_offset: usize,
+    shape: Vec<usize>,
+}
+
+fn dtype_width(dtype: DataType) -> usize {
+    match dtype {
+        DataType::U8 | DataType::Utf8Bytes => 1,
+        DataType::U16 => 2,
+        DataType::U32 | DataType::F32 => 4,
+        DataType::U64 | DataType::I64 | DataType::F64 => 8,
+    }
+}
+
+fn extract_header_value(header: &str, key: &str) -> Result<String> {
+    let start = header
+        .find(key)
+        .ok_or_else(|| PreAdPrepError::Validation(format!("NumPy header missing key {key}")))?
+        + key.len();
+    let remainder = &header[start..];
+    let trimmed = remainder.trim_start();
+    if key == "'shape':" {
+        let end = trimmed.find(')').ok_or_else(|| {
+            PreAdPrepError::Validation("NumPy header shape tuple is not closed".into())
+        })?;
+        Ok(trimmed[..=end].trim().to_string())
+    } else {
+        let end = trimmed.find(',').ok_or_else(|| {
+            PreAdPrepError::Validation(format!("NumPy header key {key} has no terminator"))
+        })?;
+        Ok(trimmed[..end].trim().to_string())
+    }
+}
+
+fn parse_shape(raw: &str) -> Result<Vec<usize>> {
+    let inner = raw
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    inner
+        .split(',')
+        .filter_map(|item| {
+            let item = item.trim();
+            (!item.is_empty()).then_some(item)
+        })
+        .map(|item| {
+            item.parse::<usize>().map_err(|error| {
+                PreAdPrepError::Validation(format!("invalid NumPy shape item {item}: {error}"))
+            })
+        })
+        .collect()
 }
 
 fn write_npy<T: NpyElement>(path: impl AsRef<Path>, values: &[T], shape: &[usize]) -> Result<()> {
