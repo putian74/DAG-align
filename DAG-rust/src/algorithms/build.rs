@@ -10,9 +10,7 @@ use crate::graph_model::graph::{EdgeIndexStrategy, EdgeKey, FtoDag, NodeKind};
 use crate::graph_model::provenance::{ProvenanceRecord, ProvenanceStorageStrategy};
 use crate::graph_model::topology::DagTopology;
 use crate::sequence_model::alphabet::Alphabet;
-use crate::sequence_model::fragment::{
-    FragmentEncoder, FragmentKey, FragmentOccurrence, PathPositionKind,
-};
+use crate::sequence_model::fragment::{FragmentEncoder, FragmentOccurrence, PathPositionKind};
 use crate::sequence_model::sequence::{EncodedSequence, SequenceInput};
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -137,7 +135,6 @@ pub struct AnchorCandidate {
 pub struct AnchorCandidateSet {
     pub position: usize,
     pub kind: NodeKind,
-    pub fragment: FragmentKey,
     pub candidates: Vec<AnchorCandidate>,
 }
 
@@ -735,7 +732,7 @@ impl FtoDagBuilder {
             if !self
                 .graph
                 .fragment_index()
-                .nodes_for(&occurrence.key, node_kind)
+                .nodes_for_stored(&occurrence.key, node_kind)
                 .is_empty()
             {
                 mergeable += 1;
@@ -782,7 +779,10 @@ impl FtoDagBuilder {
         let mut sets = Vec::with_capacity(occurrences.len());
         for occurrence in occurrences {
             let kind = node_kind_for_path_position(occurrence.kind);
-            let nodes = self.graph.fragment_index().nodes_for(&occurrence.key, kind);
+            let nodes = self
+                .graph
+                .fragment_index()
+                .nodes_for_stored(&occurrence.key, kind);
             let mut candidates = Vec::with_capacity(nodes.len());
             for node_id in nodes.iter().copied() {
                 if sequence_id
@@ -810,7 +810,6 @@ impl FtoDagBuilder {
             sets.push(AnchorCandidateSet {
                 position: occurrence.position,
                 kind,
-                fragment: occurrence.key.clone(),
                 candidates,
             });
         }
@@ -826,7 +825,10 @@ impl FtoDagBuilder {
         let mut sets = Vec::with_capacity(occurrences.len());
         for occurrence in occurrences {
             let kind = node_kind_for_path_position(occurrence.kind);
-            let nodes = self.graph.fragment_index().nodes_for(&occurrence.key, kind);
+            let nodes = self
+                .graph
+                .fragment_index()
+                .nodes_for_stored(&occurrence.key, kind);
             let mut candidates = Vec::with_capacity(nodes.len());
             for node_id in nodes.iter().copied() {
                 if sequence_id
@@ -867,7 +869,6 @@ impl FtoDagBuilder {
             sets.push(AnchorCandidateSet {
                 position: occurrence.position,
                 kind,
-                fragment: occurrence.key.clone(),
                 candidates,
             });
         }
@@ -913,7 +914,6 @@ impl FtoDagBuilder {
                 candidate_sets.push(AnchorCandidateSet {
                     position: occurrence.position,
                     kind,
-                    fragment: occurrence.key.clone(),
                     candidates: Vec::new(),
                 });
                 continue;
@@ -988,7 +988,10 @@ impl FtoDagBuilder {
         kind: NodeKind,
         cache: &TopologyCache,
     ) -> Result<AnchorCandidateSet> {
-        let nodes = self.graph.fragment_index().nodes_for(&occurrence.key, kind);
+        let nodes = self
+            .graph
+            .fragment_index()
+            .nodes_for_stored(&occurrence.key, kind);
         let mut candidates = Vec::with_capacity(nodes.len());
         for node_id in nodes.iter().copied() {
             if sequence_id
@@ -1002,7 +1005,6 @@ impl FtoDagBuilder {
         Ok(AnchorCandidateSet {
             position: occurrence.position,
             kind,
-            fragment: occurrence.key.clone(),
             candidates,
         })
     }
@@ -1732,6 +1734,7 @@ impl CoordinateProvider for TopologyCache {
 mod tests {
     use super::*;
     use crate::sequence_model::alphabet::SymbolId;
+    use crate::sequence_model::fragment::FragmentKey;
 
     fn key(raw: u16) -> FragmentKey {
         FragmentKey::symbols(vec![SymbolId::new(raw)])

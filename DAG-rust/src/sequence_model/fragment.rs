@@ -2,6 +2,7 @@
 
 use crate::foundations::bit_encoding::{BitWidth, PackedWindow};
 use crate::foundations::error::{DagError, Result};
+use crate::graph_model::graph::StoredFragmentKey;
 use crate::sequence_model::alphabet::SymbolId;
 use crate::sequence_model::sequence::EncodedSequence;
 
@@ -169,11 +170,11 @@ impl FragmentEncoder for DefaultFragmentEncoder {
             occurrences.push(FragmentOccurrence {
                 position,
                 kind: path_position_kind(position, window_count),
-                key: FragmentKey::PackedInline {
+                key: StoredFragmentKey::from(FragmentKey::PackedInline {
                     bits_per_symbol: bits,
                     len: fragment_len as u16,
                     value,
-                },
+                }),
             });
         }
         Ok(occurrences)
@@ -184,7 +185,7 @@ impl FragmentEncoder for DefaultFragmentEncoder {
 pub struct FragmentOccurrence {
     pub position: usize,
     pub kind: PathPositionKind,
-    pub key: FragmentKey,
+    pub key: StoredFragmentKey,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -263,7 +264,7 @@ impl<E: FragmentEncoder> Iterator for FragmentOccurrences<'_, E> {
             result.map(|(position, key)| FragmentOccurrence {
                 position,
                 kind: path_position_kind(position, self.window_count),
-                key,
+                key: StoredFragmentKey::from(key),
             })
         })
     }

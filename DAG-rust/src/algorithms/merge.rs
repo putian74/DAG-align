@@ -158,7 +158,7 @@ fn occurrences_from_trace_path(
         occurrences.push(FragmentOccurrence {
             position,
             kind: path_position_kind(position, trace_path.len()),
-            key: node.fragment.to_fragment_key(),
+            key: node.fragment.clone(),
         });
     }
     Ok(occurrences)

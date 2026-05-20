@@ -244,7 +244,6 @@ fn collect_anchor_candidates_includes_coordinates_and_weights() {
 
 #[test]
 fn monotone_anchor_selection_keeps_increasing_injective_chain() {
-    let fragment = FragmentKey::symbols(vec![SymbolId::new(0)]);
     let n0 = NodeId::new(0);
     let n1 = NodeId::new(1);
     let n2 = NodeId::new(2);
@@ -252,7 +251,6 @@ fn monotone_anchor_selection_keeps_increasing_injective_chain() {
         AnchorCandidateSet {
             position: 0,
             kind: NodeKind::Internal,
-            fragment: fragment.clone(),
             candidates: vec![AnchorCandidate {
                 node: n1,
                 kind: NodeKind::Internal,
@@ -264,7 +262,6 @@ fn monotone_anchor_selection_keeps_increasing_injective_chain() {
         AnchorCandidateSet {
             position: 1,
             kind: NodeKind::Internal,
-            fragment: fragment.clone(),
             candidates: vec![
                 AnchorCandidate {
                     node: n0,
@@ -315,7 +312,6 @@ fn continuity_scoring_prefers_existing_path_over_isolated_high_weight_hits() {
         AnchorCandidateSet {
             position: 0,
             kind: NodeKind::Internal,
-            fragment: fragment.clone(),
             candidates: vec![
                 AnchorCandidate {
                     node: coherent_left,
@@ -336,7 +332,6 @@ fn continuity_scoring_prefers_existing_path_over_isolated_high_weight_hits() {
         AnchorCandidateSet {
             position: 1,
             kind: NodeKind::Internal,
-            fragment: fragment.clone(),
             candidates: vec![
                 AnchorCandidate {
                     node: coherent_right,
@@ -400,7 +395,6 @@ fn bounded_reuse_prefers_coordinate_safe_existing_path_candidate() {
     let candidate_set = AnchorCandidateSet {
         position: 1,
         kind: NodeKind::Internal,
-        fragment: fragment.clone(),
         candidates: vec![
             AnchorCandidate {
                 node: coherent,

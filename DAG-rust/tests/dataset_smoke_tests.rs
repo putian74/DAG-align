@@ -2155,7 +2155,6 @@ fn base_main_path_candidate_sets_for_test(
         sets.push(AnchorCandidateSet {
             position,
             kind: add_node.kind,
-            fragment: add_node.fragment.to_fragment_key(),
             candidates,
         });
     }
