@@ -14,8 +14,8 @@ pub enum TraversalDirection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DagTopology {
     node_count: usize,
-    parents: Vec<Vec<NodeId>>,
-    children: Vec<Vec<NodeId>>,
+    parents: PackedAdjacency,
+    children: PackedAdjacency,
     topological_order: Vec<NodeId>,
     forward_coordinates: Vec<TopologicalCoordinate>,
     reverse_coordinates: Vec<TopologicalCoordinate>,
@@ -28,19 +28,10 @@ impl DagTopology {
 
     pub fn try_from_graph(graph: &FtoDag) -> Result<Self> {
         let node_count = graph.node_count();
-        let mut parents = vec![Vec::new(); node_count];
-        let mut children = vec![Vec::new(); node_count];
-        for edge in graph.edges() {
-            let parent = edge.key.parent.to_usize();
-            let child = edge.key.child.to_usize();
-            if parent >= node_count || child >= node_count {
-                return Err(DagError::InvalidEdge { parent, child });
-            }
-            children[parent].push(edge.key.child);
-            parents[child].push(edge.key.parent);
-        }
+        let parents = PackedAdjacency::from_graph_edges(graph, false)?;
+        let children = PackedAdjacency::from_graph_edges(graph, true)?;
 
-        let topological_order = topological_sort(&parents, &children)?;
+        let topological_order = topological_sort(node_count, &parents, &children)?;
         let forward_coordinates = forward_coordinates(&topological_order, &parents);
         let reverse_coordinates = reverse_coordinates(&topological_order, &children);
 
@@ -57,8 +48,8 @@ impl DagTopology {
     pub fn empty() -> Self {
         Self {
             node_count: 0,
-            parents: Vec::new(),
-            children: Vec::new(),
+            parents: PackedAdjacency::empty(),
+            children: PackedAdjacency::empty(),
             topological_order: Vec::new(),
             forward_coordinates: Vec::new(),
             reverse_coordinates: Vec::new(),
@@ -70,23 +61,11 @@ impl DagTopology {
     }
 
     pub fn parents(&self, node: NodeId) -> Result<Parents<'_>> {
-        let parents = self
-            .parents
-            .get(node.to_usize())
-            .ok_or(DagError::MissingNode {
-                node: node.to_usize(),
-            })?;
-        Ok(Parents(parents.iter()))
+        Ok(Parents(self.parents.neighbors(node)?.iter()))
     }
 
     pub fn children(&self, node: NodeId) -> Result<Children<'_>> {
-        let children = self
-            .children
-            .get(node.to_usize())
-            .ok_or(DagError::MissingNode {
-                node: node.to_usize(),
-            })?;
-        Ok(Children(children.iter()))
+        Ok(Children(self.children.neighbors(node)?.iter()))
     }
 
     pub fn topological_order(&self) -> &[NodeId] {
@@ -116,18 +95,26 @@ impl DagTopology {
     }
 }
 
-fn topological_sort(parents: &[Vec<NodeId>], children: &[Vec<NodeId>]) -> Result<Vec<NodeId>> {
-    let mut indegree = parents.iter().map(Vec::len).collect::<Vec<_>>();
+fn topological_sort(
+    node_count: usize,
+    parents: &PackedAdjacency,
+    children: &PackedAdjacency,
+) -> Result<Vec<NodeId>> {
+    let mut indegree = Vec::with_capacity(node_count);
+    for node_index in 0..node_count {
+        let node_id = NodeId::try_from(node_index).expect("node count exceeds NodeId capacity");
+        indegree.push(parents.neighbors(node_id)?.len());
+    }
     let mut queue = indegree
         .iter()
         .enumerate()
         .filter(|(_, degree)| **degree == 0)
         .map(|(node, _)| NodeId::try_from(node).expect("node count exceeds NodeId capacity"))
         .collect::<VecDeque<_>>();
-    let mut order = Vec::with_capacity(parents.len());
+    let mut order = Vec::with_capacity(node_count);
     while let Some(node) = queue.pop_front() {
         order.push(node);
-        for child in &children[node.to_usize()] {
+        for child in children.neighbors(node)? {
             let degree = &mut indegree[child.to_usize()];
             *degree -= 1;
             if *degree == 0 {
@@ -135,17 +122,19 @@ fn topological_sort(parents: &[Vec<NodeId>], children: &[Vec<NodeId>]) -> Result
             }
         }
     }
-    if order.len() == parents.len() {
+    if order.len() == node_count {
         Ok(order)
     } else {
         Err(DagError::CycleDetected)
     }
 }
 
-fn forward_coordinates(order: &[NodeId], parents: &[Vec<NodeId>]) -> Vec<TopologicalCoordinate> {
-    let mut coordinates = vec![TopologicalCoordinate::new(0); parents.len()];
+fn forward_coordinates(order: &[NodeId], parents: &PackedAdjacency) -> Vec<TopologicalCoordinate> {
+    let mut coordinates = vec![TopologicalCoordinate::new(0); parents.node_count()];
     for node in order {
-        let coordinate = parents[node.to_usize()]
+        let coordinate = parents
+            .neighbors(*node)
+            .expect("topology adjacency covers every node")
             .iter()
             .map(|parent| coordinates[parent.to_usize()].raw())
             .max()
@@ -156,10 +145,12 @@ fn forward_coordinates(order: &[NodeId], parents: &[Vec<NodeId>]) -> Vec<Topolog
     coordinates
 }
 
-fn reverse_coordinates(order: &[NodeId], children: &[Vec<NodeId>]) -> Vec<TopologicalCoordinate> {
-    let mut coordinates = vec![TopologicalCoordinate::new(0); children.len()];
+fn reverse_coordinates(order: &[NodeId], children: &PackedAdjacency) -> Vec<TopologicalCoordinate> {
+    let mut coordinates = vec![TopologicalCoordinate::new(0); children.node_count()];
     for node in order.iter().rev() {
-        let coordinate = children[node.to_usize()]
+        let coordinate = children
+            .neighbors(*node)
+            .expect("topology adjacency covers every node")
             .iter()
             .map(|child| coordinates[child.to_usize()].raw())
             .max()
@@ -221,3 +212,96 @@ pub struct Parents<'a>(pub std::slice::Iter<'a, NodeId>);
 pub struct Children<'a>(pub std::slice::Iter<'a, NodeId>);
 pub struct WeightedParents<'a, T>(pub std::slice::Iter<'a, T>);
 pub struct WeightedChildren<'a, T>(pub std::slice::Iter<'a, T>);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PackedAdjacency {
+    offsets: Vec<u32>,
+    nodes: Vec<NodeId>,
+}
+
+impl PackedAdjacency {
+    fn empty() -> Self {
+        Self {
+            offsets: vec![0],
+            nodes: Vec::new(),
+        }
+    }
+
+    fn from_graph_edges(graph: &FtoDag, use_children: bool) -> Result<Self> {
+        let node_count = graph.node_count();
+        let mut counts = vec![0u32; node_count];
+        for edge in graph.edges() {
+            let owner = if use_children {
+                edge.key.parent.to_usize()
+            } else {
+                edge.key.child.to_usize()
+            };
+            if owner >= node_count {
+                return Err(DagError::InvalidEdge {
+                    parent: edge.key.parent.to_usize(),
+                    child: edge.key.child.to_usize(),
+                });
+            }
+            counts[owner] = counts[owner]
+                .checked_add(1)
+                .ok_or(DagError::ValueDoesNotFit {
+                    value: u128::from(counts[owner]) + 1,
+                    bits: 32,
+                })?;
+        }
+        let mut offsets = Vec::with_capacity(node_count + 1);
+        offsets.push(0);
+        let mut running_total = 0u32;
+        for count in &counts {
+            running_total = running_total
+                .checked_add(*count)
+                .ok_or(DagError::ValueDoesNotFit {
+                    value: u128::from(running_total) + u128::from(*count),
+                    bits: 32,
+                })?;
+            offsets.push(running_total);
+        }
+        let mut positions = offsets[..node_count].to_vec();
+        let mut nodes = vec![NodeId::new(0); graph.edges().len()];
+        for edge in graph.edges() {
+            let owner = if use_children {
+                edge.key.parent.to_usize()
+            } else {
+                edge.key.child.to_usize()
+            };
+            let neighbor = if use_children {
+                edge.key.child
+            } else {
+                edge.key.parent
+            };
+            let position = positions[owner] as usize;
+            nodes[position] = neighbor;
+            positions[owner] += 1;
+        }
+        Ok(Self { offsets, nodes })
+    }
+
+    fn node_count(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    fn neighbors(&self, node: NodeId) -> Result<&[NodeId]> {
+        let start = *self
+            .offsets
+            .get(node.to_usize())
+            .ok_or(DagError::MissingNode {
+                node: node.to_usize(),
+            })? as usize;
+        let end = *self
+            .offsets
+            .get(node.to_usize() + 1)
+            .ok_or(DagError::MissingNode {
+                node: node.to_usize(),
+            })? as usize;
+        self.nodes.get(start..end).ok_or(DagError::InvalidRange {
+            start,
+            end,
+            len: self.nodes.len(),
+        })
+    }
+}

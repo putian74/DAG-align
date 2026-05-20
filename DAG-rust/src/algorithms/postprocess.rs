@@ -57,12 +57,14 @@ pub fn secondary_merge_graph_with_stats(
     config: SecondaryMergeConfig,
 ) -> Result<(FtoDag, PostprocessStats)> {
     if !config.use_forward_coordinates && !config.use_reverse_coordinates {
+        graph.compact_storage()?;
         return Ok((graph, PostprocessStats::default()));
     }
     if matches!(
         graph.provenance_storage_strategy(),
         ProvenanceStorageStrategy::CountOnly
     ) {
+        graph.compact_storage()?;
         return Ok((graph, PostprocessStats::default()));
     }
 
@@ -70,6 +72,7 @@ pub fn secondary_merge_graph_with_stats(
     loop {
         let topology = DagTopology::try_from_graph(&graph)?;
         let Some(remap) = build_secondary_merge_remap(&graph, &topology, config)? else {
+            graph.compact_storage()?;
             return Ok((graph, total_stats));
         };
         let merged_nodes = remap

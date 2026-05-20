@@ -24,7 +24,7 @@ pub struct GraphFormatVersion {
 }
 
 impl GraphFormatVersion {
-    pub const CURRENT: Self = Self { major: 0, minor: 2 };
+    pub const CURRENT: Self = Self { major: 0, minor: 3 };
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -423,20 +423,10 @@ fn read_fragment_key(reader: &mut impl Read, path: &Path) -> Result<FragmentKey>
     }
 }
 
-fn write_optional_sequence_ids(
-    writer: &mut impl Write,
-    values: &[Option<SequenceId>],
-    path: &Path,
-) -> Result<()> {
+fn write_optional_sequence_ids(writer: &mut impl Write, values: &[u32], path: &Path) -> Result<()> {
     write_u64(writer, values.len() as u64, path)?;
     for value in values {
-        match value {
-            Some(sequence_id) => {
-                write_u8(writer, 1, path)?;
-                write_u32(writer, sequence_id.raw(), path)?;
-            }
-            None => write_u8(writer, 0, path)?,
-        }
+        write_u32(writer, *value, path)?;
     }
     Ok(())
 }
@@ -445,7 +435,7 @@ fn read_optional_sequence_ids(
     reader: &mut impl Read,
     expected_len: usize,
     path: &Path,
-) -> Result<Vec<Option<SequenceId>>> {
+) -> Result<Vec<u32>> {
     let stored_len = read_usize(reader, path)?;
     if stored_len != expected_len {
         return Err(DagError::InvalidStorage(format!(
@@ -454,16 +444,7 @@ fn read_optional_sequence_ids(
     }
     let mut values = Vec::with_capacity(expected_len);
     for _ in 0..expected_len {
-        match read_u8(reader, path)? {
-            0 => values.push(None),
-            1 => values.push(Some(SequenceId::new(read_u32(reader, path)?))),
-            tag => {
-                return Err(DagError::InvalidStorage(format!(
-                    "unknown optional-sequence-id tag {tag} in {}",
-                    path.display()
-                )));
-            }
-        }
+        values.push(read_u32(reader, path)?);
     }
     Ok(values)
 }
