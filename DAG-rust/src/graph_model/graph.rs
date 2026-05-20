@@ -519,18 +519,18 @@ fn sequence_id_from_marker(marker: u32) -> Option<SequenceId> {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 struct PackedInlineIndexKey {
     kind: NodeKind,
-    bits_per_symbol: u8,
-    len: u16,
-    value: u128,
+    packed_meta: u32,
+    value_lo: u64,
+    value_hi: u64,
 }
 
 impl PackedInlineIndexKey {
     const fn new(kind: NodeKind, bits_per_symbol: u8, len: u16, value: u128) -> Self {
         Self {
             kind,
-            bits_per_symbol,
-            len,
-            value,
+            packed_meta: (bits_per_symbol as u32) | ((len as u32) << 8),
+            value_lo: value as u64,
+            value_hi: (value >> 64) as u64,
         }
     }
 
