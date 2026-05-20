@@ -7,6 +7,7 @@ use crate::graph_model::provenance::{
     PackedProvenanceRecord, ProvenanceRecord, ProvenanceStorageStrategy, ProvenanceTable,
 };
 use crate::sequence_model::fragment::FragmentKey;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, remove_file};
 use std::hash::Hash;
@@ -83,6 +84,10 @@ const TRACE_PATH_FLUSH_NODE_COUNT: usize = 16_384;
 const MISSING_SEQUENCE_MARKER: u32 = u32::MAX;
 static NEXT_TRACE_PATH_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
+type NodeNeighbors = SmallVec<[NodeId; 2]>;
+type FragmentPostingList = SmallVec<[NodeId; 2]>;
+type InlineEdgeList = SmallVec<[InlineEdgeEntry; HYBRID_EDGE_INLINE_LIMIT]>;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct InlineEdgeEntry {
     child: NodeId,
@@ -93,7 +98,7 @@ struct InlineEdgeEntry {
 enum EdgeIndexStorage {
     Global(HashMap<EdgeKey, usize>),
     HybridMutable {
-        inline: Vec<Vec<InlineEdgeEntry>>,
+        inline: Vec<InlineEdgeList>,
         overflow: HashMap<EdgeKey, usize>,
     },
     HybridPacked {
@@ -128,7 +133,7 @@ impl EdgeIndexStorage {
             self.unpack_hybrid();
         }
         if let Self::HybridMutable { inline, .. } = self {
-            inline.push(Vec::new());
+            inline.push(InlineEdgeList::new());
         }
     }
 
@@ -192,7 +197,7 @@ impl EdgeIndexStorage {
         let replacement = match self {
             Self::Global(_) | Self::HybridPacked { .. } => None,
             Self::HybridMutable { inline, overflow } => {
-                let total_entries = inline.iter().map(Vec::len).sum::<usize>();
+                let total_entries = inline.iter().map(InlineEdgeList::len).sum::<usize>();
                 let mut inline_offsets = Vec::with_capacity(inline.len() + 1);
                 inline_offsets.push(0);
                 let mut running_total = 0usize;
@@ -248,7 +253,7 @@ impl EdgeIndexStorage {
         for node_index in 0..node_count {
             let start = inline_offsets[node_index] as usize;
             let end = inline_offsets[node_index + 1] as usize;
-            inline.push(inline_entries[start..end].to_vec());
+            inline.push(inline_entries[start..end].iter().copied().collect());
         }
         *self = Self::HybridMutable { inline, overflow };
     }
@@ -261,8 +266,8 @@ struct PackedAdjacency {
 }
 
 impl PackedAdjacency {
-    fn from_lists(lists: &[Vec<NodeId>]) -> Result<Self> {
-        let total_neighbors = lists.iter().map(Vec::len).sum::<usize>();
+    fn from_lists(lists: &[NodeNeighbors]) -> Result<Self> {
+        let total_neighbors = lists.iter().map(NodeNeighbors::len).sum::<usize>();
         let mut offsets = Vec::with_capacity(lists.len() + 1);
         offsets.push(0);
         let mut running_total = 0usize;
@@ -348,13 +353,13 @@ impl PackedAdjacency {
         })
     }
 
-    fn into_lists(self) -> Vec<Vec<NodeId>> {
+    fn into_lists(self) -> Vec<NodeNeighbors> {
         let node_count = self.offsets.len().saturating_sub(1);
         let mut lists = Vec::with_capacity(node_count);
         for node_index in 0..node_count {
             let start = self.offsets[node_index] as usize;
             let end = self.offsets[node_index + 1] as usize;
-            lists.push(self.nodes[start..end].to_vec());
+            lists.push(self.nodes[start..end].iter().copied().collect());
         }
         lists
     }
@@ -362,7 +367,7 @@ impl PackedAdjacency {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AdjacencyLists {
-    Ragged(Vec<Vec<NodeId>>),
+    Ragged(Vec<NodeNeighbors>),
     Packed(PackedAdjacency),
 }
 
@@ -384,7 +389,7 @@ impl AdjacencyLists {
             Self::Ragged(lists) => {
                 lists
                     .get(node_id.to_usize())
-                    .map(Vec::as_slice)
+                    .map(NodeNeighbors::as_slice)
                     .ok_or(DagError::MissingNode {
                         node: node_id.to_usize(),
                     })
@@ -394,7 +399,7 @@ impl AdjacencyLists {
     }
 
     fn push_node(&mut self) {
-        self.ensure_ragged().push(Vec::new());
+        self.ensure_ragged().push(NodeNeighbors::new());
     }
 
     fn push_neighbor(&mut self, owner: NodeId, neighbor: NodeId) -> Result<()> {
@@ -418,7 +423,7 @@ impl AdjacencyLists {
         Ok(())
     }
 
-    fn ensure_ragged(&mut self) -> &mut Vec<Vec<NodeId>> {
+    fn ensure_ragged(&mut self) -> &mut Vec<NodeNeighbors> {
         if matches!(self, Self::Packed(_)) {
             let packed = match std::mem::replace(self, Self::Ragged(Vec::new())) {
                 Self::Packed(packed) => packed,
@@ -522,7 +527,7 @@ struct NodeIdRange {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FragmentBuckets<K: Eq + Hash> {
-    Ragged(HashMap<K, Vec<NodeId>>),
+    Ragged(HashMap<K, FragmentPostingList>),
     Packed {
         ranges: HashMap<K, NodeIdRange>,
         nodes: Vec<NodeId>,
@@ -545,7 +550,7 @@ where
 
     fn get(&self, key: &K) -> &[NodeId] {
         match self {
-            Self::Ragged(entries) => entries.get(key).map(Vec::as_slice).unwrap_or(&[]),
+            Self::Ragged(entries) => entries.get(key).map(SmallVec::as_slice).unwrap_or(&[]),
             Self::Packed { ranges, nodes } => {
                 let Some(range) = ranges.get(key) else {
                     return &[];
@@ -565,7 +570,7 @@ where
         let replacement = match self {
             Self::Packed { .. } => None,
             Self::Ragged(entries) => {
-                let total_nodes = entries.values().map(Vec::len).sum::<usize>();
+                let total_nodes = entries.values().map(FragmentPostingList::len).sum::<usize>();
                 let mut ranges = HashMap::with_capacity(entries.len());
                 let mut nodes = Vec::with_capacity(total_nodes);
                 let mut cursor = 0usize;
@@ -600,13 +605,13 @@ where
         Ok(())
     }
 
-    fn ensure_ragged(&mut self) -> &mut HashMap<K, Vec<NodeId>> {
+    fn ensure_ragged(&mut self) -> &mut HashMap<K, FragmentPostingList> {
         if let Self::Packed { ranges, nodes } = self {
             let mut rebuilt = HashMap::with_capacity(ranges.len());
             for (key, range) in ranges.iter() {
                 let start = range.start as usize;
                 let end = start + range.len as usize;
-                rebuilt.insert(key.clone(), nodes[start..end].to_vec());
+                rebuilt.insert(key.clone(), nodes[start..end].iter().copied().collect());
             }
             *self = Self::Ragged(rebuilt);
         }
@@ -1577,7 +1582,11 @@ impl FtoDag {
         self.edges.len()
     }
 
-    pub fn add_node(&mut self, fragment: FragmentKey, kind: NodeKind) -> Result<NodeId> {
+    pub fn add_node<F>(&mut self, fragment: F, kind: NodeKind) -> Result<NodeId>
+    where
+        F: Into<FragmentKey>,
+    {
+        let fragment = fragment.into();
         let id = NodeId::try_from(self.nodes.len())?;
         let node = Node {
             id,
@@ -1681,8 +1690,7 @@ impl FtoDag {
     pub fn rebuild_fragment_index(&mut self) {
         self.fragment_index.clear();
         for node in &self.nodes {
-            self.fragment_index
-                .insert(&node.fragment, node.kind, node.id);
+            self.fragment_index.insert(&node.fragment, node.kind, node.id);
         }
     }
 
@@ -1769,7 +1777,8 @@ impl FtoDag {
             endpoint_index: EndpointIndex::default(),
         };
 
-        for (expected, node) in graph.nodes.iter().enumerate() {
+        for expected in 0..graph.nodes.len() {
+            let node = &graph.nodes[expected];
             if node.id.to_usize() != expected {
                 return Err(DagError::InvalidStorage(format!(
                     "node id mismatch at index {expected}: found {}",

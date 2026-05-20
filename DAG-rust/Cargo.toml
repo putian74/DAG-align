@@ -14,4 +14,4 @@ name = "dag-rust"
 path = "src/main.rs"
 
 [dependencies]
-
+smallvec = "1.13"
