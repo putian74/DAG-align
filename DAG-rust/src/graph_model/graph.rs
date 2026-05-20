@@ -86,11 +86,23 @@ static NEXT_TRACE_PATH_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 type NodeNeighbors = SmallVec<[NodeId; 2]>;
 type FragmentPostingList = SmallVec<[NodeId; 2]>;
+type EdgeSlot = u32;
+
+fn edge_slot(index: usize) -> Result<EdgeSlot> {
+    u32::try_from(index).map_err(|_| DagError::ValueDoesNotFit {
+        value: index as u128,
+        bits: 32,
+    })
+}
+
+fn edge_slot_usize(index: EdgeSlot) -> usize {
+    index as usize
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct InlineEdgeEntry {
     child: NodeId,
-    edge_index: usize,
+    edge_index: EdgeSlot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,15 +159,15 @@ impl InlineEdgeBucket {
 
 #[derive(Clone, Debug)]
 enum EdgeIndexStorage {
-    Global(HashMap<EdgeKey, usize>),
+    Global(HashMap<EdgeKey, EdgeSlot>),
     HybridMutable {
         inline: Vec<InlineEdgeBucket>,
-        overflow: HashMap<EdgeKey, usize>,
+        overflow: HashMap<EdgeKey, EdgeSlot>,
     },
     HybridPacked {
         inline_offsets: Vec<u32>,
         inline_entries: Vec<InlineEdgeEntry>,
-        overflow: HashMap<EdgeKey, usize>,
+        overflow: HashMap<EdgeKey, EdgeSlot>,
     },
 }
 
@@ -189,7 +201,7 @@ impl EdgeIndexStorage {
     }
 
     fn get(&self, key: EdgeKey) -> Option<usize> {
-        match self {
+        let edge_index = match self {
             Self::Global(index) => index.get(&key).copied(),
             Self::HybridMutable { inline, overflow } => inline
                 .get(key.parent.to_usize())
@@ -214,10 +226,12 @@ impl EdgeIndexStorage {
                         .map(|entry| entry.edge_index)
                 })
                 .or_else(|| overflow.get(&key).copied()),
-        }
+        };
+        edge_index.map(edge_slot_usize)
     }
 
-    fn insert(&mut self, key: EdgeKey, edge_index: usize) {
+    fn insert(&mut self, key: EdgeKey, edge_index: usize) -> Result<()> {
+        let edge_index = edge_slot(edge_index)?;
         if matches!(self, Self::HybridPacked { .. }) {
             self.unpack_hybrid();
         }
@@ -228,7 +242,7 @@ impl EdgeIndexStorage {
             Self::HybridMutable { inline, overflow } => {
                 let Some(entries) = inline.get_mut(key.parent.to_usize()) else {
                     overflow.insert(key, edge_index);
-                    return;
+                    return Ok(());
                 };
                 if entries.len() < HYBRID_EDGE_INLINE_LIMIT {
                     entries.push(InlineEdgeEntry {
@@ -243,6 +257,7 @@ impl EdgeIndexStorage {
                 unreachable!("packed hybrid storage is unpacked before insertion")
             }
         }
+        Ok(())
     }
 
     fn compact(&mut self) -> Result<()> {
@@ -1804,7 +1819,7 @@ impl FtoDag {
                 key,
                 weight: increment,
             });
-            self.edge_index.insert(key, edge_index);
+            self.edge_index.insert(key, edge_index)?;
             self.children.push_neighbor(parent, child)?;
             self.parents.push_neighbor(child, parent)?;
             (increment, true)
@@ -1952,7 +1967,7 @@ impl FtoDag {
             if parent >= graph.nodes.len() || child >= graph.nodes.len() {
                 return Err(DagError::InvalidEdge { parent, child });
             }
-            graph.edge_index.insert(edge.key, edge_index);
+            graph.edge_index.insert(edge.key, edge_index)?;
             graph
                 .endpoint_index
                 .record_edge_insertion(edge.key.parent, edge.key.child);
