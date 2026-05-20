@@ -144,7 +144,7 @@ fn fragment_index_uses_packed_inline_keys() {
 }
 
 #[test]
-fn graph_owned_provenance_table_tracks_node_provenance_ranges() {
+fn graph_owned_provenance_storage_tracks_node_provenance_counts() {
     let mut graph = FtoDag::new(1);
     let left = graph.add_node(key(1), NodeKind::Start).unwrap();
     let right = graph.add_node(key(2), NodeKind::End).unwrap();

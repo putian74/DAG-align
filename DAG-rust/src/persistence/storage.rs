@@ -7,7 +7,7 @@ use crate::graph_model::graph::{
     WeightedEdge,
 };
 use crate::graph_model::provenance::{
-    PackedProvenanceRecord, ProvenanceRange, ProvenanceRecord, ProvenanceStorageStrategy,
+    PackedProvenanceRecord, ProvenanceRecord, ProvenanceStorageStrategy,
 };
 use crate::sequence_model::alphabet::SymbolId;
 use crate::sequence_model::fragment::FragmentKey;
@@ -24,7 +24,7 @@ pub struct GraphFormatVersion {
 }
 
 impl GraphFormatVersion {
-    pub const CURRENT: Self = Self { major: 0, minor: 3 };
+    pub const CURRENT: Self = Self { major: 0, minor: 4 };
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -153,9 +153,7 @@ fn write_node(writer: &mut impl Write, node: &Node, path: &Path) -> Result<()> {
     write_fragment_key(writer, &node.fragment, path)?;
     write_u8(writer, encode_node_kind(node.kind), path)?;
     write_u64(writer, node.weight.raw(), path)?;
-    write_u16(writer, node.flags.bits(), path)?;
-    write_u64(writer, node.provenance_range.start, path)?;
-    write_u64(writer, node.provenance_range.len, path)
+    write_u16(writer, node.flags.bits(), path)
 }
 
 fn read_node(reader: &mut impl Read, path: &Path) -> Result<Node> {
@@ -165,7 +163,6 @@ fn read_node(reader: &mut impl Read, path: &Path) -> Result<Node> {
         kind: decode_node_kind(read_u8(reader, path)?)?,
         weight: Weight::new(read_u64(reader, path)?),
         flags: crate::foundations::bit_encoding::NodeFlags::from_bits(read_u16(reader, path)?),
-        provenance_range: ProvenanceRange::new(read_u64(reader, path)?, read_u64(reader, path)?),
     })
 }
 

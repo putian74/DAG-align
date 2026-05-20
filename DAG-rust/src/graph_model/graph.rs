@@ -4,12 +4,12 @@ use crate::foundations::bit_encoding::NodeFlags;
 use crate::foundations::error::{DagError, Result};
 use crate::foundations::id::{NodeId, ProvenancePosition, SequenceId, Weight};
 use crate::graph_model::provenance::{
-    PackedProvenanceRecord, ProvenanceRange, ProvenanceRecord, ProvenanceStorageStrategy,
-    ProvenanceTable,
+    PackedProvenanceRecord, ProvenanceRecord, ProvenanceStorageStrategy, ProvenanceTable,
 };
 use crate::sequence_model::fragment::FragmentKey;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, remove_file};
+use std::hash::Hash;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,7 +49,6 @@ pub struct Node {
     pub kind: NodeKind,
     pub weight: Weight,
     pub flags: NodeFlags,
-    pub provenance_range: ProvenanceRange,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -479,40 +478,24 @@ impl PackedInlineIndexKey {
 
 #[derive(Clone, Debug, Default)]
 pub struct FragmentIndex {
-    entries: HashMap<NodeKind, HashMap<FragmentKey, Vec<NodeId>>>,
-    packed_inline_entries: HashMap<PackedInlineIndexKey, Vec<NodeId>>,
+    entries: FragmentBuckets<(NodeKind, FragmentKey)>,
+    packed_inline_entries: FragmentBuckets<PackedInlineIndexKey>,
 }
 
 impl FragmentIndex {
     pub fn insert(&mut self, fragment: &FragmentKey, kind: NodeKind, node_id: NodeId) {
         if let Some(key) = PackedInlineIndexKey::from_fragment(fragment, kind) {
-            self.packed_inline_entries
-                .entry(key)
-                .or_default()
-                .push(node_id);
+            self.packed_inline_entries.insert(key, node_id);
         } else {
-            self.entries
-                .entry(kind)
-                .or_default()
-                .entry(fragment.clone())
-                .or_default()
-                .push(node_id);
+            self.entries.insert((kind, fragment.clone()), node_id);
         }
     }
 
     pub fn nodes_for(&self, fragment: &FragmentKey, kind: NodeKind) -> &[NodeId] {
         if let Some(key) = PackedInlineIndexKey::from_fragment(fragment, kind) {
-            return self
-                .packed_inline_entries
-                .get(&key)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
+            return self.packed_inline_entries.get(&key);
         }
-        self.entries
-            .get(&kind)
-            .and_then(|entries| entries.get(fragment))
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.entries.get(&(kind, fragment.clone()))
     }
 
     pub fn contains(&self, fragment: &FragmentKey, kind: NodeKind, node_id: NodeId) -> bool {
@@ -522,6 +505,115 @@ impl FragmentIndex {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.packed_inline_entries.clear();
+    }
+
+    fn compact(&mut self) -> Result<()> {
+        self.entries.compact()?;
+        self.packed_inline_entries.compact()?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NodeIdRange {
+    start: u32,
+    len: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FragmentBuckets<K: Eq + Hash> {
+    Ragged(HashMap<K, Vec<NodeId>>),
+    Packed {
+        ranges: HashMap<K, NodeIdRange>,
+        nodes: Vec<NodeId>,
+    },
+}
+
+impl<K: Eq + Hash> Default for FragmentBuckets<K> {
+    fn default() -> Self {
+        Self::Ragged(HashMap::new())
+    }
+}
+
+impl<K> FragmentBuckets<K>
+where
+    K: Clone + Eq + Hash,
+{
+    fn insert(&mut self, key: K, node_id: NodeId) {
+        self.ensure_ragged().entry(key).or_default().push(node_id);
+    }
+
+    fn get(&self, key: &K) -> &[NodeId] {
+        match self {
+            Self::Ragged(entries) => entries.get(key).map(Vec::as_slice).unwrap_or(&[]),
+            Self::Packed { ranges, nodes } => {
+                let Some(range) = ranges.get(key) else {
+                    return &[];
+                };
+                let start = range.start as usize;
+                let end = start + range.len as usize;
+                nodes.get(start..end).unwrap_or(&[])
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::Ragged(HashMap::new());
+    }
+
+    fn compact(&mut self) -> Result<()> {
+        let replacement = match self {
+            Self::Packed { .. } => None,
+            Self::Ragged(entries) => {
+                let total_nodes = entries.values().map(Vec::len).sum::<usize>();
+                let mut ranges = HashMap::with_capacity(entries.len());
+                let mut nodes = Vec::with_capacity(total_nodes);
+                let mut cursor = 0usize;
+                for (key, ids) in entries.iter() {
+                    let len = ids.len();
+                    let start = cursor;
+                    cursor = cursor.checked_add(len).ok_or(DagError::ValueDoesNotFit {
+                        value: total_nodes as u128,
+                        bits: usize::BITS as u8,
+                    })?;
+                    ranges.insert(
+                        key.clone(),
+                        NodeIdRange {
+                            start: u32::try_from(start).map_err(|_| DagError::ValueDoesNotFit {
+                                value: start as u128,
+                                bits: 32,
+                            })?,
+                            len: u32::try_from(len).map_err(|_| DagError::ValueDoesNotFit {
+                                value: len as u128,
+                                bits: 32,
+                            })?,
+                        },
+                    );
+                    nodes.extend(ids.iter().copied());
+                }
+                Some(Self::Packed { ranges, nodes })
+            }
+        };
+        if let Some(storage) = replacement {
+            *self = storage;
+        }
+        Ok(())
+    }
+
+    fn ensure_ragged(&mut self) -> &mut HashMap<K, Vec<NodeId>> {
+        if let Self::Packed { ranges, nodes } = self {
+            let mut rebuilt = HashMap::with_capacity(ranges.len());
+            for (key, range) in ranges.iter() {
+                let start = range.start as usize;
+                let end = start + range.len as usize;
+                rebuilt.insert(key.clone(), nodes[start..end].to_vec());
+            }
+            *self = Self::Ragged(rebuilt);
+        }
+        match self {
+            Self::Ragged(entries) => entries,
+            Self::Packed { .. } => unreachable!("packed fragment buckets were unpacked"),
+        }
     }
 }
 
@@ -1493,7 +1585,6 @@ impl FtoDag {
             kind,
             weight: Weight::new(0),
             flags: kind.flags(),
-            provenance_range: ProvenanceRange::default(),
         };
         self.fragment_index.insert(&fragment, kind, id);
         self.endpoint_index.record_node_kind(id, kind);
@@ -1519,8 +1610,6 @@ impl FtoDag {
             *last_sequence = record.sequence_id.raw();
         }
         let node = &mut self.nodes[node_index];
-        node.provenance_range =
-            ProvenanceRange::new(0, self.node_provenance.record_count(node_id)? as u64);
         node.weight = Weight::new(node.weight.raw() + 1);
         Ok(())
     }
@@ -1535,8 +1624,6 @@ impl FtoDag {
             .nodes
             .get_mut(node_index)
             .ok_or(DagError::MissingNode { node: node_index })?;
-        node.provenance_range =
-            ProvenanceRange::new(0, self.node_provenance.record_count(node_id)? as u64);
         node.weight = Weight::new(node.weight.raw() + count);
         Ok(())
     }
@@ -1611,6 +1698,7 @@ impl FtoDag {
         self.parents.compact()?;
         self.children.compact()?;
         self.edge_index.compact()?;
+        self.fragment_index.compact()?;
         Ok(())
     }
 
