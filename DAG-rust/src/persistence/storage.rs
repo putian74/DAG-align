@@ -3,8 +3,8 @@
 use crate::foundations::error::{DagError, Result};
 use crate::foundations::id::{NodeId, ProvenancePosition, SequenceId, Weight};
 use crate::graph_model::graph::{
-    EdgeIndexStrategy, EdgeKey, FtoDag, FtoDagSnapshot, Node, NodeKind, ProvenanceSnapshot,
-    WeightedEdge,
+    EdgeIndexStrategy, EdgeKey, FtoDag, FtoDagSnapshot, Node, NodeKind, NodeProvenanceStorage,
+    ProvenanceSnapshot, SequenceTraceStore, WeightedEdge,
 };
 use crate::graph_model::provenance::{
     PackedProvenanceRecord, ProvenanceRecord, ProvenanceStorageStrategy,
@@ -57,34 +57,33 @@ impl GraphStorage for NativeGraphStorage {
         let file = File::create(path)
             .map_err(|err| DagError::Io(format!("create {}: {err}", path.display())))?;
         let mut writer = BufWriter::new(file);
-        let snapshot = graph.snapshot()?;
 
         writer
             .write_all(&STORAGE_MAGIC)
             .map_err(|err| DagError::Io(format!("write {}: {err}", path.display())))?;
         write_u32(&mut writer, packed_version(config.version), path)?;
-        write_u64(&mut writer, snapshot.fragment_len as u64, path)?;
+        write_u64(&mut writer, graph.fragment_len() as u64, path)?;
         write_u8(
             &mut writer,
-            encode_edge_index_strategy(snapshot.edge_index_strategy),
+            encode_edge_index_strategy(graph.edge_index_strategy()),
             path,
         )?;
         write_u8(
             &mut writer,
-            encode_provenance_strategy(snapshot.provenance.strategy()),
+            encode_provenance_strategy(graph.provenance_storage_strategy()),
             path,
         )?;
-        write_u64(&mut writer, snapshot.nodes.len() as u64, path)?;
-        write_u64(&mut writer, snapshot.edges.len() as u64, path)?;
+        write_u64(&mut writer, graph.nodes().len() as u64, path)?;
+        write_u64(&mut writer, graph.edges().len() as u64, path)?;
 
-        for node in &snapshot.nodes {
+        for node in graph.nodes() {
             write_node(&mut writer, node, path)?;
         }
-        for edge in &snapshot.edges {
+        for edge in graph.edges() {
             write_edge(&mut writer, edge, path)?;
         }
-        write_optional_sequence_ids(&mut writer, &snapshot.node_last_sequences, path)?;
-        write_provenance_snapshot(&mut writer, &snapshot.provenance, path)?;
+        write_optional_sequence_ids(&mut writer, graph.node_last_sequence_markers(), path)?;
+        write_graph_provenance(&mut writer, graph, path)?;
 
         writer
             .flush()
@@ -130,17 +129,88 @@ impl GraphStorage for NativeGraphStorage {
             edges.push(read_edge(&mut reader, path)?);
         }
         let node_last_sequences = read_optional_sequence_ids(&mut reader, node_count, path)?;
-        let provenance =
-            read_provenance_snapshot(&mut reader, provenance_strategy, node_count, path)?;
+        match provenance_strategy {
+            ProvenanceStorageStrategy::FullRecords | ProvenanceStorageStrategy::Packed32 => {
+                let provenance =
+                    read_provenance_snapshot(&mut reader, provenance_strategy, node_count, path)?;
+                FtoDag::from_snapshot(FtoDagSnapshot {
+                    fragment_len,
+                    nodes,
+                    edges,
+                    edge_index_strategy,
+                    provenance,
+                    node_last_sequences,
+                })
+            }
+            ProvenanceStorageStrategy::TracePaths => {
+                let offsets = read_trace_path_offsets(&mut reader, path)?;
+                let trace_node_count = read_usize(&mut reader, path)?;
+                let expected_nodes = offsets.last().copied().unwrap_or(0);
+                if expected_nodes
+                    != u64::try_from(trace_node_count).map_err(|_| DagError::ValueDoesNotFit {
+                        value: trace_node_count as u128,
+                        bits: 64,
+                    })?
+                {
+                    return Err(DagError::InvalidStorage(format!(
+                        "trace-path node-count mismatch: offsets end {expected_nodes} but stored node count is {trace_node_count}"
+                    )));
+                }
+                let sequence_trace_paths =
+                    SequenceTraceStore::from_serialized_reader(offsets, &mut reader, path, true)?;
+                FtoDag::from_storage_parts(
+                    fragment_len,
+                    nodes,
+                    edges,
+                    edge_index_strategy,
+                    NodeProvenanceStorage::TracePaths { node_count },
+                    sequence_trace_paths,
+                    node_last_sequences,
+                )
+            }
+            ProvenanceStorageStrategy::CountOnly => FtoDag::from_storage_parts(
+                fragment_len,
+                nodes,
+                edges,
+                edge_index_strategy,
+                NodeProvenanceStorage::CountOnly { node_count },
+                SequenceTraceStore::default(),
+                node_last_sequences,
+            ),
+        }
+    }
+}
 
-        FtoDag::from_snapshot(FtoDagSnapshot {
-            fragment_len,
-            nodes,
-            edges,
-            edge_index_strategy,
-            provenance,
-            node_last_sequences,
-        })
+fn write_graph_provenance(writer: &mut impl Write, graph: &FtoDag, path: &Path) -> Result<()> {
+    match graph.provenance_storage_strategy() {
+        ProvenanceStorageStrategy::FullRecords | ProvenanceStorageStrategy::Packed32 => {
+            write_u64(writer, graph.nodes().len() as u64, path)?;
+            for node in graph.nodes() {
+                let records = graph.provenance_records(node.id)?;
+                write_u64(writer, records.len() as u64, path)?;
+                for record in records {
+                    write_provenance_record(writer, record, path)?;
+                }
+            }
+            Ok(())
+        }
+        ProvenanceStorageStrategy::TracePaths => {
+            let offsets = graph.sequence_trace_offsets()?;
+            write_u64(writer, offsets.len() as u64, path)?;
+            for offset in offsets {
+                write_u64(writer, *offset, path)?;
+            }
+            let total_nodes = offsets.last().copied().unwrap_or(0);
+            write_u64(writer, total_nodes, path)?;
+            let mut paths = graph.sequence_trace_paths()?;
+            while let Some((_sequence_index, path_nodes)) = paths.next_path()? {
+                for node_id in path_nodes {
+                    write_u32(writer, node_id.raw(), path)?;
+                }
+            }
+            Ok(())
+        }
+        ProvenanceStorageStrategy::CountOnly => Ok(()),
     }
 }
 
@@ -180,41 +250,6 @@ fn read_edge(reader: &mut impl Read, path: &Path) -> Result<WeightedEdge> {
         },
         weight: Weight::new(read_u64(reader, path)?),
     })
-}
-
-fn write_provenance_snapshot(
-    writer: &mut impl Write,
-    provenance: &ProvenanceSnapshot,
-    path: &Path,
-) -> Result<()> {
-    match provenance {
-        ProvenanceSnapshot::Full(records) => write_record_lists(writer, records, path),
-        ProvenanceSnapshot::Packed32(records) => {
-            write_u64(writer, records.len() as u64, path)?;
-            for node_records in records {
-                write_u64(writer, node_records.len() as u64, path)?;
-                for record in node_records {
-                    write_provenance_record(writer, record.unpack(), path)?;
-                }
-            }
-            Ok(())
-        }
-        ProvenanceSnapshot::TracePaths {
-            sequence_trace_offsets,
-            sequence_trace_nodes,
-        } => {
-            write_u64(writer, sequence_trace_offsets.len() as u64, path)?;
-            for offset in sequence_trace_offsets {
-                write_u64(writer, *offset, path)?;
-            }
-            write_u64(writer, sequence_trace_nodes.len() as u64, path)?;
-            for node_id in sequence_trace_nodes {
-                write_u32(writer, node_id.raw(), path)?;
-            }
-            Ok(())
-        }
-        ProvenanceSnapshot::CountOnly => Ok(()),
-    }
 }
 
 fn read_provenance_snapshot(
@@ -259,19 +294,13 @@ fn read_provenance_snapshot(
     }
 }
 
-fn write_record_lists(
-    writer: &mut impl Write,
-    records: &[Vec<ProvenanceRecord>],
-    path: &Path,
-) -> Result<()> {
-    write_u64(writer, records.len() as u64, path)?;
-    for node_records in records {
-        write_u64(writer, node_records.len() as u64, path)?;
-        for record in node_records {
-            write_provenance_record(writer, *record, path)?;
-        }
+fn read_trace_path_offsets(reader: &mut impl Read, path: &Path) -> Result<Vec<u64>> {
+    let offset_count = read_usize(reader, path)?;
+    let mut sequence_trace_offsets = Vec::with_capacity(offset_count);
+    for _ in 0..offset_count {
+        sequence_trace_offsets.push(read_u64(reader, path)?);
     }
-    Ok(())
+    Ok(sequence_trace_offsets)
 }
 
 fn read_record_lists(
