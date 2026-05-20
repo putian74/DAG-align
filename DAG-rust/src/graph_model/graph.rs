@@ -86,7 +86,6 @@ static NEXT_TRACE_PATH_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 type NodeNeighbors = SmallVec<[NodeId; 2]>;
 type FragmentPostingList = SmallVec<[NodeId; 2]>;
-type InlineEdgeList = SmallVec<[InlineEdgeEntry; HYBRID_EDGE_INLINE_LIMIT]>;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct InlineEdgeEntry {
@@ -94,11 +93,63 @@ struct InlineEdgeEntry {
     edge_index: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InlineEdgeBucket {
+    Empty,
+    One(InlineEdgeEntry),
+    Two([InlineEdgeEntry; 2]),
+    Many(Vec<InlineEdgeEntry>),
+}
+
+impl InlineEdgeBucket {
+    fn new() -> Self {
+        Self::Empty
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::Two(_) => 2,
+            Self::Many(entries) => entries.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[InlineEdgeEntry] {
+        match self {
+            Self::Empty => &[],
+            Self::One(entry) => std::slice::from_ref(entry),
+            Self::Two(entries) => entries,
+            Self::Many(entries) => entries.as_slice(),
+        }
+    }
+
+    fn push(&mut self, entry: InlineEdgeEntry) {
+        match self {
+            Self::Empty => *self = Self::One(entry),
+            Self::One(first) => *self = Self::Two([*first, entry]),
+            Self::Two([first, second]) => {
+                *self = Self::Many(vec![*first, *second, entry]);
+            }
+            Self::Many(entries) => entries.push(entry),
+        }
+    }
+
+    fn from_slice(entries: &[InlineEdgeEntry]) -> Self {
+        match entries {
+            [] => Self::Empty,
+            [entry] => Self::One(*entry),
+            [first, second] => Self::Two([*first, *second]),
+            _ => Self::Many(entries.to_vec()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum EdgeIndexStorage {
     Global(HashMap<EdgeKey, usize>),
     HybridMutable {
-        inline: Vec<InlineEdgeList>,
+        inline: Vec<InlineEdgeBucket>,
         overflow: HashMap<EdgeKey, usize>,
     },
     HybridPacked {
@@ -133,7 +184,7 @@ impl EdgeIndexStorage {
             self.unpack_hybrid();
         }
         if let Self::HybridMutable { inline, .. } = self {
-            inline.push(InlineEdgeList::new());
+            inline.push(InlineEdgeBucket::new());
         }
     }
 
@@ -144,6 +195,7 @@ impl EdgeIndexStorage {
                 .get(key.parent.to_usize())
                 .and_then(|entries| {
                     entries
+                        .as_slice()
                         .iter()
                         .find(|entry| entry.child == key.child)
                         .map(|entry| entry.edge_index)
@@ -197,7 +249,7 @@ impl EdgeIndexStorage {
         let replacement = match self {
             Self::Global(_) | Self::HybridPacked { .. } => None,
             Self::HybridMutable { inline, overflow } => {
-                let total_entries = inline.iter().map(InlineEdgeList::len).sum::<usize>();
+                let total_entries = inline.iter().map(InlineEdgeBucket::len).sum::<usize>();
                 let mut inline_offsets = Vec::with_capacity(inline.len() + 1);
                 inline_offsets.push(0);
                 let mut running_total = 0usize;
@@ -217,7 +269,7 @@ impl EdgeIndexStorage {
                 }
                 let mut inline_entries = Vec::with_capacity(total_entries);
                 for entries in inline.iter() {
-                    inline_entries.extend(entries.iter().copied());
+                    inline_entries.extend(entries.as_slice().iter().copied());
                 }
                 let overflow = std::mem::take(overflow);
                 Some(Self::HybridPacked {
@@ -253,7 +305,7 @@ impl EdgeIndexStorage {
         for node_index in 0..node_count {
             let start = inline_offsets[node_index] as usize;
             let end = inline_offsets[node_index + 1] as usize;
-            inline.push(inline_entries[start..end].iter().copied().collect());
+            inline.push(InlineEdgeBucket::from_slice(&inline_entries[start..end]));
         }
         *self = Self::HybridMutable { inline, overflow };
     }
@@ -386,14 +438,12 @@ impl AdjacencyLists {
 
     fn neighbors(&self, node_id: NodeId) -> Result<&[NodeId]> {
         match self {
-            Self::Ragged(lists) => {
-                lists
-                    .get(node_id.to_usize())
-                    .map(NodeNeighbors::as_slice)
-                    .ok_or(DagError::MissingNode {
-                        node: node_id.to_usize(),
-                    })
-            }
+            Self::Ragged(lists) => lists
+                .get(node_id.to_usize())
+                .map(NodeNeighbors::as_slice)
+                .ok_or(DagError::MissingNode {
+                    node: node_id.to_usize(),
+                }),
             Self::Packed(packed) => packed.neighbors(node_id),
         }
     }
@@ -570,7 +620,10 @@ where
         let replacement = match self {
             Self::Packed { .. } => None,
             Self::Ragged(entries) => {
-                let total_nodes = entries.values().map(FragmentPostingList::len).sum::<usize>();
+                let total_nodes = entries
+                    .values()
+                    .map(FragmentPostingList::len)
+                    .sum::<usize>();
                 let mut ranges = HashMap::with_capacity(entries.len());
                 let mut nodes = Vec::with_capacity(total_nodes);
                 let mut cursor = 0usize;
@@ -1690,7 +1743,8 @@ impl FtoDag {
     pub fn rebuild_fragment_index(&mut self) {
         self.fragment_index.clear();
         for node in &self.nodes {
-            self.fragment_index.insert(&node.fragment, node.kind, node.id);
+            self.fragment_index
+                .insert(&node.fragment, node.kind, node.id);
         }
     }
 
