@@ -24,7 +24,7 @@ pub struct GraphFormatVersion {
 }
 
 impl GraphFormatVersion {
-    pub const CURRENT: Self = Self { major: 0, minor: 4 };
+    pub const CURRENT: Self = Self { major: 0, minor: 5 };
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -200,14 +200,9 @@ fn write_provenance_snapshot(
             Ok(())
         }
         ProvenanceSnapshot::TracePaths {
-            node_counts,
             sequence_trace_offsets,
             sequence_trace_nodes,
         } => {
-            write_u64(writer, node_counts.len() as u64, path)?;
-            for count in node_counts {
-                write_u64(writer, *count, path)?;
-            }
             write_u64(writer, sequence_trace_offsets.len() as u64, path)?;
             for offset in sequence_trace_offsets {
                 write_u64(writer, *offset, path)?;
@@ -218,13 +213,7 @@ fn write_provenance_snapshot(
             }
             Ok(())
         }
-        ProvenanceSnapshot::CountOnly(counts) => {
-            write_u64(writer, counts.len() as u64, path)?;
-            for count in counts {
-                write_u64(writer, *count, path)?;
-            }
-            Ok(())
-        }
+        ProvenanceSnapshot::CountOnly => Ok(()),
     }
 }
 
@@ -251,16 +240,6 @@ fn read_provenance_snapshot(
             Ok(ProvenanceSnapshot::Packed32(records))
         }
         ProvenanceStorageStrategy::TracePaths => {
-            let stored_node_count = read_usize(reader, path)?;
-            if stored_node_count != node_count {
-                return Err(DagError::InvalidStorage(format!(
-                    "trace-path node-count mismatch: expected {node_count}, found {stored_node_count}"
-                )));
-            }
-            let mut node_counts = Vec::with_capacity(node_count);
-            for _ in 0..node_count {
-                node_counts.push(read_u64(reader, path)?);
-            }
             let offset_count = read_usize(reader, path)?;
             let mut sequence_trace_offsets = Vec::with_capacity(offset_count);
             for _ in 0..offset_count {
@@ -272,24 +251,11 @@ fn read_provenance_snapshot(
                 sequence_trace_nodes.push(NodeId::new(read_u32(reader, path)?));
             }
             Ok(ProvenanceSnapshot::TracePaths {
-                node_counts,
                 sequence_trace_offsets,
                 sequence_trace_nodes,
             })
         }
-        ProvenanceStorageStrategy::CountOnly => {
-            let stored_node_count = read_usize(reader, path)?;
-            if stored_node_count != node_count {
-                return Err(DagError::InvalidStorage(format!(
-                    "count-only node-count mismatch: expected {node_count}, found {stored_node_count}"
-                )));
-            }
-            let mut counts = Vec::with_capacity(node_count);
-            for _ in 0..node_count {
-                counts.push(read_u64(reader, path)?);
-            }
-            Ok(ProvenanceSnapshot::CountOnly(counts))
-        }
+        ProvenanceStorageStrategy::CountOnly => Ok(ProvenanceSnapshot::CountOnly),
     }
 }
 

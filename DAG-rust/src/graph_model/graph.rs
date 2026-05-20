@@ -1222,8 +1222,8 @@ impl<'a> SequenceTracePathReader<'a> {
 pub(crate) enum NodeProvenanceStorage {
     Full(Vec<Vec<ProvenanceRecord>>),
     Packed32(Vec<Vec<PackedProvenanceRecord>>),
-    TracePaths(Vec<u64>),
-    CountOnly(Vec<u64>),
+    TracePaths { node_count: usize },
+    CountOnly { node_count: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -1231,11 +1231,10 @@ pub(crate) enum ProvenanceSnapshot {
     Full(Vec<Vec<ProvenanceRecord>>),
     Packed32(Vec<Vec<PackedProvenanceRecord>>),
     TracePaths {
-        node_counts: Vec<u64>,
         sequence_trace_offsets: Vec<u64>,
         sequence_trace_nodes: Vec<NodeId>,
     },
-    CountOnly(Vec<u64>),
+    CountOnly,
 }
 
 impl ProvenanceSnapshot {
@@ -1244,17 +1243,24 @@ impl ProvenanceSnapshot {
             Self::Full(_) => ProvenanceStorageStrategy::FullRecords,
             Self::Packed32(_) => ProvenanceStorageStrategy::Packed32,
             Self::TracePaths { .. } => ProvenanceStorageStrategy::TracePaths,
-            Self::CountOnly(_) => ProvenanceStorageStrategy::CountOnly,
+            Self::CountOnly => ProvenanceStorageStrategy::CountOnly,
         }
     }
 
-    fn node_count(&self) -> usize {
-        match self {
-            Self::Full(records) => records.len(),
-            Self::Packed32(records) => records.len(),
-            Self::TracePaths { node_counts, .. } => node_counts.len(),
-            Self::CountOnly(counts) => counts.len(),
+    fn validate_node_count(&self, node_count: usize) -> Result<()> {
+        let stored = match self {
+            Self::Full(records) => Some(records.len()),
+            Self::Packed32(records) => Some(records.len()),
+            Self::TracePaths { .. } | Self::CountOnly => None,
+        };
+        if let Some(stored) = stored
+            && stored != node_count
+        {
+            return Err(DagError::InvalidStorage(format!(
+                "node/provenance length mismatch: {node_count} nodes vs {stored} provenance slots"
+            )));
         }
+        Ok(())
     }
 }
 
@@ -1273,8 +1279,8 @@ impl NodeProvenanceStorage {
         match strategy {
             ProvenanceStorageStrategy::FullRecords => Self::Full(Vec::new()),
             ProvenanceStorageStrategy::Packed32 => Self::Packed32(Vec::new()),
-            ProvenanceStorageStrategy::TracePaths => Self::TracePaths(Vec::new()),
-            ProvenanceStorageStrategy::CountOnly => Self::CountOnly(Vec::new()),
+            ProvenanceStorageStrategy::TracePaths => Self::TracePaths { node_count: 0 },
+            ProvenanceStorageStrategy::CountOnly => Self::CountOnly { node_count: 0 },
         }
     }
 
@@ -1282,8 +1288,8 @@ impl NodeProvenanceStorage {
         match self {
             Self::Full(_) => ProvenanceStorageStrategy::FullRecords,
             Self::Packed32(_) => ProvenanceStorageStrategy::Packed32,
-            Self::TracePaths(_) => ProvenanceStorageStrategy::TracePaths,
-            Self::CountOnly(_) => ProvenanceStorageStrategy::CountOnly,
+            Self::TracePaths { .. } => ProvenanceStorageStrategy::TracePaths,
+            Self::CountOnly { .. } => ProvenanceStorageStrategy::CountOnly,
         }
     }
 
@@ -1291,8 +1297,7 @@ impl NodeProvenanceStorage {
         match self {
             Self::Full(records) => records.push(Vec::new()),
             Self::Packed32(records) => records.push(Vec::new()),
-            Self::TracePaths(counts) => counts.push(0),
-            Self::CountOnly(counts) => counts.push(0),
+            Self::TracePaths { node_count } | Self::CountOnly { node_count } => *node_count += 1,
         }
     }
 
@@ -1300,8 +1305,9 @@ impl NodeProvenanceStorage {
         let exists = match self {
             Self::Full(records) => node_id.to_usize() < records.len(),
             Self::Packed32(records) => node_id.to_usize() < records.len(),
-            Self::TracePaths(counts) => node_id.to_usize() < counts.len(),
-            Self::CountOnly(counts) => node_id.to_usize() < counts.len(),
+            Self::TracePaths { node_count } | Self::CountOnly { node_count } => {
+                node_id.to_usize() < *node_count
+            }
         };
         if exists {
             Ok(())
@@ -1323,33 +1329,20 @@ impl NodeProvenanceStorage {
                 .get_mut(node_index)
                 .ok_or(DagError::MissingNode { node: node_index })?
                 .push(PackedProvenanceRecord::try_from_record(record)?),
-            Self::TracePaths(counts) => {
-                let count = counts
-                    .get_mut(node_index)
-                    .ok_or(DagError::MissingNode { node: node_index })?;
-                *count += 1;
-            }
-            Self::CountOnly(counts) => {
-                let count = counts
-                    .get_mut(node_index)
-                    .ok_or(DagError::MissingNode { node: node_index })?;
-                *count += 1;
+            Self::TracePaths { .. } | Self::CountOnly { .. } => {
+                self.ensure_node_exists(node_id)?;
             }
         }
         Ok(())
     }
 
-    fn add_count(&mut self, node_id: NodeId, count: u64) -> Result<()> {
-        let node_index = node_id.to_usize();
+    fn add_count(&mut self, node_id: NodeId, _count: u64) -> Result<()> {
         match self {
-            Self::CountOnly(counts) => {
-                let slot = counts
-                    .get_mut(node_index)
-                    .ok_or(DagError::MissingNode { node: node_index })?;
-                *slot += count;
+            Self::CountOnly { .. } => {
+                self.ensure_node_exists(node_id)?;
                 Ok(())
             }
-            Self::Full(_) | Self::Packed32(_) | Self::TracePaths(_) => {
+            Self::Full(_) | Self::Packed32(_) | Self::TracePaths { .. } => {
                 Err(DagError::UnsupportedOperation(
                     "bulk provenance count transfer is only supported with CountOnly provenance storage",
                 ))
@@ -1357,7 +1350,7 @@ impl NodeProvenanceStorage {
         }
     }
 
-    fn record_count(&self, node_id: NodeId) -> Result<usize> {
+    fn record_count(&self, node_id: NodeId, node_weight: Weight) -> Result<usize> {
         let node_index = node_id.to_usize();
         match self {
             Self::Full(records) => records
@@ -1368,14 +1361,13 @@ impl NodeProvenanceStorage {
                 .get(node_index)
                 .map(Vec::len)
                 .ok_or(DagError::MissingNode { node: node_index }),
-            Self::TracePaths(counts) => counts
-                .get(node_index)
-                .map(|count| *count as usize)
-                .ok_or(DagError::MissingNode { node: node_index }),
-            Self::CountOnly(counts) => counts
-                .get(node_index)
-                .map(|count| *count as usize)
-                .ok_or(DagError::MissingNode { node: node_index }),
+            Self::TracePaths { .. } | Self::CountOnly { .. } => {
+                self.ensure_node_exists(node_id)?;
+                usize::try_from(node_weight.raw()).map_err(|_| DagError::ValueDoesNotFit {
+                    value: node_weight.raw() as u128,
+                    bits: usize::BITS as u8,
+                })
+            }
         }
     }
 
@@ -1396,10 +1388,10 @@ impl NodeProvenanceStorage {
                         .collect()
                 })
                 .ok_or(DagError::MissingNode { node: node_index }),
-            Self::TracePaths(_) => Err(DagError::UnsupportedOperation(
+            Self::TracePaths { .. } => Err(DagError::UnsupportedOperation(
                 "node provenance records are not retained with TracePaths provenance storage",
             )),
-            Self::CountOnly(_) => Err(DagError::UnsupportedOperation(
+            Self::CountOnly { .. } => Err(DagError::UnsupportedOperation(
                 "node provenance records are not retained with CountOnly provenance storage",
             )),
         }
@@ -1418,10 +1410,10 @@ impl NodeProvenanceStorage {
                 .ok_or(DagError::MissingNode { node: node_index })?
                 .iter()
                 .all(|record| record.sequence_id() != sequence_id)),
-            Self::TracePaths(_) => Err(DagError::UnsupportedOperation(
+            Self::TracePaths { .. } => Err(DagError::UnsupportedOperation(
                 "out-of-order duplicate provenance checks require retained node provenance records",
             )),
-            Self::CountOnly(_) => Err(DagError::UnsupportedOperation(
+            Self::CountOnly { .. } => Err(DagError::UnsupportedOperation(
                 "out-of-order duplicate provenance checks require retained node provenance records",
             )),
         }
@@ -1432,30 +1424,27 @@ impl NodeProvenanceStorage {
     }
 
     fn retains_trace_paths(&self) -> bool {
-        matches!(self, Self::TracePaths(_))
+        matches!(self, Self::TracePaths { .. })
     }
 
     fn snapshot(&self, sequence_trace_paths: &SequenceTraceStore) -> Result<ProvenanceSnapshot> {
         Ok(match self {
             Self::Full(records) => ProvenanceSnapshot::Full(records.clone()),
             Self::Packed32(records) => ProvenanceSnapshot::Packed32(records.clone()),
-            Self::TracePaths(node_counts) => ProvenanceSnapshot::TracePaths {
-                node_counts: node_counts.clone(),
+            Self::TracePaths { .. } => ProvenanceSnapshot::TracePaths {
                 sequence_trace_offsets: sequence_trace_paths.offsets().to_vec(),
                 sequence_trace_nodes: sequence_trace_paths.snapshot_nodes()?,
             },
-            Self::CountOnly(counts) => ProvenanceSnapshot::CountOnly(counts.clone()),
+            Self::CountOnly { .. } => ProvenanceSnapshot::CountOnly,
         })
     }
 
-    fn from_snapshot(snapshot: &ProvenanceSnapshot) -> Self {
+    fn from_snapshot(snapshot: &ProvenanceSnapshot, node_count: usize) -> Self {
         match snapshot {
             ProvenanceSnapshot::Full(records) => Self::Full(records.clone()),
             ProvenanceSnapshot::Packed32(records) => Self::Packed32(records.clone()),
-            ProvenanceSnapshot::TracePaths { node_counts, .. } => {
-                Self::TracePaths(node_counts.clone())
-            }
-            ProvenanceSnapshot::CountOnly(counts) => Self::CountOnly(counts.clone()),
+            ProvenanceSnapshot::TracePaths { .. } => Self::TracePaths { node_count },
+            ProvenanceSnapshot::CountOnly => Self::CountOnly { node_count },
         }
     }
 }
@@ -1549,9 +1538,7 @@ impl FtoDag {
 
     pub fn to_count_only(&self) -> Result<Self> {
         let mut snapshot = self.snapshot()?;
-        snapshot.provenance = ProvenanceSnapshot::CountOnly(
-            self.nodes.iter().map(|node| node.weight.raw()).collect(),
-        );
+        snapshot.provenance = ProvenanceSnapshot::CountOnly;
         Self::from_snapshot(snapshot)
     }
 
@@ -1560,7 +1547,8 @@ impl FtoDag {
     }
 
     pub fn provenance_record_count(&self, node_id: NodeId) -> Result<usize> {
-        self.node_provenance.record_count(node_id)
+        let node = self.node(node_id)?;
+        self.node_provenance.record_count(node_id, node.weight)
     }
 
     pub fn retains_provenance_records(&self) -> bool {
@@ -1785,13 +1773,7 @@ impl FtoDag {
             node_last_sequences,
         } = snapshot;
 
-        if nodes.len() != provenance.node_count() {
-            return Err(DagError::InvalidStorage(format!(
-                "node/provenance length mismatch: {} nodes vs {} provenance slots",
-                nodes.len(),
-                provenance.node_count()
-            )));
-        }
+        provenance.validate_node_count(nodes.len())?;
         if nodes.len() != node_last_sequences.len() {
             return Err(DagError::InvalidStorage(format!(
                 "node/node-last-sequence length mismatch: {} nodes vs {} markers",
@@ -1799,8 +1781,8 @@ impl FtoDag {
                 node_last_sequences.len()
             )));
         }
-        let node_count = provenance.node_count();
-        let node_provenance = NodeProvenanceStorage::from_snapshot(&provenance);
+        let node_count = nodes.len();
+        let node_provenance = NodeProvenanceStorage::from_snapshot(&provenance, node_count);
         let sequence_trace_paths = match provenance {
             ProvenanceSnapshot::TracePaths {
                 sequence_trace_offsets,
@@ -1811,7 +1793,7 @@ impl FtoDag {
             }
             ProvenanceSnapshot::Full(_)
             | ProvenanceSnapshot::Packed32(_)
-            | ProvenanceSnapshot::CountOnly(_) => SequenceTraceStore::default(),
+            | ProvenanceSnapshot::CountOnly => SequenceTraceStore::default(),
         };
         let parents = AdjacencyLists::from_edges(node_count, &edges, false)?;
         let children = AdjacencyLists::from_edges(node_count, &edges, true)?;
