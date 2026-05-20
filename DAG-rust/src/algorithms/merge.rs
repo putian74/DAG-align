@@ -127,7 +127,8 @@ fn replay_trace_path_graphs(base: FtoDag, add: FtoDag, config: MergeConfig) -> R
     build_config.topology_update_strategy = TopologyUpdateStrategy::IncrementalForwardRelaxation;
     let mut builder = FtoDagBuilder::from_graph(base, build_config)?;
 
-    for (sequence_offset, trace_path) in add.sequence_trace_paths()?.enumerate() {
+    let mut trace_paths = add.sequence_trace_paths()?;
+    while let Some((sequence_offset, trace_path)) = trace_paths.next_path()? {
         if trace_path.is_empty() {
             continue;
         }

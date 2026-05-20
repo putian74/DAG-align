@@ -57,7 +57,7 @@ impl GraphStorage for NativeGraphStorage {
         let file = File::create(path)
             .map_err(|err| DagError::Io(format!("create {}: {err}", path.display())))?;
         let mut writer = BufWriter::new(file);
-        let snapshot = graph.snapshot();
+        let snapshot = graph.snapshot()?;
 
         writer
             .write_all(&STORAGE_MAGIC)

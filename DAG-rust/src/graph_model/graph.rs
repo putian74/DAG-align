@@ -9,6 +9,11 @@ use crate::graph_model::provenance::{
 };
 use crate::sequence_model::fragment::FragmentKey;
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions, remove_file};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum NodeKind {
@@ -74,6 +79,9 @@ pub enum EdgeIndexStrategy {
 }
 
 const HYBRID_EDGE_INLINE_LIMIT: usize = 8;
+const TRACE_PATH_NODE_BYTES: u64 = std::mem::size_of::<u32>() as u64;
+const TRACE_PATH_FLUSH_NODE_COUNT: usize = 16_384;
+static NEXT_TRACE_PATH_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct InlineEdgeEntry {
@@ -336,20 +344,60 @@ pub struct FtoDag {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SequenceTraceStore {
     offsets: Vec<u64>,
-    nodes: Vec<NodeId>,
+    backing: SequenceTraceBacking,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SequenceTraceBacking {
+    InMemory(Vec<NodeId>),
+    DeferredExternal,
+    External(Arc<ExternalTraceFile>),
+}
+
+#[derive(Debug)]
+struct ExternalTraceFile {
+    path: PathBuf,
+    state: Mutex<ExternalTraceState>,
+}
+
+#[derive(Debug)]
+struct ExternalTraceState {
+    file: File,
+    pending_nodes: Vec<NodeId>,
+}
+
+impl PartialEq for ExternalTraceFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl Eq for ExternalTraceFile {}
+
+impl Drop for ExternalTraceFile {
+    fn drop(&mut self) {
+        let _ = remove_file(&self.path);
+    }
 }
 
 impl Default for SequenceTraceStore {
     fn default() -> Self {
         Self {
             offsets: vec![0],
-            nodes: Vec::new(),
+            backing: SequenceTraceBacking::InMemory(Vec::new()),
         }
     }
 }
 
 impl SequenceTraceStore {
-    fn from_parts(offsets: Vec<u64>, nodes: Vec<NodeId>) -> Result<Self> {
+    fn deferred_external() -> Self {
+        Self {
+            offsets: vec![0],
+            backing: SequenceTraceBacking::DeferredExternal,
+        }
+    }
+
+    fn from_parts(offsets: Vec<u64>, nodes: Vec<NodeId>, externalize: bool) -> Result<Self> {
         if offsets.is_empty() {
             return Err(DagError::InvalidStorage(
                 "trace-path offsets must include an initial zero".to_string(),
@@ -378,7 +426,14 @@ impl SequenceTraceStore {
                 offsets[offsets.len() - 1]
             )));
         }
-        Ok(Self { offsets, nodes })
+        let backing = if externalize {
+            let file = ExternalTraceFile::create_temp()?;
+            file.write_all_nodes(&nodes)?;
+            SequenceTraceBacking::External(Arc::new(file))
+        } else {
+            SequenceTraceBacking::InMemory(nodes)
+        };
+        Ok(Self { offsets, backing })
     }
 
     fn path_count(&self) -> usize {
@@ -389,8 +444,10 @@ impl SequenceTraceStore {
         &self.offsets
     }
 
-    fn nodes(&self) -> &[NodeId] {
-        &self.nodes
+    fn path(&self, sequence_id: SequenceId) -> Result<Vec<NodeId>> {
+        let mut buffer = Vec::new();
+        self.read_path_into(sequence_id, &mut buffer)?;
+        Ok(buffer)
     }
 
     fn path_bounds(&self, sequence_index: usize) -> Option<(usize, usize)> {
@@ -401,15 +458,67 @@ impl SequenceTraceStore {
         Some((start, end))
     }
 
-    fn path(&self, sequence_id: SequenceId) -> Option<&[NodeId]> {
-        let (start, end) = self.path_bounds(sequence_id.to_usize())?;
-        self.nodes.get(start..end)
+    fn read_path_into(&self, sequence_id: SequenceId, buffer: &mut Vec<NodeId>) -> Result<()> {
+        self.read_path_into_index(sequence_id.to_usize(), buffer)
     }
 
-    fn iter(&self) -> SequenceTracePathIter<'_> {
-        SequenceTracePathIter {
+    fn read_path_into_index(&self, sequence_index: usize, buffer: &mut Vec<NodeId>) -> Result<()> {
+        let Some((start, end)) = self.path_bounds(sequence_index) else {
+            return Err(DagError::InvalidRange {
+                start: sequence_index,
+                end: sequence_index.saturating_add(1),
+                len: self.path_count(),
+            });
+        };
+        self.read_nodes(start, end, buffer)
+    }
+
+    fn read_nodes(&self, start: usize, end: usize, buffer: &mut Vec<NodeId>) -> Result<()> {
+        match &self.backing {
+            SequenceTraceBacking::InMemory(nodes) => {
+                let path = nodes.get(start..end).ok_or(DagError::InvalidRange {
+                    start,
+                    end,
+                    len: nodes.len(),
+                })?;
+                buffer.clear();
+                buffer.extend_from_slice(path);
+                Ok(())
+            }
+            SequenceTraceBacking::DeferredExternal => {
+                if start == end {
+                    buffer.clear();
+                    Ok(())
+                } else {
+                    Err(DagError::InvalidStorage(
+                        "trace-path external backing is missing stored nodes".to_string(),
+                    ))
+                }
+            }
+            SequenceTraceBacking::External(file) => file.read_nodes(start, end, buffer),
+        }
+    }
+
+    fn snapshot_nodes(&self) -> Result<Vec<NodeId>> {
+        let Some(total) = self.offsets.last().copied() else {
+            return Err(DagError::InvalidStorage(
+                "trace-path offsets must include an initial zero".to_string(),
+            ));
+        };
+        let total = usize::try_from(total).map_err(|_| DagError::ValueDoesNotFit {
+            value: total as u128,
+            bits: usize::BITS as u8,
+        })?;
+        let mut nodes = Vec::with_capacity(total);
+        self.read_nodes(0, total, &mut nodes)?;
+        Ok(nodes)
+    }
+
+    fn reader(&self) -> SequenceTracePathReader<'_> {
+        SequenceTracePathReader {
             store: self,
             next_index: 0,
+            buffer: Vec::new(),
         }
     }
 
@@ -420,8 +529,9 @@ impl SequenceTraceStore {
         node_id: NodeId,
     ) -> Result<()> {
         let sequence_index = sequence_id.to_usize();
+        let current_len = self.offsets.last().copied().unwrap_or(0);
         while self.path_count() < sequence_index + 1 {
-            self.offsets.push(self.nodes.len() as u64);
+            self.offsets.push(current_len);
         }
         if sequence_index + 1 != self.path_count() {
             return Err(DagError::InvalidRange {
@@ -449,27 +559,225 @@ impl SequenceTraceStore {
                 len: expected_position,
             });
         }
-        self.nodes.push(node_id);
-        self.offsets[sequence_index + 1] = self.nodes.len() as u64;
+        match &mut self.backing {
+            SequenceTraceBacking::InMemory(nodes) => {
+                nodes.push(node_id);
+                self.offsets[sequence_index + 1] = nodes.len() as u64;
+            }
+            SequenceTraceBacking::DeferredExternal | SequenceTraceBacking::External(_) => {
+                let store = self.ensure_unique_external_backing()?;
+                store.append_node(node_id)?;
+                self.offsets[sequence_index + 1] += 1;
+            }
+        }
         Ok(())
+    }
+
+    fn ensure_unique_external_backing(&mut self) -> Result<&ExternalTraceFile> {
+        let logical_len = self.offsets.last().copied().unwrap_or(0);
+        let logical_len = usize::try_from(logical_len).map_err(|_| DagError::ValueDoesNotFit {
+            value: logical_len as u128,
+            bits: usize::BITS as u8,
+        })?;
+        let replacement = match &self.backing {
+            SequenceTraceBacking::DeferredExternal => Some(SequenceTraceBacking::External(
+                Arc::new(ExternalTraceFile::create_temp()?),
+            )),
+            SequenceTraceBacking::External(file) if Arc::strong_count(file) > 1 => Some(
+                SequenceTraceBacking::External(Arc::new(file.clone_prefix(logical_len)?)),
+            ),
+            SequenceTraceBacking::InMemory(_) | SequenceTraceBacking::External(_) => None,
+        };
+        if let Some(backing) = replacement {
+            self.backing = backing;
+        }
+        match &self.backing {
+            SequenceTraceBacking::External(file) => Ok(file.as_ref()),
+            SequenceTraceBacking::InMemory(_) | SequenceTraceBacking::DeferredExternal => {
+                Err(DagError::InvalidStorage(
+                    "trace-path storage is not backed by an external store".to_string(),
+                ))
+            }
+        }
     }
 }
 
-pub(crate) struct SequenceTracePathIter<'a> {
-    store: &'a SequenceTraceStore,
-    next_index: usize,
+impl ExternalTraceFile {
+    fn create_temp() -> Result<Self> {
+        let directory = std::env::temp_dir();
+        for _ in 0..1024 {
+            let suffix = NEXT_TRACE_PATH_FILE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = directory.join(format!(
+                "dag-rust-tracepaths-{}-{suffix}.bin",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        state: Mutex::new(ExternalTraceState {
+                            file,
+                            pending_nodes: Vec::with_capacity(TRACE_PATH_FLUSH_NODE_COUNT),
+                        }),
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(DagError::Io(format!("create {}: {err}", path.display())));
+                }
+            }
+        }
+        Err(DagError::Io(
+            "failed to allocate a unique trace-path temporary file".to_string(),
+        ))
+    }
+
+    fn append_node(&self, node_id: NodeId) -> Result<()> {
+        let mut state = self.lock_state()?;
+        state.pending_nodes.push(node_id);
+        if state.pending_nodes.len() >= TRACE_PATH_FLUSH_NODE_COUNT {
+            self.flush_locked(&mut state)?;
+        }
+        Ok(())
+    }
+
+    fn write_all_nodes(&self, nodes: &[NodeId]) -> Result<()> {
+        let mut state = self.lock_state()?;
+        state.pending_nodes.clear();
+        state
+            .file
+            .set_len(0)
+            .map_err(|err| DagError::Io(format!("truncate {}: {err}", self.path.display())))?;
+        state
+            .file
+            .seek(SeekFrom::Start(0))
+            .map_err(|err| DagError::Io(format!("seek {}: {err}", self.path.display())))?;
+        self.write_nodes_locked(&mut state.file, nodes)
+    }
+
+    fn read_nodes(&self, start: usize, end: usize, buffer: &mut Vec<NodeId>) -> Result<()> {
+        let node_count = end.saturating_sub(start);
+        buffer.clear();
+        if node_count == 0 {
+            return Ok(());
+        }
+        let start_byte = trace_path_byte_offset(start)?;
+        let byte_len = trace_path_byte_offset(node_count)?;
+        let byte_len = usize::try_from(byte_len).map_err(|_| DagError::ValueDoesNotFit {
+            value: byte_len as u128,
+            bits: usize::BITS as u8,
+        })?;
+        let mut raw = vec![0_u8; byte_len];
+        let mut state = self.lock_state()?;
+        self.flush_locked(&mut state)?;
+        state
+            .file
+            .seek(SeekFrom::Start(start_byte))
+            .map_err(|err| DagError::Io(format!("seek {}: {err}", self.path.display())))?;
+        state
+            .file
+            .read_exact(&mut raw)
+            .map_err(|err| DagError::Io(format!("read {}: {err}", self.path.display())))?;
+        buffer.reserve(node_count);
+        for chunk in raw.chunks_exact(TRACE_PATH_NODE_BYTES as usize) {
+            buffer.push(NodeId::new(u32::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3],
+            ])));
+        }
+        Ok(())
+    }
+
+    fn clone_prefix(&self, node_count: usize) -> Result<Self> {
+        let mut nodes = Vec::with_capacity(node_count);
+        self.read_nodes(0, node_count, &mut nodes)?;
+        let cloned = Self::create_temp()?;
+        cloned.write_all_nodes(&nodes)?;
+        Ok(cloned)
+    }
+
+    fn flush_locked(&self, state: &mut ExternalTraceState) -> Result<()> {
+        if state.pending_nodes.is_empty() {
+            return Ok(());
+        }
+        state
+            .file
+            .seek(SeekFrom::End(0))
+            .map_err(|err| DagError::Io(format!("seek {}: {err}", self.path.display())))?;
+        let pending_nodes = std::mem::take(&mut state.pending_nodes);
+        let result = self.write_nodes_locked(&mut state.file, &pending_nodes);
+        match result {
+            Ok(()) => {
+                state.pending_nodes = pending_nodes;
+                state.pending_nodes.clear();
+                Ok(())
+            }
+            Err(err) => {
+                state.pending_nodes = pending_nodes;
+                Err(err)
+            }
+        }
+    }
+
+    fn write_nodes_locked(&self, file: &mut File, nodes: &[NodeId]) -> Result<()> {
+        let byte_len = nodes
+            .len()
+            .checked_mul(TRACE_PATH_NODE_BYTES as usize)
+            .ok_or(DagError::ValueDoesNotFit {
+                value: nodes.len() as u128 * u128::from(TRACE_PATH_NODE_BYTES),
+                bits: usize::BITS as u8,
+            })?;
+        let mut raw = Vec::with_capacity(byte_len);
+        for node_id in nodes {
+            raw.extend_from_slice(&node_id.raw().to_le_bytes());
+        }
+        file.write_all(&raw)
+            .map_err(|err| DagError::Io(format!("write {}: {err}", self.path.display())))
+    }
+
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, ExternalTraceState>> {
+        self.state.lock().map_err(|_| {
+            DagError::Io(format!(
+                "lock {}: trace-path temporary file handle was poisoned",
+                self.path.display()
+            ))
+        })
+    }
 }
 
-impl<'a> Iterator for SequenceTracePathIter<'a> {
-    type Item = &'a [NodeId];
+fn trace_path_byte_offset(node_count: usize) -> Result<u64> {
+    let node_count = u64::try_from(node_count).map_err(|_| DagError::ValueDoesNotFit {
+        value: node_count as u128,
+        bits: 64,
+    })?;
+    node_count
+        .checked_mul(TRACE_PATH_NODE_BYTES)
+        .ok_or(DagError::ValueDoesNotFit {
+            value: u128::from(node_count) * u128::from(TRACE_PATH_NODE_BYTES),
+            bits: 64,
+        })
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let path = self
-            .store
-            .path_bounds(self.next_index)
-            .and_then(|(start, end)| self.store.nodes.get(start..end))?;
+pub(crate) struct SequenceTracePathReader<'a> {
+    store: &'a SequenceTraceStore,
+    next_index: usize,
+    buffer: Vec<NodeId>,
+}
+
+impl<'a> SequenceTracePathReader<'a> {
+    pub(crate) fn next_path(&mut self) -> Result<Option<(usize, &[NodeId])>> {
+        if self.next_index >= self.store.path_count() {
+            return Ok(None);
+        }
+        let sequence_index = self.next_index;
+        self.store
+            .read_path_into_index(sequence_index, &mut self.buffer)?;
         self.next_index += 1;
-        Some(path)
+        Ok(Some((sequence_index, self.buffer.as_slice())))
     }
 }
 
@@ -511,7 +819,6 @@ impl ProvenanceSnapshot {
             Self::CountOnly(counts) => counts.len(),
         }
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -691,17 +998,17 @@ impl NodeProvenanceStorage {
         matches!(self, Self::TracePaths(_))
     }
 
-    fn snapshot(&self, sequence_trace_paths: &SequenceTraceStore) -> ProvenanceSnapshot {
-        match self {
+    fn snapshot(&self, sequence_trace_paths: &SequenceTraceStore) -> Result<ProvenanceSnapshot> {
+        Ok(match self {
             Self::Full(records) => ProvenanceSnapshot::Full(records.clone()),
             Self::Packed32(records) => ProvenanceSnapshot::Packed32(records.clone()),
             Self::TracePaths(node_counts) => ProvenanceSnapshot::TracePaths {
                 node_counts: node_counts.clone(),
                 sequence_trace_offsets: sequence_trace_paths.offsets().to_vec(),
-                sequence_trace_nodes: sequence_trace_paths.nodes().to_vec(),
+                sequence_trace_nodes: sequence_trace_paths.snapshot_nodes()?,
             },
             Self::CountOnly(counts) => ProvenanceSnapshot::CountOnly(counts.clone()),
-        }
+        })
     }
 
     fn from_snapshot(snapshot: &ProvenanceSnapshot) -> Self {
@@ -746,7 +1053,11 @@ impl FtoDag {
             children: Vec::new(),
             provenance_table: ProvenanceTable::new(),
             node_provenance: NodeProvenanceStorage::new(provenance_storage),
-            sequence_trace_paths: SequenceTraceStore::default(),
+            sequence_trace_paths: if provenance_storage == ProvenanceStorageStrategy::TracePaths {
+                SequenceTraceStore::deferred_external()
+            } else {
+                SequenceTraceStore::default()
+            },
             node_last_sequences: Vec::new(),
             fragment_index: FragmentIndex::default(),
             endpoint_index: EndpointIndex::default(),
@@ -810,7 +1121,7 @@ impl FtoDag {
     }
 
     pub fn to_count_only(&self) -> Result<Self> {
-        let mut snapshot = self.snapshot();
+        let mut snapshot = self.snapshot()?;
         snapshot.provenance = ProvenanceSnapshot::CountOnly(
             self.nodes.iter().map(|node| node.weight.raw()).collect(),
         );
@@ -833,19 +1144,13 @@ impl FtoDag {
         self.node_provenance.retains_trace_paths()
     }
 
-    pub fn sequence_trace_path(&self, sequence_id: SequenceId) -> Result<&[NodeId]> {
+    pub fn sequence_trace_path(&self, sequence_id: SequenceId) -> Result<Vec<NodeId>> {
         if !self.retains_sequence_trace_paths() {
             return Err(DagError::UnsupportedOperation(
                 "sequence trace paths are only retained with TracePaths provenance storage",
             ));
         }
-        self.sequence_trace_paths
-            .path(sequence_id)
-            .ok_or(DagError::InvalidRange {
-                start: sequence_id.to_usize(),
-                end: sequence_id.to_usize().saturating_add(1),
-                len: self.sequence_trace_paths.path_count(),
-            })
+        self.sequence_trace_paths.path(sequence_id)
     }
 
     pub(crate) fn sequence_trace_path_count(&self) -> Result<usize> {
@@ -857,13 +1162,13 @@ impl FtoDag {
         Ok(self.sequence_trace_paths.path_count())
     }
 
-    pub(crate) fn sequence_trace_paths(&self) -> Result<SequenceTracePathIter<'_>> {
+    pub(crate) fn sequence_trace_paths(&self) -> Result<SequenceTracePathReader<'_>> {
         if !self.retains_sequence_trace_paths() {
             return Err(DagError::UnsupportedOperation(
                 "sequence trace paths are only retained with TracePaths provenance storage",
             ));
         }
-        Ok(self.sequence_trace_paths.iter())
+        Ok(self.sequence_trace_paths.reader())
     }
 
     pub fn can_node_accept_sequence(
@@ -1020,56 +1325,67 @@ impl FtoDag {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> FtoDagSnapshot {
-        FtoDagSnapshot {
+    pub(crate) fn snapshot(&self) -> Result<FtoDagSnapshot> {
+        Ok(FtoDagSnapshot {
             fragment_len: self.fragment_len,
             nodes: self.nodes.clone(),
             edges: self.edges.clone(),
             edge_index_strategy: self.edge_index.strategy(),
-            provenance: self.node_provenance.snapshot(&self.sequence_trace_paths),
+            provenance: self.node_provenance.snapshot(&self.sequence_trace_paths)?,
             node_last_sequences: self.node_last_sequences.clone(),
-        }
+        })
     }
 
     pub(crate) fn from_snapshot(snapshot: FtoDagSnapshot) -> Result<Self> {
-        if snapshot.nodes.len() != snapshot.provenance.node_count() {
+        let FtoDagSnapshot {
+            fragment_len,
+            nodes,
+            edges,
+            edge_index_strategy,
+            provenance,
+            node_last_sequences,
+        } = snapshot;
+
+        if nodes.len() != provenance.node_count() {
             return Err(DagError::InvalidStorage(format!(
                 "node/provenance length mismatch: {} nodes vs {} provenance slots",
-                snapshot.nodes.len(),
-                snapshot.provenance.node_count()
+                nodes.len(),
+                provenance.node_count()
             )));
         }
-        if snapshot.nodes.len() != snapshot.node_last_sequences.len() {
+        if nodes.len() != node_last_sequences.len() {
             return Err(DagError::InvalidStorage(format!(
                 "node/node-last-sequence length mismatch: {} nodes vs {} markers",
-                snapshot.nodes.len(),
-                snapshot.node_last_sequences.len()
+                nodes.len(),
+                node_last_sequences.len()
             )));
         }
+        let node_count = provenance.node_count();
+        let node_provenance = NodeProvenanceStorage::from_snapshot(&provenance);
+        let sequence_trace_paths = match provenance {
+            ProvenanceSnapshot::TracePaths {
+                sequence_trace_offsets,
+                sequence_trace_nodes,
+                ..
+            } => {
+                SequenceTraceStore::from_parts(sequence_trace_offsets, sequence_trace_nodes, true)?
+            }
+            ProvenanceSnapshot::Full(_)
+            | ProvenanceSnapshot::Packed32(_)
+            | ProvenanceSnapshot::CountOnly(_) => SequenceTraceStore::default(),
+        };
 
         let mut graph = Self {
-            fragment_len: snapshot.fragment_len,
-            nodes: snapshot.nodes,
-            edges: snapshot.edges,
-            edge_index: EdgeIndexStorage::new(snapshot.edge_index_strategy),
-            parents: vec![Vec::new(); snapshot.provenance.node_count()],
-            children: vec![Vec::new(); snapshot.provenance.node_count()],
+            fragment_len,
+            nodes,
+            edges,
+            edge_index: EdgeIndexStorage::new(edge_index_strategy),
+            parents: vec![Vec::new(); node_count],
+            children: vec![Vec::new(); node_count],
             provenance_table: ProvenanceTable::new(),
-            node_provenance: NodeProvenanceStorage::from_snapshot(&snapshot.provenance),
-            sequence_trace_paths: match &snapshot.provenance {
-                ProvenanceSnapshot::TracePaths {
-                    sequence_trace_offsets,
-                    sequence_trace_nodes,
-                    ..
-                } => SequenceTraceStore::from_parts(
-                    sequence_trace_offsets.clone(),
-                    sequence_trace_nodes.clone(),
-                )?,
-                ProvenanceSnapshot::Full(_)
-                | ProvenanceSnapshot::Packed32(_)
-                | ProvenanceSnapshot::CountOnly(_) => SequenceTraceStore::default(),
-            },
-            node_last_sequences: snapshot.node_last_sequences,
+            node_provenance,
+            sequence_trace_paths,
+            node_last_sequences,
             fragment_index: FragmentIndex::default(),
             endpoint_index: EndpointIndex::default(),
         };

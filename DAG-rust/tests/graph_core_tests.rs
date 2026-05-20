@@ -286,6 +286,56 @@ fn trace_path_provenance_storage_tracks_sequence_paths_without_node_records() {
 }
 
 #[test]
+fn trace_path_graph_clone_detaches_before_future_mutation() {
+    let mut graph = FtoDag::with_provenance_storage(1, ProvenanceStorageStrategy::TracePaths);
+    let left = graph.add_node(key(1), NodeKind::Start).unwrap();
+    let right = graph.add_node(key(2), NodeKind::End).unwrap();
+    graph
+        .add_provenance_record(
+            left,
+            ProvenanceRecord {
+                sequence_id: SequenceId::new(0),
+                position: ProvenancePosition::new(0),
+            },
+        )
+        .unwrap();
+    graph
+        .add_provenance_record(
+            right,
+            ProvenanceRecord {
+                sequence_id: SequenceId::new(0),
+                position: ProvenancePosition::new(1),
+            },
+        )
+        .unwrap();
+
+    let cloned = graph.clone();
+
+    let singleton = graph.add_node(key(3), NodeKind::Singleton).unwrap();
+    graph
+        .add_provenance_record(
+            singleton,
+            ProvenanceRecord {
+                sequence_id: SequenceId::new(1),
+                position: ProvenancePosition::new(0),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        cloned.sequence_trace_path(SequenceId::new(0)).unwrap(),
+        &[left, right]
+    );
+    assert!(cloned.sequence_trace_path(SequenceId::new(1)).is_err());
+    assert_eq!(
+        graph.sequence_trace_path(SequenceId::new(1)).unwrap(),
+        &[singleton]
+    );
+    assert!(cloned.validate().is_valid());
+    assert!(graph.validate().is_valid());
+}
+
+#[test]
 fn validation_reports_duplicate_sequence_provenance() {
     let mut graph = FtoDag::new(1);
     let node = graph.add_node(key(1), NodeKind::Singleton).unwrap();
