@@ -236,11 +236,13 @@ pub struct EndpointIndex {
     sequence_ends: Vec<NodeId>,
     structural_roots: Vec<NodeId>,
     structural_sinks: Vec<NodeId>,
-    structural_root_positions: Vec<Option<usize>>,
-    structural_sink_positions: Vec<Option<usize>>,
+    structural_root_positions: Vec<u32>,
+    structural_sink_positions: Vec<u32>,
 }
 
 impl EndpointIndex {
+    const MISSING_POSITION: u32 = u32::MAX;
+
     pub fn sequence_starts(&self) -> &[NodeId] {
         &self.sequence_starts
     }
@@ -264,10 +266,14 @@ impl EndpointIndex {
         if kind.is_sequence_end() {
             self.sequence_ends.push(node_id);
         }
+        let root_position =
+            u32::try_from(self.structural_roots.len()).expect("endpoint count exceeds u32");
+        let sink_position =
+            u32::try_from(self.structural_sinks.len()).expect("endpoint count exceeds u32");
         Self::ensure_position_len(&mut self.structural_root_positions, node_id);
         Self::ensure_position_len(&mut self.structural_sink_positions, node_id);
-        self.structural_root_positions[node_id.to_usize()] = Some(self.structural_roots.len());
-        self.structural_sink_positions[node_id.to_usize()] = Some(self.structural_sinks.len());
+        self.structural_root_positions[node_id.to_usize()] = root_position;
+        self.structural_sink_positions[node_id.to_usize()] = sink_position;
         self.structural_roots.push(node_id);
         self.structural_sinks.push(node_id);
     }
@@ -285,26 +291,28 @@ impl EndpointIndex {
         );
     }
 
-    fn ensure_position_len(positions: &mut Vec<Option<usize>>, node_id: NodeId) {
+    fn ensure_position_len(positions: &mut Vec<u32>, node_id: NodeId) {
         let required_len = node_id.to_usize() + 1;
         if positions.len() < required_len {
-            positions.resize(required_len, None);
+            positions.resize(required_len, Self::MISSING_POSITION);
         }
     }
 
-    fn remove_endpoint(
-        endpoints: &mut Vec<NodeId>,
-        positions: &mut [Option<usize>],
-        node_id: NodeId,
-    ) {
+    fn remove_endpoint(endpoints: &mut Vec<NodeId>, positions: &mut [u32], node_id: NodeId) {
         let node_index = node_id.to_usize();
-        let Some(position) = positions.get_mut(node_index).and_then(Option::take) else {
+        let Some(position) = positions.get_mut(node_index) else {
             return;
         };
-        let moved = endpoints.swap_remove(position);
+        if *position == Self::MISSING_POSITION {
+            return;
+        }
+        let position_index = *position as usize;
+        *position = Self::MISSING_POSITION;
+        let moved = endpoints.swap_remove(position_index);
         debug_assert_eq!(moved, node_id);
-        if let Some(replacement) = endpoints.get(position) {
-            positions[replacement.to_usize()] = Some(position);
+        if let Some(replacement) = endpoints.get(position_index) {
+            positions[replacement.to_usize()] =
+                u32::try_from(position_index).expect("endpoint count exceeds u32");
         }
     }
 }

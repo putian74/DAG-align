@@ -362,6 +362,7 @@ pub struct FtoDagBuilder {
     graph: FtoDag,
     report: BuildReport,
     topology_cache: Option<TopologyCache>,
+    existing_node_marks: ExistingNodeMarks,
 }
 
 impl FtoDagBuilder {
@@ -375,6 +376,7 @@ impl FtoDagBuilder {
             config,
             report: BuildReport::default(),
             topology_cache: None,
+            existing_node_marks: ExistingNodeMarks::default(),
         }
     }
 
@@ -393,6 +395,7 @@ impl FtoDagBuilder {
             graph,
             report: BuildReport::default(),
             topology_cache: None,
+            existing_node_marks: ExistingNodeMarks::default(),
         })
     }
 
@@ -606,7 +609,8 @@ impl FtoDagBuilder {
         let mut node_path = Vec::with_capacity(occurrences.len());
         let mut previous = None;
         let mut last_existing_coordinate = None;
-        let mut used_existing_node_marks = vec![false; self.graph.node_count()];
+        self.existing_node_marks
+            .begin_sequence(self.graph.node_count());
         let mut inserted_edges = 0;
         let mut inserted_edge_keys = Vec::new();
         let mut provenance_records_added = 0;
@@ -620,7 +624,7 @@ impl FtoDagBuilder {
             let node_id = match decision {
                 AnchorDecision::Matched(node_id) => {
                     self.add_source_to_existing_node(*node_id, sequence_id, occurrence.position)?;
-                    mark_used_node(&mut used_existing_node_marks, *node_id);
+                    self.existing_node_marks.mark(*node_id);
                     last_existing_coordinate =
                         selected_coordinate(&anchor_path, &candidate_sets, index, *node_id)
                             .or(last_existing_coordinate);
@@ -635,7 +639,7 @@ impl FtoDagBuilder {
                     if let Some(reuse) = select_bounded_reuse_candidate_with_marks(
                         &candidate_sets[index],
                         interval,
-                        &used_existing_node_marks,
+                        &self.existing_node_marks,
                         &self.graph,
                         previous,
                         next_anchor.map(|(node, _)| node),
@@ -646,7 +650,7 @@ impl FtoDagBuilder {
                             sequence_id,
                             occurrence.position,
                         )?;
-                        mark_used_node(&mut used_existing_node_marks, node_id);
+                        self.existing_node_marks.mark(node_id);
                         last_existing_coordinate = reuse.coordinate.or(last_existing_coordinate);
                         block_plan.reused_nodes.push(node_id);
                         node_id
@@ -1287,23 +1291,73 @@ struct TopologyCache {
 
 impl TopologyCache {
     fn from_graph(graph: &FtoDag, include_reverse: bool) -> Result<Self> {
-        let topology = DagTopology::try_from_graph(graph)?;
-        let mut forward_coordinates = Vec::with_capacity(graph.node_count());
-        let mut reverse_coordinates =
-            include_reverse.then(|| Vec::with_capacity(graph.node_count()));
-        for index in 0..graph.node_count() {
-            let node = NodeId::try_from(index)?;
-            forward_coordinates.push(topology.forward_coordinate(node)?);
-            if let Some(reverse_coordinates) = &mut reverse_coordinates {
-                reverse_coordinates.push(topology.reverse_coordinate(node)?);
-            }
+        let order = topological_order_from_graph(graph)?;
+        let mut forward_coordinates = vec![TopologicalCoordinate::new(0); graph.node_count()];
+        for node in &order {
+            let coordinate = graph
+                .parents(*node)?
+                .iter()
+                .map(|parent| forward_coordinates[parent.to_usize()].raw())
+                .max()
+                .unwrap_or(0)
+                + 1;
+            forward_coordinates[node.to_usize()] = TopologicalCoordinate::new(coordinate);
         }
+        let reverse_coordinates = if include_reverse {
+            let mut reverse_coordinates = vec![TopologicalCoordinate::new(0); graph.node_count()];
+            for node in order.iter().rev() {
+                let coordinate = graph
+                    .children(*node)?
+                    .iter()
+                    .map(|child| reverse_coordinates[child.to_usize()].raw())
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                reverse_coordinates[node.to_usize()] = TopologicalCoordinate::new(coordinate);
+            }
+            Some(reverse_coordinates)
+        } else {
+            None
+        };
         Ok(Self {
             forward_coordinates,
             reverse_coordinates,
         })
     }
+}
 
+fn topological_order_from_graph(graph: &FtoDag) -> Result<Vec<NodeId>> {
+    let mut indegree = Vec::with_capacity(graph.node_count());
+    let mut queue = VecDeque::new();
+    for index in 0..graph.node_count() {
+        let node = NodeId::try_from(index)?;
+        let degree = graph.parents(node)?.len();
+        indegree.push(degree);
+        if degree == 0 {
+            queue.push_back(node);
+        }
+    }
+
+    let mut order = Vec::with_capacity(graph.node_count());
+    while let Some(node) = queue.pop_front() {
+        order.push(node);
+        for child in graph.children(node)? {
+            let degree = &mut indegree[child.to_usize()];
+            *degree -= 1;
+            if *degree == 0 {
+                queue.push_back(*child);
+            }
+        }
+    }
+
+    if order.len() == graph.node_count() {
+        Ok(order)
+    } else {
+        Err(DagError::CycleDetected)
+    }
+}
+
+impl TopologyCache {
     fn node_count(&self) -> usize {
         self.forward_coordinates.len()
     }
@@ -1701,6 +1755,46 @@ mod tests {
                 "forward coordinate differs at node {index}"
             );
         }
+    }
+
+    #[test]
+    fn topology_cache_from_graph_matches_full_with_reverse_coordinates() {
+        let mut graph = FtoDag::new(1);
+        let start = graph.add_node(key(0), NodeKind::Start).unwrap();
+        let left = graph.add_node(key(1), NodeKind::Internal).unwrap();
+        let right = graph.add_node(key(2), NodeKind::Internal).unwrap();
+        let end = graph.add_node(key(3), NodeKind::End).unwrap();
+        add_edge(&mut graph, start, left);
+        add_edge(&mut graph, start, right);
+        add_edge(&mut graph, left, end);
+        add_edge(&mut graph, right, end);
+
+        let cache = TopologyCache::from_graph(&graph, true).unwrap();
+        let topology = DagTopology::try_from_graph(&graph).unwrap();
+        for index in 0..graph.node_count() {
+            let node = NodeId::try_from(index).unwrap();
+            assert_eq!(
+                cache.forward_coordinate(node).unwrap(),
+                topology.forward_coordinate(node).unwrap()
+            );
+            assert_eq!(
+                cache.reverse_coordinate(node).unwrap(),
+                Some(topology.reverse_coordinate(node).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn existing_node_marks_reset_between_sequences() {
+        let mut marks = ExistingNodeMarks::default();
+        marks.begin_sequence(4);
+        marks.mark(NodeId::new(2));
+        assert!(marks.contains(NodeId::new(2)));
+
+        marks.begin_sequence(4);
+        assert!(!marks.contains(NodeId::new(2)));
+        marks.mark(NodeId::new(1));
+        assert!(marks.contains(NodeId::new(1)));
     }
 
     #[test]
@@ -2260,6 +2354,36 @@ impl UsedNodeTracker {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ExistingNodeMarks {
+    marks: Vec<u32>,
+    current_mark: u32,
+}
+
+impl ExistingNodeMarks {
+    fn begin_sequence(&mut self, node_count: usize) {
+        if self.current_mark == u32::MAX {
+            self.marks.fill(0);
+            self.current_mark = 1;
+        } else {
+            self.current_mark += 1;
+        }
+        if self.marks.len() < node_count {
+            self.marks.resize(node_count, 0);
+        }
+    }
+
+    fn contains(&self, node: NodeId) -> bool {
+        self.marks.get(node.to_usize()).copied() == Some(self.current_mark)
+    }
+
+    fn mark(&mut self, node: NodeId) {
+        if let Some(slot) = self.marks.get_mut(node.to_usize()) {
+            *slot = self.current_mark;
+        }
+    }
+}
+
 pub fn select_bounded_reuse_candidate<'a>(
     candidate_set: &'a AnchorCandidateSet,
     interval: CoordinateInterval,
@@ -2290,7 +2414,7 @@ pub fn select_bounded_reuse_candidate<'a>(
 fn select_bounded_reuse_candidate_with_marks<'a>(
     candidate_set: &'a AnchorCandidateSet,
     interval: CoordinateInterval,
-    used_node_marks: &[bool],
+    used_node_marks: &ExistingNodeMarks,
     graph: &FtoDag,
     previous_node: Option<NodeId>,
     next_node: Option<NodeId>,
@@ -2299,10 +2423,7 @@ fn select_bounded_reuse_candidate_with_marks<'a>(
     for candidate in &candidate_set.candidates {
         if !candidate.coordinate.is_some_and(|coordinate| {
             interval.contains_open(coordinate)
-                && !used_node_marks
-                    .get(candidate.node.to_usize())
-                    .copied()
-                    .unwrap_or(false)
+                && !used_node_marks.contains(candidate.node)
                 && next_node != Some(candidate.node)
         }) {
             continue;
@@ -2315,12 +2436,6 @@ fn select_bounded_reuse_candidate_with_marks<'a>(
         }
     }
     best.map(|(candidate, _)| candidate)
-}
-
-fn mark_used_node(used_node_marks: &mut [bool], node: NodeId) {
-    if let Some(mark) = used_node_marks.get_mut(node.to_usize()) {
-        *mark = true;
-    }
 }
 
 pub fn block_plan_from_anchor_path(

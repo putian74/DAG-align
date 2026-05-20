@@ -50,6 +50,23 @@ fn endpoint_index_separates_sequence_and_structural_endpoints() {
 }
 
 #[test]
+fn endpoint_index_updates_swapped_positions_after_multiple_removals() {
+    let mut graph = FtoDag::new(1);
+    let a = graph.add_node(key(0), NodeKind::Internal).unwrap();
+    let b = graph.add_node(key(1), NodeKind::Internal).unwrap();
+    let c = graph.add_node(key(2), NodeKind::Internal).unwrap();
+    let d = graph.add_node(key(3), NodeKind::Internal).unwrap();
+
+    graph.add_or_increment_edge(a, b, Weight::new(1)).unwrap();
+    graph.add_or_increment_edge(c, d, Weight::new(1)).unwrap();
+    graph.add_or_increment_edge(b, c, Weight::new(1)).unwrap();
+
+    assert_eq!(graph.endpoints().structural_roots(), &[a]);
+    assert_eq!(graph.endpoints().structural_sinks(), &[d]);
+    assert!(graph.validate().is_valid());
+}
+
+#[test]
 fn hybrid_edge_index_increments_existing_edges() {
     let mut graph = FtoDag::with_provenance_and_edge_storage(
         1,
