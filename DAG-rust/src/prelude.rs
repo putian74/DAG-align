@@ -3,9 +3,10 @@
 pub use crate::algorithms::build::{
     AnchorBlock, AnchorCandidate, AnchorCandidateSet, AnchorDecision, AnchorPath,
     AnchorRejectReason, BlockPlan, BuildConfig, BuildOrderingPolicy, BuildReport,
-    BuildSequenceResult, BuildTimingBreakdown, CoordinateInterval, FtoDagBuilder,
-    IntegrationDecision, PathRange, ProfiledSequenceBuildOutcome, RejectedSequence,
-    RejectionPolicy, SequenceBuildOutcome, SimilarityThreshold, TopologyUpdateCounters,
+    BuildSequenceResult, BuildSequenceSummary, BuildTimingBreakdown, CoordinateInterval,
+    FtoDagBuilder, IntegrationDecision, PathRange, ProfiledSequenceBuildOutcome,
+    ProfiledSequenceBuildSummaryOutcome, RejectedSequence, RejectionPolicy, SequenceBuildOutcome,
+    SequenceBuildSummaryOutcome, SimilarityThreshold, TopologyUpdateCounters,
     TopologyUpdateStrategy, UnanchoredBlock, block_plan_from_anchor_path,
     node_kind_for_path_position, select_bounded_reuse_candidate, select_monotone_anchor_path,
     select_monotone_anchor_path_with_graph,

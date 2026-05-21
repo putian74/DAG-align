@@ -507,6 +507,44 @@ fn add_sequence_reuses_monotone_anchors_and_inserts_unanchored_block() {
 }
 
 #[test]
+fn add_sequence_summary_reports_counts_without_full_diagnostics() {
+    let alphabet = BuiltinAlphabet::dna_canonical();
+    let encoder =
+        DefaultFragmentEncoder::packed(BitWidth::new(alphabet.bits_per_symbol()).unwrap());
+    let seed = EncodedSequence::encode(SequenceRecord::new("seed", "ACGTACGT"), &alphabet).unwrap();
+    let query =
+        EncodedSequence::encode(SequenceRecord::new("query", "ACGTTCGT"), &alphabet).unwrap();
+    let mut builder = FtoDagBuilder::new(BuildConfig::new(3));
+    builder
+        .initialize_from_encoded(SequenceId::new(0), &seed, &encoder)
+        .unwrap();
+
+    let outcome = builder
+        .add_sequence_from_encoded_summary(SequenceId::new(1), &query, &encoder)
+        .unwrap();
+    let SequenceBuildSummaryOutcome::Integrated(result) = outcome else {
+        panic!("similar sequence should integrate");
+    };
+
+    assert_eq!(result.sequence_id, SequenceId::new(1));
+    assert_eq!(result.provenance_records_added, 6);
+    assert_eq!(result.inserted_edges, 4);
+    assert_eq!(result.new_nodes_created, 3);
+    assert_eq!(result.reused_nodes, 0);
+    assert_eq!(builder.graph().node_count(), 9);
+    assert_eq!(builder.graph().edge_count(), 9);
+    assert_eq!(
+        builder.report().integrated_sequences,
+        vec![SequenceId::new(1)]
+    );
+    assert_eq!(builder.report().attempted_sequences, 1);
+    assert_eq!(builder.report().total_nodes_created, 3);
+    assert_eq!(builder.report().total_edges_inserted, 4);
+    assert_eq!(builder.report().total_provenance_records_added, 6);
+    assert!(builder.graph().validate().is_valid());
+}
+
+#[test]
 fn topology_update_strategies_match_on_small_build() {
     let alphabet = BuiltinAlphabet::dna_canonical();
     let encoder =

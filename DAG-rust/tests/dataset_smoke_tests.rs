@@ -845,7 +845,7 @@ fn local_sars_cov2_archive_1000_full_genomes_profiles_build_phases() {
         encode_time += start.elapsed();
 
         let profiled = builder
-            .add_sequence_from_encoded_profiled(
+            .add_sequence_from_encoded_profiled_summary(
                 SequenceId::try_from(index).unwrap(),
                 &encoded,
                 &encoder,
@@ -1114,7 +1114,7 @@ fn build_profile_graph(
         let encoded = EncodedSequence::encode(SequenceRecord::new(id, sequence.clone()), &alphabet)
             .expect("full SARS-CoV-2 record encodes");
         builder
-            .add_sequence_from_encoded_profiled(
+            .add_sequence_from_encoded_summary(
                 SequenceId::try_from(index).unwrap(),
                 &encoded,
                 &encoder,

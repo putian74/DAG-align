@@ -252,6 +252,15 @@ pub struct BuildSequenceResult {
     pub block_plan: BlockPlan,
 }
 
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct BuildSequenceSummary {
+    pub sequence_id: SequenceId,
+    pub inserted_edges: usize,
+    pub provenance_records_added: usize,
+    pub new_nodes_created: usize,
+    pub reused_nodes: usize,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct RejectedSequence {
     pub sequence_id: SequenceId,
@@ -267,6 +276,12 @@ pub enum IntegrationDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SequenceBuildOutcome {
     Integrated(BuildSequenceResult),
+    Rejected(RejectedSequence),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SequenceBuildSummaryOutcome {
+    Integrated(BuildSequenceSummary),
     Rejected(RejectedSequence),
 }
 
@@ -353,6 +368,67 @@ pub struct ProfiledSequenceBuildOutcome {
     pub timing: BuildTimingBreakdown,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfiledSequenceBuildSummaryOutcome {
+    pub outcome: SequenceBuildSummaryOutcome,
+    pub timing: BuildTimingBreakdown,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BuildDetailMode {
+    Diagnostics,
+    Summary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IntegratedSequenceBuildData {
+    sequence_id: SequenceId,
+    node_path: Option<Vec<NodeId>>,
+    inserted_edges: usize,
+    provenance_records_added: usize,
+    block_plan: Option<BlockPlan>,
+    new_nodes_created: usize,
+    reused_nodes: usize,
+}
+
+impl IntegratedSequenceBuildData {
+    fn into_result(self) -> BuildSequenceResult {
+        BuildSequenceResult {
+            sequence_id: self.sequence_id,
+            node_path: self
+                .node_path
+                .expect("diagnostic build data retains node path"),
+            inserted_edges: self.inserted_edges,
+            provenance_records_added: self.provenance_records_added,
+            block_plan: self
+                .block_plan
+                .expect("diagnostic build data retains block plan"),
+        }
+    }
+
+    fn into_summary(self) -> BuildSequenceSummary {
+        BuildSequenceSummary {
+            sequence_id: self.sequence_id,
+            inserted_edges: self.inserted_edges,
+            provenance_records_added: self.provenance_records_added,
+            new_nodes_created: self.new_nodes_created,
+            reused_nodes: self.reused_nodes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SequenceBuildDataOutcome {
+    Integrated(IntegratedSequenceBuildData),
+    Rejected(RejectedSequence),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProfiledSequenceBuildDataOutcome {
+    outcome: SequenceBuildDataOutcome,
+    timing: BuildTimingBreakdown,
+}
+
 #[derive(Clone, Debug)]
 pub struct FtoDagBuilder {
     config: BuildConfig,
@@ -423,17 +499,26 @@ impl FtoDagBuilder {
         encoder: &E,
     ) -> Result<BuildSequenceResult> {
         let occurrences = encoder.encode_occurrences(sequence, self.config.fragment_len)?;
-        self.initialize_from_occurrences(sequence_id, occurrences)
+        Ok(self
+            .initialize_from_occurrences_with_detail(
+                sequence_id,
+                occurrences,
+                BuildDetailMode::Diagnostics,
+            )?
+            .into_result())
     }
 
-    fn initialize_from_occurrences(
+    fn initialize_from_occurrences_with_detail(
         &mut self,
         sequence_id: SequenceId,
         occurrences: Vec<FragmentOccurrence>,
-    ) -> Result<BuildSequenceResult> {
+        detail_mode: BuildDetailMode,
+    ) -> Result<IntegratedSequenceBuildData> {
         let mut previous = None;
-        let mut node_path = Vec::new();
+        let retain_details = detail_mode == BuildDetailMode::Diagnostics;
+        let mut node_path = retain_details.then(Vec::new);
         let mut inserted_edges = 0;
+        let new_nodes_created = occurrences.len();
         for occurrence in occurrences {
             let node_id = self.add_occurrence_node(sequence_id, occurrence)?;
             if let Some(previous) = previous {
@@ -443,18 +528,21 @@ impl FtoDagBuilder {
                 inserted_edges += usize::from(update.inserted);
             }
             previous = Some(node_id);
-            node_path.push(node_id);
+            if let Some(path) = node_path.as_mut() {
+                path.push(node_id);
+            }
         }
-        let provenance_records_added = node_path.len();
-        Ok(BuildSequenceResult {
+        Ok(IntegratedSequenceBuildData {
             sequence_id,
-            block_plan: BlockPlan {
-                new_nodes: node_path.clone(),
-                ..BlockPlan::default()
-            },
-            node_path,
+            node_path: node_path.clone(),
             inserted_edges,
-            provenance_records_added,
+            provenance_records_added: new_nodes_created,
+            block_plan: node_path.map(|node_path| BlockPlan {
+                new_nodes: node_path,
+                ..BlockPlan::default()
+            }),
+            new_nodes_created,
+            reused_nodes: 0,
         })
     }
 
@@ -469,6 +557,17 @@ impl FtoDagBuilder {
             .outcome)
     }
 
+    pub fn add_sequence_from_encoded_summary<E: FragmentEncoder>(
+        &mut self,
+        sequence_id: SequenceId,
+        sequence: &EncodedSequence,
+        encoder: &E,
+    ) -> Result<SequenceBuildSummaryOutcome> {
+        Ok(self
+            .add_sequence_from_encoded_profiled_summary(sequence_id, sequence, encoder)?
+            .outcome)
+    }
+
     pub fn add_sequence_from_occurrences(
         &mut self,
         sequence_id: SequenceId,
@@ -479,12 +578,73 @@ impl FtoDagBuilder {
             .outcome)
     }
 
+    pub fn add_sequence_from_occurrences_summary(
+        &mut self,
+        sequence_id: SequenceId,
+        occurrences: Vec<FragmentOccurrence>,
+    ) -> Result<SequenceBuildSummaryOutcome> {
+        Ok(self
+            .add_sequence_from_occurrences_profiled_summary(sequence_id, occurrences)?
+            .outcome)
+    }
+
     pub fn add_sequence_from_encoded_profiled<E: FragmentEncoder>(
         &mut self,
         sequence_id: SequenceId,
         sequence: &EncodedSequence,
         encoder: &E,
     ) -> Result<ProfiledSequenceBuildOutcome> {
+        let profiled = self.add_sequence_from_encoded_profiled_with_detail(
+            sequence_id,
+            sequence,
+            encoder,
+            BuildDetailMode::Diagnostics,
+        )?;
+        Ok(ProfiledSequenceBuildOutcome {
+            outcome: match profiled.outcome {
+                SequenceBuildDataOutcome::Integrated(result) => {
+                    SequenceBuildOutcome::Integrated(result.into_result())
+                }
+                SequenceBuildDataOutcome::Rejected(rejected) => {
+                    SequenceBuildOutcome::Rejected(rejected)
+                }
+            },
+            timing: profiled.timing,
+        })
+    }
+
+    pub fn add_sequence_from_encoded_profiled_summary<E: FragmentEncoder>(
+        &mut self,
+        sequence_id: SequenceId,
+        sequence: &EncodedSequence,
+        encoder: &E,
+    ) -> Result<ProfiledSequenceBuildSummaryOutcome> {
+        let profiled = self.add_sequence_from_encoded_profiled_with_detail(
+            sequence_id,
+            sequence,
+            encoder,
+            BuildDetailMode::Summary,
+        )?;
+        Ok(ProfiledSequenceBuildSummaryOutcome {
+            outcome: match profiled.outcome {
+                SequenceBuildDataOutcome::Integrated(result) => {
+                    SequenceBuildSummaryOutcome::Integrated(result.into_summary())
+                }
+                SequenceBuildDataOutcome::Rejected(rejected) => {
+                    SequenceBuildSummaryOutcome::Rejected(rejected)
+                }
+            },
+            timing: profiled.timing,
+        })
+    }
+
+    fn add_sequence_from_encoded_profiled_with_detail<E: FragmentEncoder>(
+        &mut self,
+        sequence_id: SequenceId,
+        sequence: &EncodedSequence,
+        encoder: &E,
+        detail_mode: BuildDetailMode,
+    ) -> Result<ProfiledSequenceBuildDataOutcome> {
         let total_start = Instant::now();
         let mut timing = BuildTimingBreakdown::default();
         let start = Instant::now();
@@ -495,6 +655,7 @@ impl FtoDagBuilder {
             occurrences,
             total_start,
             timing,
+            detail_mode,
         )
     }
 
@@ -503,12 +664,49 @@ impl FtoDagBuilder {
         sequence_id: SequenceId,
         occurrences: Vec<FragmentOccurrence>,
     ) -> Result<ProfiledSequenceBuildOutcome> {
-        self.add_sequence_from_occurrences_profiled_with_timing(
+        let profiled = self.add_sequence_from_occurrences_profiled_with_timing(
             sequence_id,
             occurrences,
             Instant::now(),
             BuildTimingBreakdown::default(),
-        )
+            BuildDetailMode::Diagnostics,
+        )?;
+        Ok(ProfiledSequenceBuildOutcome {
+            outcome: match profiled.outcome {
+                SequenceBuildDataOutcome::Integrated(result) => {
+                    SequenceBuildOutcome::Integrated(result.into_result())
+                }
+                SequenceBuildDataOutcome::Rejected(rejected) => {
+                    SequenceBuildOutcome::Rejected(rejected)
+                }
+            },
+            timing: profiled.timing,
+        })
+    }
+
+    pub fn add_sequence_from_occurrences_profiled_summary(
+        &mut self,
+        sequence_id: SequenceId,
+        occurrences: Vec<FragmentOccurrence>,
+    ) -> Result<ProfiledSequenceBuildSummaryOutcome> {
+        let profiled = self.add_sequence_from_occurrences_profiled_with_timing(
+            sequence_id,
+            occurrences,
+            Instant::now(),
+            BuildTimingBreakdown::default(),
+            BuildDetailMode::Summary,
+        )?;
+        Ok(ProfiledSequenceBuildSummaryOutcome {
+            outcome: match profiled.outcome {
+                SequenceBuildDataOutcome::Integrated(result) => {
+                    SequenceBuildSummaryOutcome::Integrated(result.into_summary())
+                }
+                SequenceBuildDataOutcome::Rejected(rejected) => {
+                    SequenceBuildSummaryOutcome::Rejected(rejected)
+                }
+            },
+            timing: profiled.timing,
+        })
     }
 
     fn add_sequence_from_occurrences_profiled_with_timing(
@@ -517,11 +715,16 @@ impl FtoDagBuilder {
         occurrences: Vec<FragmentOccurrence>,
         total_start: Instant,
         mut timing: BuildTimingBreakdown,
-    ) -> Result<ProfiledSequenceBuildOutcome> {
+        detail_mode: BuildDetailMode,
+    ) -> Result<ProfiledSequenceBuildDataOutcome> {
         self.report.attempted_sequences += 1;
         if self.graph.node_count() == 0 {
             let start = Instant::now();
-            let result = self.initialize_from_occurrences(sequence_id, occurrences)?;
+            let result = self.initialize_from_occurrences_with_detail(
+                sequence_id,
+                occurrences,
+                detail_mode,
+            )?;
             timing.initialize += start.elapsed();
             if self.config.topology_update_strategy.is_incremental() {
                 let start = Instant::now();
@@ -529,11 +732,11 @@ impl FtoDagBuilder {
                 timing.topology += start.elapsed();
             }
             let start = Instant::now();
-            self.record_integrated_sequence(&result);
+            self.record_integrated_sequence_data(&result);
             timing.report_update += start.elapsed();
             timing.total = total_start.elapsed();
-            return Ok(ProfiledSequenceBuildOutcome {
-                outcome: SequenceBuildOutcome::Integrated(result),
+            return Ok(ProfiledSequenceBuildDataOutcome {
+                outcome: SequenceBuildDataOutcome::Integrated(result),
                 timing,
             });
         }
@@ -547,8 +750,8 @@ impl FtoDagBuilder {
             self.report.rejected_sequences.push(rejected);
             timing.report_update += start.elapsed();
             timing.total = total_start.elapsed();
-            return Ok(ProfiledSequenceBuildOutcome {
-                outcome: SequenceBuildOutcome::Rejected(rejected),
+            return Ok(ProfiledSequenceBuildDataOutcome {
+                outcome: SequenceBuildDataOutcome::Rejected(rejected),
                 timing,
             });
         }
@@ -599,11 +802,25 @@ impl FtoDagBuilder {
             timing.anchor_selection += start.elapsed();
             (candidate_sets, anchor_path)
         };
-        let start = Instant::now();
-        let mut block_plan = block_plan_from_anchor_path(&anchor_path, &candidate_sets);
-        timing.block_planning += start.elapsed();
+        let mut block_plan = if detail_mode == BuildDetailMode::Diagnostics {
+            let start = Instant::now();
+            let block_plan = block_plan_from_anchor_path(&anchor_path, &candidate_sets);
+            timing.block_planning += start.elapsed();
+            Some(block_plan)
+        } else {
+            None
+        };
         let next_anchors = next_matched_anchors_after(&anchor_path, &candidate_sets);
-        let mut node_path = Vec::with_capacity(occurrences.len());
+        let AnchorPath {
+            decisions,
+            selected_anchors,
+        } = anchor_path;
+        let selected_coordinates = selected_anchors
+            .into_iter()
+            .map(|selected| selected.map(|selected| selected.coordinate))
+            .collect::<Vec<_>>();
+        let mut node_path = (detail_mode == BuildDetailMode::Diagnostics)
+            .then(|| Vec::with_capacity(occurrences.len()));
         let mut previous = None;
         let mut last_existing_coordinate = None;
         self.existing_node_marks
@@ -611,11 +828,14 @@ impl FtoDagBuilder {
         let mut inserted_edges = 0;
         let mut inserted_edge_keys = Vec::new();
         let mut provenance_records_added = 0;
+        let mut new_nodes_created = 0;
+        let mut reused_nodes = 0;
 
         let start = Instant::now();
-        for (index, (occurrence, decision)) in occurrences
+        for (index, ((occurrence, decision), candidate_set)) in occurrences
             .into_iter()
-            .zip(anchor_path.decisions.iter())
+            .zip(decisions.iter())
+            .zip(candidate_sets.into_iter())
             .enumerate()
         {
             let node_id = match decision {
@@ -623,8 +843,7 @@ impl FtoDagBuilder {
                     self.add_source_to_existing_node(*node_id, sequence_id, occurrence.position)?;
                     self.existing_node_marks.mark(*node_id);
                     last_existing_coordinate =
-                        selected_coordinate(&anchor_path, &candidate_sets, index, *node_id)
-                            .or(last_existing_coordinate);
+                        selected_coordinates[index].or(last_existing_coordinate);
                     *node_id
                 }
                 AnchorDecision::Unmatched(_) => {
@@ -634,7 +853,7 @@ impl FtoDagBuilder {
                         right: next_anchor.map(|(_, coordinate)| coordinate),
                     };
                     if let Some(reuse) = select_bounded_reuse_candidate_with_marks(
-                        &candidate_sets[index],
+                        &candidate_set,
                         interval,
                         &self.existing_node_marks,
                         &self.graph,
@@ -649,11 +868,17 @@ impl FtoDagBuilder {
                         )?;
                         self.existing_node_marks.mark(node_id);
                         last_existing_coordinate = reuse.coordinate.or(last_existing_coordinate);
-                        block_plan.reused_nodes.push(node_id);
+                        reused_nodes += 1;
+                        if let Some(plan) = block_plan.as_mut() {
+                            plan.reused_nodes.push(node_id);
+                        }
                         node_id
                     } else {
                         let node_id = self.add_occurrence_node(sequence_id, occurrence)?;
-                        block_plan.new_nodes.push(node_id);
+                        new_nodes_created += 1;
+                        if let Some(plan) = block_plan.as_mut() {
+                            plan.new_nodes.push(node_id);
+                        }
                         node_id
                     }
                 }
@@ -669,7 +894,9 @@ impl FtoDagBuilder {
                 }
             }
             previous = Some(node_id);
-            node_path.push(node_id);
+            if let Some(path) = node_path.as_mut() {
+                path.push(node_id);
+            }
         }
         timing.mutation += start.elapsed();
 
@@ -679,19 +906,21 @@ impl FtoDagBuilder {
             timing.topology += start.elapsed();
         }
 
-        let result = BuildSequenceResult {
+        let result = IntegratedSequenceBuildData {
             sequence_id,
             node_path,
             inserted_edges,
             provenance_records_added,
             block_plan,
+            new_nodes_created,
+            reused_nodes,
         };
         let start = Instant::now();
-        self.record_integrated_sequence(&result);
+        self.record_integrated_sequence_data(&result);
         timing.report_update += start.elapsed();
         timing.total = total_start.elapsed();
-        Ok(ProfiledSequenceBuildOutcome {
-            outcome: SequenceBuildOutcome::Integrated(result),
+        Ok(ProfiledSequenceBuildDataOutcome {
+            outcome: SequenceBuildDataOutcome::Integrated(result),
             timing,
         })
     }
@@ -1171,9 +1400,9 @@ impl FtoDagBuilder {
             .unwrap_or(false)
     }
 
-    fn record_integrated_sequence(&mut self, result: &BuildSequenceResult) {
+    fn record_integrated_sequence_data(&mut self, result: &IntegratedSequenceBuildData) {
         self.report.integrated_sequences.push(result.sequence_id);
-        self.report.total_nodes_created += result.block_plan.new_nodes.len();
+        self.report.total_nodes_created += result.new_nodes_created;
         self.report.total_edges_inserted += result.inserted_edges;
         self.report.total_provenance_records_added += result.provenance_records_added;
     }
@@ -2443,7 +2672,7 @@ fn select_bounded_reuse_candidate_with_marks<'a>(
 
 pub fn block_plan_from_anchor_path(
     anchor_path: &AnchorPath,
-    candidate_sets: &[AnchorCandidateSet],
+    _candidate_sets: &[AnchorCandidateSet],
 ) -> BlockPlan {
     let mut accepted_anchors = Vec::new();
     let mut current_block: Option<AnchorBlock> = None;
@@ -2459,18 +2688,12 @@ pub fn block_plan_from_anchor_path(
                         path_range: PathRange::new(start, index),
                         coordinate_interval: CoordinateInterval {
                             left: last_anchor.map(|(_, coordinate)| coordinate),
-                            right: selected_coordinate(
-                                anchor_path,
-                                candidate_sets,
-                                index,
-                                *node_id,
-                            ),
+                            right: selected_coordinate(anchor_path, index, *node_id),
                         },
                     });
                 }
 
-                let Some(selected) = selected_anchor(anchor_path, candidate_sets, index, *node_id)
-                else {
+                let Some(selected) = selected_anchor(anchor_path, index, *node_id) else {
                     continue;
                 };
                 let coordinate = selected.coordinate;
@@ -2530,14 +2753,14 @@ pub fn block_plan_from_anchor_path(
 
 fn next_matched_anchors_after(
     anchor_path: &AnchorPath,
-    candidate_sets: &[AnchorCandidateSet],
+    _candidate_sets: &[AnchorCandidateSet],
 ) -> Vec<Option<(NodeId, TopologicalCoordinate)>> {
     let mut next = vec![None; anchor_path.decisions.len()];
     let mut current = None;
     for index in (0..anchor_path.decisions.len()).rev() {
         next[index] = current;
         if let AnchorDecision::Matched(node_id) = anchor_path.decisions[index] {
-            current = selected_coordinate(anchor_path, candidate_sets, index, node_id)
+            current = selected_coordinate(anchor_path, index, node_id)
                 .map(|coordinate| (node_id, coordinate));
         }
     }
@@ -2569,21 +2792,8 @@ fn reuse_score(
     Weight::new(previous_score.raw() + next_score.raw())
 }
 
-fn matched_candidate(
-    candidate_sets: &[AnchorCandidateSet],
-    index: usize,
-    node_id: NodeId,
-) -> Option<&AnchorCandidate> {
-    candidate_sets
-        .get(index)?
-        .candidates
-        .iter()
-        .find(|candidate| candidate.node == node_id)
-}
-
 fn selected_anchor(
     anchor_path: &AnchorPath,
-    candidate_sets: &[AnchorCandidateSet],
     index: usize,
     node_id: NodeId,
 ) -> Option<SelectedAnchor> {
@@ -2593,24 +2803,14 @@ fn selected_anchor(
         .copied()
         .flatten()
         .filter(|selected| selected.node == node_id)
-        .or_else(|| {
-            matched_candidate(candidate_sets, index, node_id).and_then(|candidate| {
-                candidate.coordinate.map(|coordinate| SelectedAnchor {
-                    node: candidate.node,
-                    coordinate,
-                    weight: candidate.weight,
-                })
-            })
-        })
 }
 
 fn selected_coordinate(
     anchor_path: &AnchorPath,
-    candidate_sets: &[AnchorCandidateSet],
     index: usize,
     node_id: NodeId,
 ) -> Option<TopologicalCoordinate> {
-    selected_anchor(anchor_path, candidate_sets, index, node_id).map(|selected| selected.coordinate)
+    selected_anchor(anchor_path, index, node_id).map(|selected| selected.coordinate)
 }
 
 fn better_cell(
