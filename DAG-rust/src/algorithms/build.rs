@@ -167,6 +167,48 @@ pub struct AnchorPath {
     pub selected_anchors: Vec<Option<SelectedAnchor>>,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct MutationCandidate {
+    node: NodeId,
+    coordinate: TopologicalCoordinate,
+    weight: Weight,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MutationCandidateSet {
+    candidates: Vec<MutationCandidate>,
+}
+
+trait CandidateLike {
+    fn node(&self) -> NodeId;
+    fn coordinate(&self) -> Option<TopologicalCoordinate>;
+    fn weight(&self) -> Weight;
+}
+
+trait CandidateSetLike<C: CandidateLike> {
+    fn candidates(&self) -> &[C];
+}
+
+impl CandidateLike for AnchorCandidate {
+    fn node(&self) -> NodeId {
+        self.node
+    }
+
+    fn coordinate(&self) -> Option<TopologicalCoordinate> {
+        self.coordinate
+    }
+
+    fn weight(&self) -> Weight {
+        self.weight
+    }
+}
+
+impl CandidateSetLike<AnchorCandidate> for AnchorCandidateSet {
+    fn candidates(&self) -> &[AnchorCandidate] {
+        &self.candidates
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct PathRange {
     pub start: usize,
@@ -811,6 +853,7 @@ impl FtoDagBuilder {
             None
         };
         let next_anchors = next_matched_anchors_after(&anchor_path, &candidate_sets);
+        let candidate_sets = compact_candidate_sets_for_mutation(candidate_sets, &anchor_path);
         let AnchorPath {
             decisions,
             selected_anchors,
@@ -867,7 +910,7 @@ impl FtoDagBuilder {
                             occurrence.position,
                         )?;
                         self.existing_node_marks.mark(node_id);
-                        last_existing_coordinate = reuse.coordinate.or(last_existing_coordinate);
+                        last_existing_coordinate = Some(reuse.coordinate);
                         reused_nodes += 1;
                         if let Some(plan) = block_plan.as_mut() {
                             plan.reused_nodes.push(node_id);
@@ -2183,41 +2226,47 @@ pub fn select_monotone_anchor_path_with_graph(
     )
 }
 
-fn select_monotone_anchor_path_with_edge_score(
-    candidate_sets: &[AnchorCandidateSet],
+fn select_monotone_anchor_path_with_edge_score<C, S>(
+    candidate_sets: &[S],
     edge_score: impl Fn(EdgeKey) -> Weight,
     node_count: Option<usize>,
-) -> AnchorPath {
+) -> AnchorPath
+where
+    C: CandidateLike,
+    S: CandidateSetLike<C>,
+{
     if candidate_sets.len() > GREEDY_ANCHOR_SET_LIMIT {
         return select_greedy_monotone_anchor_path(candidate_sets, edge_score, node_count);
     }
 
     let mut dp: Vec<Vec<Option<AnchorDpCell>>> = candidate_sets
         .iter()
-        .map(|set| vec![None; set.candidates.len()])
+        .map(|set| vec![None; set.candidates().len()])
         .collect();
 
     let mut best: Option<(usize, usize, AnchorDpCell)> = None;
     for (set_index, set) in candidate_sets.iter().enumerate() {
-        for (candidate_index, candidate) in set.candidates.iter().enumerate() {
-            let Some(coordinate) = candidate.coordinate else {
+        for (candidate_index, candidate) in set.candidates().iter().enumerate() {
+            let Some(coordinate) = candidate.coordinate() else {
                 continue;
             };
             let mut cell = AnchorDpCell {
                 len: 1,
                 continuity: Weight::new(0),
-                weight: candidate.weight,
+                weight: candidate.weight(),
                 prev: None,
             };
 
             for prev_set_index in 0..set_index {
-                for (prev_candidate_index, prev_candidate) in
-                    candidate_sets[prev_set_index].candidates.iter().enumerate()
+                for (prev_candidate_index, prev_candidate) in candidate_sets[prev_set_index]
+                    .candidates()
+                    .iter()
+                    .enumerate()
                 {
-                    let Some(prev_coordinate) = prev_candidate.coordinate else {
+                    let Some(prev_coordinate) = prev_candidate.coordinate() else {
                         continue;
                     };
-                    if prev_coordinate >= coordinate || prev_candidate.node == candidate.node {
+                    if prev_coordinate >= coordinate || prev_candidate.node() == candidate.node() {
                         continue;
                     }
                     let Some(prev_cell) = dp[prev_set_index][prev_candidate_index] else {
@@ -2228,15 +2277,15 @@ fn select_monotone_anchor_path_with_edge_score(
                         continuity: Weight::new(
                             prev_cell.continuity.raw()
                                 + edge_score(EdgeKey {
-                                    parent: prev_candidate.node,
-                                    child: candidate.node,
+                                    parent: prev_candidate.node(),
+                                    child: candidate.node(),
                                 })
                                 .raw(),
                         ),
-                        weight: Weight::new(prev_cell.weight.raw() + candidate.weight.raw()),
+                        weight: Weight::new(prev_cell.weight.raw() + candidate.weight().raw()),
                         prev: Some((prev_set_index, prev_candidate_index)),
                     };
-                    if better_cell(next, cell, candidate.node, candidate.node) {
+                    if better_cell(next, cell, candidate.node(), candidate.node()) {
                         cell = next;
                     }
                 }
@@ -2245,8 +2294,8 @@ fn select_monotone_anchor_path_with_edge_score(
             match best {
                 Some((best_set_index, best_candidate_index, best_cell)) => {
                     let best_node =
-                        candidate_sets[best_set_index].candidates[best_candidate_index].node;
-                    if better_cell(cell, best_cell, candidate.node, best_node) {
+                        candidate_sets[best_set_index].candidates()[best_candidate_index].node();
+                    if better_cell(cell, best_cell, candidate.node(), best_node) {
                         best = Some((set_index, candidate_index, cell));
                     }
                 }
@@ -2258,12 +2307,12 @@ fn select_monotone_anchor_path_with_edge_score(
     let mut decisions = candidate_sets
         .iter()
         .map(|set| {
-            if set.candidates.is_empty() {
+            if set.candidates().is_empty() {
                 AnchorDecision::Unmatched(AnchorRejectReason::NoCandidate)
             } else if set
-                .candidates
+                .candidates()
                 .iter()
-                .any(|candidate| candidate.coordinate.is_some())
+                .any(|candidate| candidate.coordinate().is_some())
             {
                 AnchorDecision::Unmatched(AnchorRejectReason::NotSelected)
             } else {
@@ -2275,13 +2324,13 @@ fn select_monotone_anchor_path_with_edge_score(
 
     if let Some((mut set_index, mut candidate_index, _)) = best {
         loop {
-            let candidate = &candidate_sets[set_index].candidates[candidate_index];
-            decisions[set_index] = AnchorDecision::Matched(candidate.node);
-            if let Some(coordinate) = candidate.coordinate {
+            let candidate = &candidate_sets[set_index].candidates()[candidate_index];
+            decisions[set_index] = AnchorDecision::Matched(candidate.node());
+            if let Some(coordinate) = candidate.coordinate() {
                 selected_anchors[set_index] = Some(SelectedAnchor {
-                    node: candidate.node,
+                    node: candidate.node(),
                     coordinate,
-                    weight: candidate.weight,
+                    weight: candidate.weight(),
                 });
             }
             let Some(cell) = dp[set_index][candidate_index] else {
@@ -2302,11 +2351,15 @@ fn select_monotone_anchor_path_with_edge_score(
     }
 }
 
-fn select_greedy_monotone_anchor_path(
-    candidate_sets: &[AnchorCandidateSet],
+fn select_greedy_monotone_anchor_path<C, S>(
+    candidate_sets: &[S],
     edge_score: impl Fn(EdgeKey) -> Weight,
     node_count: Option<usize>,
-) -> AnchorPath {
+) -> AnchorPath
+where
+    C: CandidateLike,
+    S: CandidateSetLike<C>,
+{
     let mut decisions = Vec::with_capacity(candidate_sets.len());
     let mut selected_anchors = Vec::with_capacity(candidate_sets.len());
     let mut used_nodes = UsedNodeTracker::new(node_count);
@@ -2317,27 +2370,27 @@ fn select_greedy_monotone_anchor_path(
         if let Some(candidate) =
             direct_extension_candidate(set, previous, last_coordinate, &used_nodes, &edge_score)
         {
-            used_nodes.insert(candidate.node);
-            previous = Some(candidate.node);
-            last_coordinate = candidate.coordinate;
-            decisions.push(AnchorDecision::Matched(candidate.node));
-            selected_anchors.push(candidate.coordinate.map(|coordinate| SelectedAnchor {
-                node: candidate.node,
+            used_nodes.insert(candidate.node());
+            previous = Some(candidate.node());
+            last_coordinate = candidate.coordinate();
+            decisions.push(AnchorDecision::Matched(candidate.node()));
+            selected_anchors.push(candidate.coordinate().map(|coordinate| SelectedAnchor {
+                node: candidate.node(),
                 coordinate,
-                weight: candidate.weight,
+                weight: candidate.weight(),
             }));
             continue;
         }
 
-        let mut best: Option<(&AnchorCandidate, Weight)> = None;
+        let mut best: Option<(&C, Weight)> = None;
         let mut has_coordinate = false;
-        for candidate in &set.candidates {
-            let Some(coordinate) = candidate.coordinate else {
+        for candidate in set.candidates() {
+            let Some(coordinate) = candidate.coordinate() else {
                 continue;
             };
             has_coordinate = true;
             if last_coordinate.is_some_and(|last| last >= coordinate)
-                || used_nodes.contains(candidate.node)
+                || used_nodes.contains(candidate.node())
             {
                 continue;
             }
@@ -2350,16 +2403,16 @@ fn select_greedy_monotone_anchor_path(
         }
 
         if let Some((candidate, _)) = best {
-            used_nodes.insert(candidate.node);
-            previous = Some(candidate.node);
-            last_coordinate = candidate.coordinate;
-            decisions.push(AnchorDecision::Matched(candidate.node));
-            selected_anchors.push(candidate.coordinate.map(|coordinate| SelectedAnchor {
-                node: candidate.node,
+            used_nodes.insert(candidate.node());
+            previous = Some(candidate.node());
+            last_coordinate = candidate.coordinate();
+            decisions.push(AnchorDecision::Matched(candidate.node()));
+            selected_anchors.push(candidate.coordinate().map(|coordinate| SelectedAnchor {
+                node: candidate.node(),
                 coordinate,
-                weight: candidate.weight,
+                weight: candidate.weight(),
             }));
-        } else if set.candidates.is_empty() {
+        } else if set.candidates().is_empty() {
             decisions.push(AnchorDecision::Unmatched(AnchorRejectReason::NoCandidate));
             selected_anchors.push(None);
         } else if has_coordinate {
@@ -2379,10 +2432,14 @@ fn select_greedy_monotone_anchor_path(
     }
 }
 
-fn select_greedy_monotone_anchor_path_with_graph(
-    candidate_sets: &[AnchorCandidateSet],
+fn select_greedy_monotone_anchor_path_with_graph<C, S>(
+    candidate_sets: &[S],
     graph: &FtoDag,
-) -> AnchorPath {
+) -> AnchorPath
+where
+    C: CandidateLike,
+    S: CandidateSetLike<C>,
+{
     let mut decisions = Vec::with_capacity(candidate_sets.len());
     let mut selected_anchors = Vec::with_capacity(candidate_sets.len());
     let mut used_nodes = UsedNodeTracker::new(Some(graph.node_count()));
@@ -2393,27 +2450,27 @@ fn select_greedy_monotone_anchor_path_with_graph(
         if let Some(candidate) =
             direct_child_extension_candidate(set, previous, last_coordinate, &used_nodes, graph)
         {
-            used_nodes.insert(candidate.node);
-            previous = Some(candidate.node);
-            last_coordinate = candidate.coordinate;
-            decisions.push(AnchorDecision::Matched(candidate.node));
-            selected_anchors.push(candidate.coordinate.map(|coordinate| SelectedAnchor {
-                node: candidate.node,
+            used_nodes.insert(candidate.node());
+            previous = Some(candidate.node());
+            last_coordinate = candidate.coordinate();
+            decisions.push(AnchorDecision::Matched(candidate.node()));
+            selected_anchors.push(candidate.coordinate().map(|coordinate| SelectedAnchor {
+                node: candidate.node(),
                 coordinate,
-                weight: candidate.weight,
+                weight: candidate.weight(),
             }));
             continue;
         }
 
-        let mut best: Option<(&AnchorCandidate, Weight)> = None;
+        let mut best: Option<(&C, Weight)> = None;
         let mut has_coordinate = false;
-        for candidate in &set.candidates {
-            let Some(coordinate) = candidate.coordinate else {
+        for candidate in set.candidates() {
+            let Some(coordinate) = candidate.coordinate() else {
                 continue;
             };
             has_coordinate = true;
             if last_coordinate.is_some_and(|last| last >= coordinate)
-                || used_nodes.contains(candidate.node)
+                || used_nodes.contains(candidate.node())
             {
                 continue;
             }
@@ -2428,16 +2485,16 @@ fn select_greedy_monotone_anchor_path_with_graph(
         }
 
         if let Some((candidate, _)) = best {
-            used_nodes.insert(candidate.node);
-            previous = Some(candidate.node);
-            last_coordinate = candidate.coordinate;
-            decisions.push(AnchorDecision::Matched(candidate.node));
-            selected_anchors.push(candidate.coordinate.map(|coordinate| SelectedAnchor {
-                node: candidate.node,
+            used_nodes.insert(candidate.node());
+            previous = Some(candidate.node());
+            last_coordinate = candidate.coordinate();
+            decisions.push(AnchorDecision::Matched(candidate.node()));
+            selected_anchors.push(candidate.coordinate().map(|coordinate| SelectedAnchor {
+                node: candidate.node(),
                 coordinate,
-                weight: candidate.weight,
+                weight: candidate.weight(),
             }));
-        } else if set.candidates.is_empty() {
+        } else if set.candidates().is_empty() {
             decisions.push(AnchorDecision::Unmatched(AnchorRejectReason::NoCandidate));
             selected_anchors.push(None);
         } else if has_coordinate {
@@ -2457,30 +2514,34 @@ fn select_greedy_monotone_anchor_path_with_graph(
     }
 }
 
-fn direct_child_extension_candidate<'a>(
-    set: &'a AnchorCandidateSet,
+fn direct_child_extension_candidate<'a, C, S>(
+    set: &'a S,
     previous: Option<NodeId>,
     last_coordinate: Option<TopologicalCoordinate>,
     used_nodes: &UsedNodeTracker,
     graph: &FtoDag,
-) -> Option<&'a AnchorCandidate> {
+) -> Option<&'a C>
+where
+    C: CandidateLike,
+    S: CandidateSetLike<C>,
+{
     let previous = previous?;
     let next_coordinate = TopologicalCoordinate::new(last_coordinate?.raw() + 1);
-    let mut best: Option<(&AnchorCandidate, Weight)> = None;
+    let mut best: Option<(&C, Weight)> = None;
     let children = graph.children(previous).ok()?;
     for child in children {
         if used_nodes.contains(*child) {
             continue;
         }
-        let Some(candidate) = set.candidates.iter().find(|candidate| {
-            candidate.node == *child && candidate.coordinate == Some(next_coordinate)
+        let Some(candidate) = set.candidates().iter().find(|candidate| {
+            candidate.node() == *child && candidate.coordinate() == Some(next_coordinate)
         }) else {
             continue;
         };
         let score = graph
             .edge_weight(EdgeKey {
                 parent: previous,
-                child: candidate.node,
+                child: candidate.node(),
             })
             .unwrap_or_default();
         if score == Weight::new(0) {
@@ -2495,23 +2556,28 @@ fn direct_child_extension_candidate<'a>(
     best.map(|(candidate, _)| candidate)
 }
 
-fn direct_extension_candidate<'a>(
-    set: &'a AnchorCandidateSet,
+fn direct_extension_candidate<'a, C, S>(
+    set: &'a S,
     previous: Option<NodeId>,
     last_coordinate: Option<TopologicalCoordinate>,
     used_nodes: &UsedNodeTracker,
     edge_score: &impl Fn(EdgeKey) -> Weight,
-) -> Option<&'a AnchorCandidate> {
+) -> Option<&'a C>
+where
+    C: CandidateLike,
+    S: CandidateSetLike<C>,
+{
     let previous = previous?;
     let next_coordinate = TopologicalCoordinate::new(last_coordinate?.raw() + 1);
-    let mut best: Option<(&AnchorCandidate, Weight)> = None;
-    for candidate in &set.candidates {
-        if candidate.coordinate != Some(next_coordinate) || used_nodes.contains(candidate.node) {
+    let mut best: Option<(&C, Weight)> = None;
+    for candidate in set.candidates() {
+        if candidate.coordinate() != Some(next_coordinate) || used_nodes.contains(candidate.node())
+        {
             continue;
         }
         let score = edge_score(EdgeKey {
             parent: previous,
-            child: candidate.node,
+            child: candidate.node(),
         });
         if score == Weight::new(0) {
             continue;
@@ -2525,8 +2591,8 @@ fn direct_extension_candidate<'a>(
     best.map(|(candidate, _)| candidate)
 }
 
-fn greedy_candidate_score(
-    candidate: &AnchorCandidate,
+fn greedy_candidate_score<C: CandidateLike>(
+    candidate: &C,
     previous: Option<NodeId>,
     edge_score: &impl Fn(EdgeKey) -> Weight,
 ) -> Weight {
@@ -2534,23 +2600,23 @@ fn greedy_candidate_score(
         .map(|parent| {
             edge_score(EdgeKey {
                 parent,
-                child: candidate.node,
+                child: candidate.node(),
             })
         })
         .unwrap_or_default()
 }
 
-fn better_greedy_candidate(
-    candidate: &AnchorCandidate,
+fn better_greedy_candidate<C: CandidateLike>(
+    candidate: &C,
     score: Weight,
-    current: &AnchorCandidate,
+    current: &C,
     current_score: Weight,
 ) -> bool {
     score > current_score
-        || (score == current_score && candidate.weight > current.weight)
+        || (score == current_score && candidate.weight() > current.weight())
         || (score == current_score
-            && candidate.weight == current.weight
-            && candidate.node < current.node)
+            && candidate.weight() == current.weight()
+            && candidate.node() < current.node())
 }
 
 enum UsedNodeTracker {
@@ -2588,13 +2654,13 @@ impl UsedNodeTracker {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ExistingNodeMarks {
-    marks: Vec<u32>,
-    current_mark: u32,
+    marks: Vec<u16>,
+    current_mark: u16,
 }
 
 impl ExistingNodeMarks {
     fn begin_sequence(&mut self, node_count: usize) {
-        if self.current_mark == u32::MAX {
+        if self.current_mark == u16::MAX {
             self.marks.fill(0);
             self.current_mark = 1;
         } else {
@@ -2633,7 +2699,7 @@ pub fn select_bounded_reuse_candidate<'a>(
         }) {
             continue;
         }
-        let score = reuse_score(candidate, graph, previous_node, next_node);
+        let score = reuse_score_for_node(candidate.node, graph, previous_node, next_node);
         if best.is_none_or(|(best_candidate, best_score)| {
             better_greedy_candidate(candidate, score, best_candidate, best_score)
         }) {
@@ -2644,25 +2710,28 @@ pub fn select_bounded_reuse_candidate<'a>(
 }
 
 fn select_bounded_reuse_candidate_with_marks<'a>(
-    candidate_set: &'a AnchorCandidateSet,
+    candidate_set: &'a MutationCandidateSet,
     interval: CoordinateInterval,
     used_node_marks: &ExistingNodeMarks,
     graph: &FtoDag,
     previous_node: Option<NodeId>,
     next_node: Option<NodeId>,
-) -> Option<&'a AnchorCandidate> {
-    let mut best = None;
+) -> Option<&'a MutationCandidate> {
+    let mut best: Option<(&MutationCandidate, Weight)> = None;
     for candidate in &candidate_set.candidates {
-        if !candidate.coordinate.is_some_and(|coordinate| {
-            interval.contains_open(coordinate)
-                && !used_node_marks.contains(candidate.node)
-                && next_node != Some(candidate.node)
-        }) {
+        if !interval.contains_open(candidate.coordinate)
+            || used_node_marks.contains(candidate.node)
+            || next_node == Some(candidate.node)
+        {
             continue;
         }
-        let score = reuse_score(candidate, graph, previous_node, next_node);
+        let score = reuse_score_for_node(candidate.node, graph, previous_node, next_node);
         if best.is_none_or(|(best_candidate, best_score)| {
-            better_greedy_candidate(candidate, score, best_candidate, best_score)
+            score > best_score
+                || (score == best_score && candidate.weight > best_candidate.weight)
+                || (score == best_score
+                    && candidate.weight == best_candidate.weight
+                    && candidate.node < best_candidate.node)
         }) {
             best = Some((candidate, score));
         }
@@ -2751,6 +2820,32 @@ pub fn block_plan_from_anchor_path(
     }
 }
 
+fn compact_candidate_sets_for_mutation(
+    candidate_sets: Vec<AnchorCandidateSet>,
+    anchor_path: &AnchorPath,
+) -> Vec<MutationCandidateSet> {
+    candidate_sets
+        .into_iter()
+        .zip(anchor_path.decisions.iter())
+        .map(|(candidate_set, decision)| MutationCandidateSet {
+            candidates: match decision {
+                AnchorDecision::Matched(_) => Vec::new(),
+                AnchorDecision::Unmatched(_) => candidate_set
+                    .candidates
+                    .into_iter()
+                    .filter_map(|candidate| {
+                        candidate.coordinate.map(|coordinate| MutationCandidate {
+                            node: candidate.node,
+                            coordinate,
+                            weight: candidate.weight,
+                        })
+                    })
+                    .collect(),
+            },
+        })
+        .collect()
+}
+
 fn next_matched_anchors_after(
     anchor_path: &AnchorPath,
     _candidate_sets: &[AnchorCandidateSet],
@@ -2767,8 +2862,8 @@ fn next_matched_anchors_after(
     next
 }
 
-fn reuse_score(
-    candidate: &AnchorCandidate,
+fn reuse_score_for_node(
+    node: NodeId,
     graph: &FtoDag,
     previous_node: Option<NodeId>,
     next_node: Option<NodeId>,
@@ -2777,14 +2872,14 @@ fn reuse_score(
         .and_then(|previous| {
             graph.edge_weight(EdgeKey {
                 parent: previous,
-                child: candidate.node,
+                child: node,
             })
         })
         .unwrap_or_default();
     let next_score = next_node
         .and_then(|next| {
             graph.edge_weight(EdgeKey {
-                parent: candidate.node,
+                parent: node,
                 child: next,
             })
         })

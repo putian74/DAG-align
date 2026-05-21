@@ -8,7 +8,7 @@ use crate::graph_model::provenance::{
 };
 use crate::sequence_model::fragment::FragmentKey;
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::{File, OpenOptions, remove_file};
 use std::hash::Hash;
@@ -178,7 +178,6 @@ const TRACE_PATH_FLUSH_NODE_COUNT: usize = 16_384;
 const MISSING_SEQUENCE_MARKER: u32 = u32::MAX;
 static NEXT_TRACE_PATH_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
-type NodeNeighbors = SmallVec<[NodeId; 2]>;
 type FragmentPostingList = SmallVec<[NodeId; 2]>;
 type EdgeSlot = u32;
 
@@ -421,21 +420,251 @@ impl EdgeIndexStorage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct MutableAdjacencyBucket {
+    start: u32,
+    len: u32,
+    capacity: u32,
+    inline: [NodeId; 2],
+}
+
+impl MutableAdjacencyBucket {
+    fn new() -> Self {
+        Self {
+            start: 0,
+            len: 0,
+            capacity: 0,
+            inline: [NodeId::new(0); 2],
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MutableAdjacency {
+    buckets: Vec<MutableAdjacencyBucket>,
+    overflow: Vec<NodeId>,
+    free_ranges: BTreeMap<u32, Vec<u32>>,
+}
+
+impl MutableAdjacency {
+    const INITIAL_OVERFLOW_CAPACITY: u32 = 4;
+
+    fn new() -> Self {
+        Self {
+            buckets: Vec::new(),
+            overflow: Vec::new(),
+            free_ranges: BTreeMap::new(),
+        }
+    }
+
+    fn from_packed(packed: PackedAdjacency) -> Result<Self> {
+        let node_count = packed.offsets.len().saturating_sub(1);
+        let mut buckets = Vec::with_capacity(node_count);
+        let mut overflow = Vec::new();
+        for node_index in 0..node_count {
+            let start = packed.offsets[node_index] as usize;
+            let end = packed.offsets[node_index + 1] as usize;
+            let neighbors = packed.nodes.get(start..end).ok_or(DagError::InvalidRange {
+                start,
+                end,
+                len: packed.nodes.len(),
+            })?;
+            let mut bucket = MutableAdjacencyBucket::new();
+            match neighbors.len() {
+                0 => {}
+                1 | 2 => {
+                    bucket.len = neighbors.len() as u32;
+                    bucket.inline[..neighbors.len()].copy_from_slice(neighbors);
+                }
+                len => {
+                    bucket.start =
+                        u32::try_from(overflow.len()).map_err(|_| DagError::ValueDoesNotFit {
+                            value: overflow.len() as u128,
+                            bits: 32,
+                        })?;
+                    bucket.len = len as u32;
+                    bucket.capacity = len as u32;
+                    overflow.extend_from_slice(neighbors);
+                }
+            }
+            buckets.push(bucket);
+        }
+        Ok(Self {
+            buckets,
+            overflow,
+            free_ranges: BTreeMap::new(),
+        })
+    }
+
+    fn neighbors(&self, node_id: NodeId) -> Result<&[NodeId]> {
+        let bucket = self
+            .buckets
+            .get(node_id.to_usize())
+            .ok_or(DagError::MissingNode {
+                node: node_id.to_usize(),
+            })?;
+        if bucket.len <= 2 {
+            return Ok(&bucket.inline[..bucket.len()]);
+        }
+        let start = bucket.start as usize;
+        let end = start + bucket.len();
+        self.overflow.get(start..end).ok_or(DagError::InvalidRange {
+            start,
+            end,
+            len: self.overflow.len(),
+        })
+    }
+
+    fn push_node(&mut self) {
+        self.buckets.push(MutableAdjacencyBucket::new());
+    }
+
+    fn push_neighbor(&mut self, owner: NodeId, neighbor: NodeId) -> Result<()> {
+        let owner_index = owner.to_usize();
+        let Some(bucket) = self.buckets.get(owner_index) else {
+            return Err(DagError::MissingNode { node: owner_index });
+        };
+        match bucket.len {
+            0 | 1 => {
+                let bucket = &mut self.buckets[owner_index];
+                bucket.inline[bucket.len as usize] = neighbor;
+                bucket.len += 1;
+                Ok(())
+            }
+            2 => self.promote_inline_bucket(owner_index, neighbor),
+            _ => self.push_overflow_neighbor(owner_index, neighbor),
+        }
+    }
+
+    fn promote_inline_bucket(&mut self, owner_index: usize, neighbor: NodeId) -> Result<()> {
+        let inline = self.buckets[owner_index].inline;
+        let start = self.allocate_range(Self::INITIAL_OVERFLOW_CAPACITY)?;
+        let start_index = start as usize;
+        self.overflow[start_index] = inline[0];
+        self.overflow[start_index + 1] = inline[1];
+        self.overflow[start_index + 2] = neighbor;
+
+        let bucket = &mut self.buckets[owner_index];
+        bucket.start = start;
+        bucket.len = 3;
+        bucket.capacity = Self::INITIAL_OVERFLOW_CAPACITY;
+        Ok(())
+    }
+
+    fn push_overflow_neighbor(&mut self, owner_index: usize, neighbor: NodeId) -> Result<()> {
+        let (start, len, capacity) = {
+            let bucket = &self.buckets[owner_index];
+            (bucket.start, bucket.len, bucket.capacity)
+        };
+
+        if len < capacity {
+            let write_index = (start + len) as usize;
+            let overflow_len = self.overflow.len();
+            let slot = self
+                .overflow
+                .get_mut(write_index)
+                .ok_or(DagError::InvalidRange {
+                    start: write_index,
+                    end: write_index.saturating_add(1),
+                    len: overflow_len,
+                })?;
+            *slot = neighbor;
+            self.buckets[owner_index].len += 1;
+            return Ok(());
+        }
+
+        let new_len = len.checked_add(1).ok_or(DagError::ValueDoesNotFit {
+            value: u128::from(len) + 1,
+            bits: 32,
+        })?;
+        let new_capacity =
+            new_len
+                .checked_next_power_of_two()
+                .ok_or(DagError::ValueDoesNotFit {
+                    value: u128::from(new_len),
+                    bits: 32,
+                })?;
+        let current = self
+            .overflow
+            .get(start as usize..(start + len) as usize)
+            .ok_or(DagError::InvalidRange {
+                start: start as usize,
+                end: (start + len) as usize,
+                len: self.overflow.len(),
+            })?
+            .to_vec();
+        let new_start = self.allocate_range(new_capacity)?;
+        let new_start_index = new_start as usize;
+        self.overflow[new_start_index..new_start_index + len as usize].copy_from_slice(&current);
+        self.overflow[new_start_index + len as usize] = neighbor;
+        self.release_range(start, capacity);
+
+        let bucket = &mut self.buckets[owner_index];
+        bucket.start = new_start;
+        bucket.len = new_len;
+        bucket.capacity = new_capacity;
+        Ok(())
+    }
+
+    fn allocate_range(&mut self, capacity: u32) -> Result<u32> {
+        let reused = if let Some(starts) = self.free_ranges.get_mut(&capacity) {
+            let start = starts.pop();
+            let empty = starts.is_empty();
+            Some((start, empty))
+        } else {
+            None
+        };
+        if let Some((Some(start), empty)) = reused {
+            if empty {
+                self.free_ranges.remove(&capacity);
+            }
+            return Ok(start);
+        }
+        let start = u32::try_from(self.overflow.len()).map_err(|_| DagError::ValueDoesNotFit {
+            value: self.overflow.len() as u128,
+            bits: 32,
+        })?;
+        let new_len = self.overflow.len().checked_add(capacity as usize).ok_or(
+            DagError::ValueDoesNotFit {
+                value: self.overflow.len() as u128 + u128::from(capacity),
+                bits: usize::BITS as u8,
+            },
+        )?;
+        self.overflow.resize(new_len, NodeId::new(0));
+        Ok(start)
+    }
+
+    fn release_range(&mut self, start: u32, capacity: u32) {
+        if capacity == 0 {
+            return;
+        }
+        self.free_ranges.entry(capacity).or_default().push(start);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PackedAdjacency {
     offsets: Vec<u32>,
     nodes: Vec<NodeId>,
 }
 
 impl PackedAdjacency {
-    fn from_lists(lists: &[NodeNeighbors]) -> Result<Self> {
-        let total_neighbors = lists.iter().map(NodeNeighbors::len).sum::<usize>();
-        let mut offsets = Vec::with_capacity(lists.len() + 1);
+    fn from_mutable(mutable: &MutableAdjacency) -> Result<Self> {
+        let total_neighbors = mutable
+            .buckets
+            .iter()
+            .map(MutableAdjacencyBucket::len)
+            .sum::<usize>();
+        let mut offsets = Vec::with_capacity(mutable.buckets.len() + 1);
         offsets.push(0);
         let mut running_total = 0usize;
-        for neighbors in lists {
+        for bucket in &mutable.buckets {
             running_total =
                 running_total
-                    .checked_add(neighbors.len())
+                    .checked_add(bucket.len())
                     .ok_or(DagError::ValueDoesNotFit {
                         value: total_neighbors as u128,
                         bits: usize::BITS as u8,
@@ -448,8 +677,9 @@ impl PackedAdjacency {
             );
         }
         let mut nodes = Vec::with_capacity(total_neighbors);
-        for neighbors in lists {
-            nodes.extend(neighbors.iter().copied());
+        for node_index in 0..mutable.buckets.len() {
+            let node_id = NodeId::try_from(node_index)?;
+            nodes.extend_from_slice(mutable.neighbors(node_id)?);
         }
         Ok(Self { offsets, nodes })
     }
@@ -513,28 +743,17 @@ impl PackedAdjacency {
             len: self.nodes.len(),
         })
     }
-
-    fn into_lists(self) -> Vec<NodeNeighbors> {
-        let node_count = self.offsets.len().saturating_sub(1);
-        let mut lists = Vec::with_capacity(node_count);
-        for node_index in 0..node_count {
-            let start = self.offsets[node_index] as usize;
-            let end = self.offsets[node_index + 1] as usize;
-            lists.push(self.nodes[start..end].iter().copied().collect());
-        }
-        lists
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AdjacencyLists {
-    Ragged(Vec<NodeNeighbors>),
+    Mutable(MutableAdjacency),
     Packed(PackedAdjacency),
 }
 
 impl AdjacencyLists {
     fn new() -> Self {
-        Self::Ragged(Vec::new())
+        Self::Mutable(MutableAdjacency::new())
     }
 
     fn from_edges(node_count: usize, edges: &[WeightedEdge], use_children: bool) -> Result<Self> {
@@ -547,33 +766,24 @@ impl AdjacencyLists {
 
     fn neighbors(&self, node_id: NodeId) -> Result<&[NodeId]> {
         match self {
-            Self::Ragged(lists) => lists
-                .get(node_id.to_usize())
-                .map(NodeNeighbors::as_slice)
-                .ok_or(DagError::MissingNode {
-                    node: node_id.to_usize(),
-                }),
+            Self::Mutable(adjacency) => adjacency.neighbors(node_id),
             Self::Packed(packed) => packed.neighbors(node_id),
         }
     }
 
     fn push_node(&mut self) {
-        self.ensure_ragged().push(NodeNeighbors::new());
+        self.ensure_mutable().push_node();
     }
 
     fn push_neighbor(&mut self, owner: NodeId, neighbor: NodeId) -> Result<()> {
-        self.ensure_ragged()
-            .get_mut(owner.to_usize())
-            .ok_or(DagError::MissingNode {
-                node: owner.to_usize(),
-            })?
-            .push(neighbor);
-        Ok(())
+        self.ensure_mutable().push_neighbor(owner, neighbor)
     }
 
     fn compact(&mut self) -> Result<()> {
         let replacement = match self {
-            Self::Ragged(lists) => Some(Self::Packed(PackedAdjacency::from_lists(lists)?)),
+            Self::Mutable(adjacency) => {
+                Some(Self::Packed(PackedAdjacency::from_mutable(adjacency)?))
+            }
             Self::Packed(_) => None,
         };
         if let Some(storage) = replacement {
@@ -582,20 +792,23 @@ impl AdjacencyLists {
         Ok(())
     }
 
-    fn ensure_ragged(&mut self) -> &mut Vec<NodeNeighbors> {
+    fn ensure_mutable(&mut self) -> &mut MutableAdjacency {
         if matches!(self, Self::Packed(_)) {
-            let packed = match std::mem::replace(self, Self::Ragged(Vec::new())) {
+            let packed = match std::mem::replace(self, Self::Mutable(MutableAdjacency::new())) {
                 Self::Packed(packed) => packed,
-                Self::Ragged(lists) => {
-                    *self = Self::Ragged(lists);
-                    unreachable!("packed adjacency was replaced with ragged storage")
+                Self::Mutable(adjacency) => {
+                    *self = Self::Mutable(adjacency);
+                    unreachable!("packed adjacency was replaced with mutable storage")
                 }
             };
-            *self = Self::Ragged(packed.into_lists());
+            *self = Self::Mutable(
+                MutableAdjacency::from_packed(packed)
+                    .expect("packed adjacency should always unpack into mutable storage"),
+            );
         }
         match self {
-            Self::Ragged(lists) => lists,
-            Self::Packed(_) => unreachable!("packed adjacency was unpacked into ragged storage"),
+            Self::Mutable(adjacency) => adjacency,
+            Self::Packed(_) => unreachable!("packed adjacency was unpacked into mutable storage"),
         }
     }
 }
@@ -2126,4 +2339,59 @@ pub struct GraphStats {
     pub node_count: usize,
     pub edge_count: usize,
     pub fragment_len: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph_model::validate::ValidateGraph;
+    use crate::sequence_model::fragment::FragmentKey;
+
+    fn key(raw: u16) -> FragmentKey {
+        FragmentKey::symbols(vec![crate::sequence_model::alphabet::SymbolId::new(raw)])
+    }
+
+    #[test]
+    fn mutable_adjacency_keeps_high_fanout_neighbors_contiguous() {
+        let mut graph = FtoDag::new(1);
+        let root = graph.add_node(key(0), NodeKind::Start).unwrap();
+        let children = [
+            graph.add_node(key(1), NodeKind::Internal).unwrap(),
+            graph.add_node(key(2), NodeKind::Internal).unwrap(),
+            graph.add_node(key(3), NodeKind::Internal).unwrap(),
+            graph.add_node(key(4), NodeKind::End).unwrap(),
+        ];
+        for child in children {
+            graph
+                .add_or_increment_edge(root, child, Weight::new(1))
+                .unwrap();
+        }
+
+        assert_eq!(graph.children(root).unwrap(), &children);
+        assert!(graph.validate().is_valid());
+    }
+
+    #[test]
+    fn compacted_adjacency_unpacks_and_accepts_new_edges() {
+        let mut graph = FtoDag::new(1);
+        let root = graph.add_node(key(0), NodeKind::Start).unwrap();
+        let left = graph.add_node(key(1), NodeKind::Internal).unwrap();
+        let right = graph.add_node(key(2), NodeKind::Internal).unwrap();
+        graph
+            .add_or_increment_edge(root, left, Weight::new(1))
+            .unwrap();
+        graph
+            .add_or_increment_edge(root, right, Weight::new(1))
+            .unwrap();
+        graph.compact_storage().unwrap();
+
+        let tail = graph.add_node(key(3), NodeKind::End).unwrap();
+        graph
+            .add_or_increment_edge(right, tail, Weight::new(1))
+            .unwrap();
+
+        assert_eq!(graph.children(right).unwrap(), &[tail]);
+        assert_eq!(graph.parents(tail).unwrap(), &[right]);
+        assert!(graph.validate().is_valid());
+    }
 }
