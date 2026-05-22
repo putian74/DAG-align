@@ -145,6 +145,12 @@ pub struct SelectedAnchor {
     pub weight: Weight,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct MatchedAnchorEntry {
+    index: usize,
+    selected: SelectedAnchor,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AnchorDecision {
     Matched(NodeId),
@@ -164,7 +170,12 @@ pub enum AnchorRejectReason {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AnchorPath {
     pub decisions: Vec<AnchorDecision>,
-    pub selected_anchors: Vec<Option<SelectedAnchor>>,
+    matched_anchors: Vec<MatchedAnchorEntry>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SparseMatchedPath {
+    matched_anchors: Vec<MatchedAnchorEntry>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -175,8 +186,34 @@ struct MutationCandidate {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct MutationCandidateSet {
+struct MutationCandidateStorage {
+    offsets: Vec<usize>,
     candidates: Vec<MutationCandidate>,
+}
+
+impl MutationCandidateStorage {
+    fn with_position_capacity(position_count: usize) -> Self {
+        let mut offsets = Vec::with_capacity(position_count + 1);
+        offsets.push(0);
+        Self {
+            offsets,
+            candidates: Vec::new(),
+        }
+    }
+
+    fn push_position<I>(&mut self, candidates: I)
+    where
+        I: IntoIterator<Item = MutationCandidate>,
+    {
+        self.candidates.extend(candidates);
+        self.offsets.push(self.candidates.len());
+    }
+
+    fn candidates_for(&self, position: usize) -> &[MutationCandidate] {
+        let start = self.offsets[position];
+        let end = self.offsets[position + 1];
+        &self.candidates[start..end]
+    }
 }
 
 trait CandidateLike {
@@ -422,6 +459,16 @@ enum BuildDetailMode {
     Summary,
 }
 
+impl BuildDetailMode {
+    const fn retains_node_path(self) -> bool {
+        matches!(self, Self::Diagnostics)
+    }
+
+    const fn retains_block_plan(self) -> bool {
+        matches!(self, Self::Diagnostics)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IntegratedSequenceBuildData {
     sequence_id: SequenceId,
@@ -557,8 +604,7 @@ impl FtoDagBuilder {
         detail_mode: BuildDetailMode,
     ) -> Result<IntegratedSequenceBuildData> {
         let mut previous = None;
-        let retain_details = detail_mode == BuildDetailMode::Diagnostics;
-        let mut node_path = retain_details.then(Vec::new);
+        let mut node_path = detail_mode.retains_node_path().then(Vec::new);
         let mut inserted_edges = 0;
         let new_nodes_created = occurrences.len();
         for occurrence in occurrences {
@@ -574,15 +620,22 @@ impl FtoDagBuilder {
                 path.push(node_id);
             }
         }
+        let block_plan = if detail_mode.retains_block_plan() {
+            Some(BlockPlan {
+                new_nodes: node_path
+                    .clone()
+                    .expect("diagnostic build data retains node path"),
+                ..BlockPlan::default()
+            })
+        } else {
+            None
+        };
         Ok(IntegratedSequenceBuildData {
             sequence_id,
-            node_path: node_path.clone(),
+            node_path,
             inserted_edges,
             provenance_records_added: new_nodes_created,
-            block_plan: node_path.map(|node_path| BlockPlan {
-                new_nodes: node_path,
-                ..BlockPlan::default()
-            }),
+            block_plan,
             new_nodes_created,
             reused_nodes: 0,
         })
@@ -811,7 +864,121 @@ impl FtoDagBuilder {
             }
         };
         timing.topology += start.elapsed();
-        let (candidate_sets, anchor_path) = if topology.is_none()
+        if topology.is_none()
+            && occurrences.len() > GREEDY_ANCHOR_SET_LIMIT
+            && !detail_mode.retains_node_path()
+            && !detail_mode.retains_block_plan()
+        {
+            let cache = self
+                .topology_cache
+                .as_ref()
+                .expect("incremental topology cache is initialized");
+            let start = Instant::now();
+            let (candidate_sets, sparse_path) =
+                self.collect_greedy_mutation_plan_with_cache(sequence_id, &occurrences, cache)?;
+            timing.candidate_collection += start.elapsed();
+
+            let mut matched_anchor_cursor = 0usize;
+            let mut previous = None;
+            let mut last_existing_coordinate = None;
+            self.existing_node_marks
+                .begin_sequence(self.graph.node_count());
+            let mut inserted_edges = 0;
+            let mut inserted_edge_keys = Vec::new();
+            let mut provenance_records_added = 0;
+            let mut new_nodes_created = 0;
+            let mut reused_nodes = 0;
+
+            let start = Instant::now();
+            for (index, occurrence) in occurrences.into_iter().enumerate() {
+                let candidate_set = candidate_sets.candidates_for(index);
+                while matched_anchor_cursor < sparse_path.matched_anchors.len()
+                    && sparse_path.matched_anchors[matched_anchor_cursor].index < index
+                {
+                    matched_anchor_cursor += 1;
+                }
+                let current_selected = sparse_path
+                    .matched_anchors
+                    .get(matched_anchor_cursor)
+                    .filter(|entry| entry.index == index)
+                    .map(|entry| entry.selected);
+                let next_anchor = sparse_path
+                    .matched_anchors
+                    .get(matched_anchor_cursor + usize::from(current_selected.is_some()))
+                    .map(|entry| (entry.selected.node, entry.selected.coordinate));
+                let node_id = if let Some(selected) = current_selected {
+                    self.add_source_to_existing_node(selected.node, sequence_id, occurrence.position)?;
+                    self.existing_node_marks.mark(selected.node);
+                    last_existing_coordinate = Some(selected.coordinate);
+                    selected.node
+                } else {
+                    let interval = CoordinateInterval {
+                        left: last_existing_coordinate,
+                        right: next_anchor.map(|(_, coordinate)| coordinate),
+                    };
+                    if let Some(reuse) = select_bounded_reuse_candidate_with_marks(
+                        candidate_set,
+                        interval,
+                        &self.existing_node_marks,
+                        &self.graph,
+                        previous,
+                        next_anchor.map(|(node, _)| node),
+                    ) {
+                        let node_id = reuse.node;
+                        self.add_source_to_existing_node(
+                            node_id,
+                            sequence_id,
+                            occurrence.position,
+                        )?;
+                        self.existing_node_marks.mark(node_id);
+                        last_existing_coordinate = Some(reuse.coordinate);
+                        reused_nodes += 1;
+                        node_id
+                    } else {
+                        let node_id = self.add_occurrence_node(sequence_id, occurrence)?;
+                        new_nodes_created += 1;
+                        node_id
+                    }
+                };
+                provenance_records_added += 1;
+                if let Some(previous) = previous {
+                    let update = self
+                        .graph
+                        .add_or_increment_edge(previous, node_id, Weight::new(1))?;
+                    inserted_edges += usize::from(update.inserted);
+                    if update.inserted {
+                        inserted_edge_keys.push(update.key);
+                    }
+                }
+                previous = Some(node_id);
+            }
+            timing.mutation += start.elapsed();
+
+            if self.config.topology_update_strategy.is_incremental() {
+                let start = Instant::now();
+                self.apply_topology_delta(&inserted_edge_keys)?;
+                timing.topology += start.elapsed();
+            }
+
+            let result = IntegratedSequenceBuildData {
+                sequence_id,
+                node_path: None,
+                inserted_edges,
+                provenance_records_added,
+                block_plan: None,
+                new_nodes_created,
+                reused_nodes,
+            };
+            let start = Instant::now();
+            self.record_integrated_sequence_data(&result);
+            timing.report_update += start.elapsed();
+            timing.total = total_start.elapsed();
+            return Ok(ProfiledSequenceBuildDataOutcome {
+                outcome: SequenceBuildDataOutcome::Integrated(result),
+                timing,
+            });
+        }
+        let (candidate_sets, compact_mutation_sets, anchor_path) = if topology.is_none()
             && occurrences.len() > GREEDY_ANCHOR_SET_LIMIT
         {
             let cache = self
@@ -822,7 +989,7 @@ impl FtoDagBuilder {
             let selected =
                 self.collect_greedy_anchor_path_with_cache(sequence_id, &occurrences, cache)?;
             timing.candidate_collection += start.elapsed();
-            selected
+            (None, Some(selected.0), selected.1)
         } else {
             let start = Instant::now();
             let candidate_sets = if let Some(topology) = &topology {
@@ -842,27 +1009,28 @@ impl FtoDagBuilder {
             let start = Instant::now();
             let anchor_path = self.select_monotone_anchor_path(&candidate_sets);
             timing.anchor_selection += start.elapsed();
-            (candidate_sets, anchor_path)
+            (Some(candidate_sets), None, anchor_path)
         };
-        let mut block_plan = if detail_mode == BuildDetailMode::Diagnostics {
+        let mut block_plan = if detail_mode.retains_block_plan() {
             let start = Instant::now();
-            let block_plan = block_plan_from_anchor_path(&anchor_path, &candidate_sets);
+            let block_plan = block_plan_from_anchor_path(&anchor_path);
             timing.block_planning += start.elapsed();
             Some(block_plan)
         } else {
             None
         };
-        let next_anchors = next_matched_anchors_after(&anchor_path, &candidate_sets);
-        let candidate_sets = compact_candidate_sets_for_mutation(candidate_sets, &anchor_path);
+        let candidate_sets = if let Some(candidate_sets) = candidate_sets {
+            compact_candidate_sets_for_mutation(candidate_sets, &anchor_path)
+        } else {
+            compact_mutation_sets.expect("greedy candidate path provides compact mutation sets")
+        };
         let AnchorPath {
             decisions,
-            selected_anchors,
+            matched_anchors,
         } = anchor_path;
-        let selected_coordinates = selected_anchors
-            .into_iter()
-            .map(|selected| selected.map(|selected| selected.coordinate))
-            .collect::<Vec<_>>();
-        let mut node_path = (detail_mode == BuildDetailMode::Diagnostics)
+        let mut matched_anchor_cursor = 0usize;
+        let mut node_path = detail_mode
+            .retains_node_path()
             .then(|| Vec::with_capacity(occurrences.len()));
         let mut previous = None;
         let mut last_existing_coordinate = None;
@@ -875,28 +1043,39 @@ impl FtoDagBuilder {
         let mut reused_nodes = 0;
 
         let start = Instant::now();
-        for (index, ((occurrence, decision), candidate_set)) in occurrences
+        for (index, (occurrence, decision)) in occurrences
             .into_iter()
             .zip(decisions.iter())
-            .zip(candidate_sets.into_iter())
             .enumerate()
         {
+            let candidate_set = candidate_sets.candidates_for(index);
+            while matched_anchor_cursor < matched_anchors.len()
+                && matched_anchors[matched_anchor_cursor].index < index
+            {
+                matched_anchor_cursor += 1;
+            }
+            let current_selected = matched_anchors
+                .get(matched_anchor_cursor)
+                .filter(|entry| entry.index == index)
+                .map(|entry| entry.selected);
+            let next_anchor = matched_anchors
+                .get(matched_anchor_cursor + usize::from(current_selected.is_some()))
+                .map(|entry| (entry.selected.node, entry.selected.coordinate));
             let node_id = match decision {
                 AnchorDecision::Matched(node_id) => {
                     self.add_source_to_existing_node(*node_id, sequence_id, occurrence.position)?;
                     self.existing_node_marks.mark(*node_id);
                     last_existing_coordinate =
-                        selected_coordinates[index].or(last_existing_coordinate);
+                        current_selected.map(|selected| selected.coordinate).or(last_existing_coordinate);
                     *node_id
                 }
                 AnchorDecision::Unmatched(_) => {
-                    let next_anchor = next_anchors[index];
                     let interval = CoordinateInterval {
                         left: last_existing_coordinate,
                         right: next_anchor.map(|(_, coordinate)| coordinate),
                     };
                     if let Some(reuse) = select_bounded_reuse_candidate_with_marks(
-                        &candidate_set,
+                        candidate_set,
                         interval,
                         &self.existing_node_marks,
                         &self.graph,
@@ -1152,11 +1331,12 @@ impl FtoDagBuilder {
         sequence_id: SequenceId,
         occurrences: &[FragmentOccurrence],
         cache: &TopologyCache,
-    ) -> Result<(Vec<AnchorCandidateSet>, AnchorPath)> {
-        let mut candidate_sets = Vec::with_capacity(occurrences.len());
+    ) -> Result<(MutationCandidateStorage, AnchorPath)> {
+        let mut candidate_sets = MutationCandidateStorage::with_position_capacity(occurrences.len());
         let mut decisions = Vec::with_capacity(occurrences.len());
-        let mut selected_anchors = Vec::with_capacity(occurrences.len());
-        let mut used_nodes = UsedNodeTracker::new(Some(self.graph.node_count()));
+        let mut matched_anchors = Vec::new();
+        let mut used_nodes =
+            UsedNodeTracker::new_for_path(Some(self.graph.node_count()), occurrences.len());
         let mut previous: Option<NodeId> = None;
         let mut last_coordinate: Option<TopologicalCoordinate> = None;
 
@@ -1178,28 +1358,34 @@ impl FtoDagBuilder {
                 previous = Some(candidate.node);
                 last_coordinate = candidate.coordinate;
                 decisions.push(AnchorDecision::Matched(candidate.node));
-                selected_anchors.push(candidate.coordinate.map(|coordinate| SelectedAnchor {
-                    node: candidate.node,
-                    coordinate,
-                    weight: candidate.weight,
-                }));
-                candidate_sets.push(AnchorCandidateSet {
-                    position: occurrence.position,
-                    kind,
-                    candidates: Vec::new(),
-                });
+                if let Some(coordinate) = candidate.coordinate {
+                    matched_anchors.push(MatchedAnchorEntry {
+                        index: occurrence.position,
+                        selected: SelectedAnchor {
+                            node: candidate.node,
+                            coordinate,
+                            weight: candidate.weight,
+                        },
+                    });
+                }
+                candidate_sets.push_position(std::iter::empty::<MutationCandidate>());
                 continue;
             }
 
-            let candidate_set = self.collect_anchor_candidate_set_with_cache(
-                Some(sequence_id),
-                occurrence,
-                kind,
-                cache,
-            )?;
-            let mut best: Option<(&AnchorCandidate, Weight)> = None;
+            let mut best: Option<(MutationCandidate, Weight)> = None;
+            let mut has_candidate = false;
             let mut has_coordinate = false;
-            for candidate in &candidate_set.candidates {
+            let nodes = self
+                .graph
+                .fragment_index()
+                .nodes_for_stored(&occurrence.key, kind);
+            let mut mutation_candidates = Vec::with_capacity(nodes.len());
+            for node_id in nodes.iter().copied() {
+                if !self.can_node_accept_sequence(node_id, sequence_id) {
+                    continue;
+                }
+                let candidate = self.anchor_candidate_from_cache(node_id, kind, cache)?;
+                has_candidate = true;
                 let Some(coordinate) = candidate.coordinate else {
                     continue;
                 };
@@ -1209,76 +1395,175 @@ impl FtoDagBuilder {
                 {
                     continue;
                 }
-                let score = greedy_candidate_score(candidate, previous, &|key| {
+                let score = greedy_candidate_score(&candidate, previous, &|key| {
                     self.graph.edge_weight(key).unwrap_or_default()
                 });
                 if best.is_none_or(|(best_candidate, best_score)| {
-                    better_greedy_candidate(candidate, score, best_candidate, best_score)
+                    score > best_score
+                        || (score == best_score && candidate.weight > best_candidate.weight)
+                        || (score == best_score
+                            && candidate.weight == best_candidate.weight
+                            && candidate.node < best_candidate.node)
                 }) {
-                    best = Some((candidate, score));
+                    best = Some((
+                        MutationCandidate {
+                            node: candidate.node,
+                            coordinate,
+                            weight: candidate.weight,
+                        },
+                        score,
+                    ));
                 }
+                mutation_candidates.push(MutationCandidate {
+                    node: candidate.node,
+                    coordinate,
+                    weight: candidate.weight,
+                });
             }
 
             if let Some((candidate, _)) = best {
                 used_nodes.insert(candidate.node);
                 previous = Some(candidate.node);
-                last_coordinate = candidate.coordinate;
+                last_coordinate = Some(candidate.coordinate);
                 decisions.push(AnchorDecision::Matched(candidate.node));
-                selected_anchors.push(candidate.coordinate.map(|coordinate| SelectedAnchor {
-                    node: candidate.node,
-                    coordinate,
-                    weight: candidate.weight,
-                }));
-            } else if candidate_set.candidates.is_empty() {
+                matched_anchors.push(MatchedAnchorEntry {
+                    index: occurrence.position,
+                    selected: SelectedAnchor {
+                        node: candidate.node,
+                        coordinate: candidate.coordinate,
+                        weight: candidate.weight,
+                    },
+                });
+            } else if !has_candidate {
                 decisions.push(AnchorDecision::Unmatched(AnchorRejectReason::NoCandidate));
-                selected_anchors.push(None);
             } else if has_coordinate {
                 decisions.push(AnchorDecision::Unmatched(AnchorRejectReason::NotSelected));
-                selected_anchors.push(None);
             } else {
                 decisions.push(AnchorDecision::Unmatched(
                     AnchorRejectReason::MissingTopology,
                 ));
-                selected_anchors.push(None);
             }
-            candidate_sets.push(candidate_set);
+            candidate_sets.push_position(mutation_candidates);
         }
 
         Ok((
             candidate_sets,
             AnchorPath {
                 decisions,
-                selected_anchors,
+                matched_anchors,
             },
         ))
     }
 
-    fn collect_anchor_candidate_set_with_cache(
+    fn collect_greedy_mutation_plan_with_cache(
         &self,
-        sequence_id: Option<SequenceId>,
-        occurrence: &FragmentOccurrence,
-        kind: NodeKind,
+        sequence_id: SequenceId,
+        occurrences: &[FragmentOccurrence],
         cache: &TopologyCache,
-    ) -> Result<AnchorCandidateSet> {
-        let nodes = self
-            .graph
-            .fragment_index()
-            .nodes_for_stored(&occurrence.key, kind);
-        let mut candidates = Vec::with_capacity(nodes.len());
-        for node_id in nodes.iter().copied() {
-            if sequence_id
-                .is_some_and(|sequence_id| !self.can_node_accept_sequence(node_id, sequence_id))
-            {
+    ) -> Result<(MutationCandidateStorage, SparseMatchedPath)> {
+        let mut candidate_sets = MutationCandidateStorage::with_position_capacity(occurrences.len());
+        let mut matched_anchors = Vec::new();
+        let mut used_nodes =
+            UsedNodeTracker::new_for_path(Some(self.graph.node_count()), occurrences.len());
+        let mut previous: Option<NodeId> = None;
+        let mut last_coordinate: Option<TopologicalCoordinate> = None;
+
+        for occurrence in occurrences {
+            let kind = node_kind_for_path_position(occurrence.kind);
+            let state = GreedySelectionState {
+                previous,
+                last_coordinate,
+                used_nodes: &used_nodes,
+            };
+            if let Some(candidate) = self.direct_child_extension_for_occurrence(
+                sequence_id,
+                occurrence,
+                kind,
+                state,
+                cache,
+            )? {
+                used_nodes.insert(candidate.node);
+                previous = Some(candidate.node);
+                last_coordinate = candidate.coordinate;
+                if let Some(coordinate) = candidate.coordinate {
+                    matched_anchors.push(MatchedAnchorEntry {
+                        index: occurrence.position,
+                        selected: SelectedAnchor {
+                            node: candidate.node,
+                            coordinate,
+                            weight: candidate.weight,
+                        },
+                    });
+                }
+                candidate_sets.push_position(std::iter::empty::<MutationCandidate>());
                 continue;
             }
 
-            candidates.push(self.anchor_candidate_from_cache(node_id, kind, cache)?);
+            let mut best: Option<(MutationCandidate, Weight)> = None;
+            let nodes = self
+                .graph
+                .fragment_index()
+                .nodes_for_stored(&occurrence.key, kind);
+            let mut mutation_candidates = Vec::with_capacity(nodes.len());
+            for node_id in nodes.iter().copied() {
+                if !self.can_node_accept_sequence(node_id, sequence_id) {
+                    continue;
+                }
+                let candidate = self.anchor_candidate_from_cache(node_id, kind, cache)?;
+                let Some(coordinate) = candidate.coordinate else {
+                    continue;
+                };
+                if last_coordinate.is_some_and(|last| last >= coordinate)
+                    || used_nodes.contains(candidate.node)
+                {
+                    continue;
+                }
+                let score = greedy_candidate_score(&candidate, previous, &|key| {
+                    self.graph.edge_weight(key).unwrap_or_default()
+                });
+                if best.is_none_or(|(best_candidate, best_score)| {
+                    score > best_score
+                        || (score == best_score && candidate.weight > best_candidate.weight)
+                        || (score == best_score
+                            && candidate.weight == best_candidate.weight
+                            && candidate.node < best_candidate.node)
+                }) {
+                    best = Some((
+                        MutationCandidate {
+                            node: candidate.node,
+                            coordinate,
+                            weight: candidate.weight,
+                        },
+                        score,
+                    ));
+                }
+                mutation_candidates.push(MutationCandidate {
+                    node: candidate.node,
+                    coordinate,
+                    weight: candidate.weight,
+                });
+            }
+
+            if let Some((candidate, _)) = best {
+                used_nodes.insert(candidate.node);
+                previous = Some(candidate.node);
+                last_coordinate = Some(candidate.coordinate);
+                matched_anchors.push(MatchedAnchorEntry {
+                    index: occurrence.position,
+                    selected: SelectedAnchor {
+                        node: candidate.node,
+                        coordinate: candidate.coordinate,
+                        weight: candidate.weight,
+                    },
+                });
+            }
+            candidate_sets.push_position(mutation_candidates);
         }
-        Ok(AnchorCandidateSet {
-            position: occurrence.position,
-            kind,
-            candidates,
-        })
+
+        Ok((
+            candidate_sets,
+            SparseMatchedPath { matched_anchors },
+        ))
     }
 
     fn direct_child_extension_for_occurrence(
@@ -2183,6 +2468,7 @@ mod tests {
         assert_eq!(counters.full_rebuild_fallbacks, 1);
         assert_forward_cache_matches_full(&graph, &cache);
     }
+
 }
 
 pub const fn node_kind_for_path_position(kind: PathPositionKind) -> NodeKind {
@@ -2320,17 +2606,20 @@ where
             }
         })
         .collect::<Vec<_>>();
-    let mut selected_anchors = vec![None; candidate_sets.len()];
+    let mut matched_anchors = Vec::new();
 
     if let Some((mut set_index, mut candidate_index, _)) = best {
         loop {
             let candidate = &candidate_sets[set_index].candidates()[candidate_index];
             decisions[set_index] = AnchorDecision::Matched(candidate.node());
             if let Some(coordinate) = candidate.coordinate() {
-                selected_anchors[set_index] = Some(SelectedAnchor {
-                    node: candidate.node(),
-                    coordinate,
-                    weight: candidate.weight(),
+                matched_anchors.push(MatchedAnchorEntry {
+                    index: set_index,
+                    selected: SelectedAnchor {
+                        node: candidate.node(),
+                        coordinate,
+                        weight: candidate.weight(),
+                    },
                 });
             }
             let Some(cell) = dp[set_index][candidate_index] else {
@@ -2344,10 +2633,11 @@ where
             }
         }
     }
+    matched_anchors.reverse();
 
     AnchorPath {
         decisions,
-        selected_anchors,
+        matched_anchors,
     }
 }
 
@@ -2361,8 +2651,8 @@ where
     S: CandidateSetLike<C>,
 {
     let mut decisions = Vec::with_capacity(candidate_sets.len());
-    let mut selected_anchors = Vec::with_capacity(candidate_sets.len());
-    let mut used_nodes = UsedNodeTracker::new(node_count);
+    let mut matched_anchors = Vec::new();
+    let mut used_nodes = UsedNodeTracker::new_for_path(node_count, candidate_sets.len());
     let mut previous: Option<NodeId> = None;
     let mut last_coordinate: Option<TopologicalCoordinate> = None;
 
@@ -2374,11 +2664,16 @@ where
             previous = Some(candidate.node());
             last_coordinate = candidate.coordinate();
             decisions.push(AnchorDecision::Matched(candidate.node()));
-            selected_anchors.push(candidate.coordinate().map(|coordinate| SelectedAnchor {
-                node: candidate.node(),
-                coordinate,
-                weight: candidate.weight(),
-            }));
+            if let Some(coordinate) = candidate.coordinate() {
+                matched_anchors.push(MatchedAnchorEntry {
+                    index: decisions.len() - 1,
+                    selected: SelectedAnchor {
+                        node: candidate.node(),
+                        coordinate,
+                        weight: candidate.weight(),
+                    },
+                });
+            }
             continue;
         }
 
@@ -2407,28 +2702,30 @@ where
             previous = Some(candidate.node());
             last_coordinate = candidate.coordinate();
             decisions.push(AnchorDecision::Matched(candidate.node()));
-            selected_anchors.push(candidate.coordinate().map(|coordinate| SelectedAnchor {
-                node: candidate.node(),
-                coordinate,
-                weight: candidate.weight(),
-            }));
+            if let Some(coordinate) = candidate.coordinate() {
+                matched_anchors.push(MatchedAnchorEntry {
+                    index: decisions.len() - 1,
+                    selected: SelectedAnchor {
+                        node: candidate.node(),
+                        coordinate,
+                        weight: candidate.weight(),
+                    },
+                });
+            }
         } else if set.candidates().is_empty() {
             decisions.push(AnchorDecision::Unmatched(AnchorRejectReason::NoCandidate));
-            selected_anchors.push(None);
         } else if has_coordinate {
             decisions.push(AnchorDecision::Unmatched(AnchorRejectReason::NotSelected));
-            selected_anchors.push(None);
         } else {
             decisions.push(AnchorDecision::Unmatched(
                 AnchorRejectReason::MissingTopology,
             ));
-            selected_anchors.push(None);
         }
     }
 
     AnchorPath {
         decisions,
-        selected_anchors,
+        matched_anchors,
     }
 }
 
@@ -2441,8 +2738,8 @@ where
     S: CandidateSetLike<C>,
 {
     let mut decisions = Vec::with_capacity(candidate_sets.len());
-    let mut selected_anchors = Vec::with_capacity(candidate_sets.len());
-    let mut used_nodes = UsedNodeTracker::new(Some(graph.node_count()));
+    let mut matched_anchors = Vec::new();
+    let mut used_nodes = UsedNodeTracker::new_for_path(Some(graph.node_count()), candidate_sets.len());
     let mut previous: Option<NodeId> = None;
     let mut last_coordinate: Option<TopologicalCoordinate> = None;
 
@@ -2454,11 +2751,16 @@ where
             previous = Some(candidate.node());
             last_coordinate = candidate.coordinate();
             decisions.push(AnchorDecision::Matched(candidate.node()));
-            selected_anchors.push(candidate.coordinate().map(|coordinate| SelectedAnchor {
-                node: candidate.node(),
-                coordinate,
-                weight: candidate.weight(),
-            }));
+            if let Some(coordinate) = candidate.coordinate() {
+                matched_anchors.push(MatchedAnchorEntry {
+                    index: decisions.len() - 1,
+                    selected: SelectedAnchor {
+                        node: candidate.node(),
+                        coordinate,
+                        weight: candidate.weight(),
+                    },
+                });
+            }
             continue;
         }
 
@@ -2489,28 +2791,30 @@ where
             previous = Some(candidate.node());
             last_coordinate = candidate.coordinate();
             decisions.push(AnchorDecision::Matched(candidate.node()));
-            selected_anchors.push(candidate.coordinate().map(|coordinate| SelectedAnchor {
-                node: candidate.node(),
-                coordinate,
-                weight: candidate.weight(),
-            }));
+            if let Some(coordinate) = candidate.coordinate() {
+                matched_anchors.push(MatchedAnchorEntry {
+                    index: decisions.len() - 1,
+                    selected: SelectedAnchor {
+                        node: candidate.node(),
+                        coordinate,
+                        weight: candidate.weight(),
+                    },
+                });
+            }
         } else if set.candidates().is_empty() {
             decisions.push(AnchorDecision::Unmatched(AnchorRejectReason::NoCandidate));
-            selected_anchors.push(None);
         } else if has_coordinate {
             decisions.push(AnchorDecision::Unmatched(AnchorRejectReason::NotSelected));
-            selected_anchors.push(None);
         } else {
             decisions.push(AnchorDecision::Unmatched(
                 AnchorRejectReason::MissingTopology,
             ));
-            selected_anchors.push(None);
         }
     }
 
     AnchorPath {
         decisions,
-        selected_anchors,
+        matched_anchors,
     }
 }
 
@@ -2625,10 +2929,16 @@ enum UsedNodeTracker {
 }
 
 impl UsedNodeTracker {
-    fn new(node_count: Option<usize>) -> Self {
-        node_count
-            .map(|node_count| Self::Marks(vec![false; node_count]))
-            .unwrap_or_else(|| Self::Set(HashSet::new()))
+    fn new_for_path(node_count: Option<usize>, expected_used: usize) -> Self {
+        const DENSE_MARK_LIMIT_FACTOR: usize = 64;
+        match node_count {
+            Some(node_count)
+                if node_count <= expected_used.saturating_mul(DENSE_MARK_LIMIT_FACTOR).max(4096) =>
+            {
+                Self::Marks(vec![false; node_count])
+            }
+            Some(_) | None => Self::Set(HashSet::with_capacity(expected_used.saturating_mul(2))),
+        }
     }
 
     fn contains(&self, node: NodeId) -> bool {
@@ -2654,30 +2964,42 @@ impl UsedNodeTracker {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ExistingNodeMarks {
-    marks: Vec<u16>,
-    current_mark: u16,
+    marks: Vec<u64>,
+    touched: Vec<NodeId>,
 }
 
 impl ExistingNodeMarks {
     fn begin_sequence(&mut self, node_count: usize) {
-        if self.current_mark == u16::MAX {
-            self.marks.fill(0);
-            self.current_mark = 1;
-        } else {
-            self.current_mark += 1;
+        for node in self.touched.drain(..) {
+            let word_index = node.to_usize() / u64::BITS as usize;
+            let bit_index = node.to_usize() % u64::BITS as usize;
+            if let Some(word) = self.marks.get_mut(word_index) {
+                *word &= !(1_u64 << bit_index);
+            }
         }
-        if self.marks.len() < node_count {
-            self.marks.resize(node_count, 0);
+        let word_count = node_count.div_ceil(u64::BITS as usize);
+        if self.marks.len() < word_count {
+            self.marks.resize(word_count, 0);
         }
     }
 
     fn contains(&self, node: NodeId) -> bool {
-        self.marks.get(node.to_usize()).copied() == Some(self.current_mark)
+        let word_index = node.to_usize() / u64::BITS as usize;
+        let bit_index = node.to_usize() % u64::BITS as usize;
+        self.marks
+            .get(word_index)
+            .is_some_and(|word| (*word & (1_u64 << bit_index)) != 0)
     }
 
     fn mark(&mut self, node: NodeId) {
-        if let Some(slot) = self.marks.get_mut(node.to_usize()) {
-            *slot = self.current_mark;
+        let word_index = node.to_usize() / u64::BITS as usize;
+        let bit_index = node.to_usize() % u64::BITS as usize;
+        if let Some(word) = self.marks.get_mut(word_index) {
+            let mask = 1_u64 << bit_index;
+            if (*word & mask) == 0 {
+                *word |= mask;
+                self.touched.push(node);
+            }
         }
     }
 }
@@ -2710,7 +3032,7 @@ pub fn select_bounded_reuse_candidate<'a>(
 }
 
 fn select_bounded_reuse_candidate_with_marks<'a>(
-    candidate_set: &'a MutationCandidateSet,
+    candidate_set: &'a [MutationCandidate],
     interval: CoordinateInterval,
     used_node_marks: &ExistingNodeMarks,
     graph: &FtoDag,
@@ -2718,7 +3040,7 @@ fn select_bounded_reuse_candidate_with_marks<'a>(
     next_node: Option<NodeId>,
 ) -> Option<&'a MutationCandidate> {
     let mut best: Option<(&MutationCandidate, Weight)> = None;
-    for candidate in &candidate_set.candidates {
+    for candidate in candidate_set {
         if !interval.contains_open(candidate.coordinate)
             || used_node_marks.contains(candidate.node)
             || next_node == Some(candidate.node)
@@ -2739,10 +3061,7 @@ fn select_bounded_reuse_candidate_with_marks<'a>(
     best.map(|(candidate, _)| candidate)
 }
 
-pub fn block_plan_from_anchor_path(
-    anchor_path: &AnchorPath,
-    _candidate_sets: &[AnchorCandidateSet],
-) -> BlockPlan {
+pub fn block_plan_from_anchor_path(anchor_path: &AnchorPath) -> BlockPlan {
     let mut accepted_anchors = Vec::new();
     let mut current_block: Option<AnchorBlock> = None;
     let mut last_anchor: Option<(usize, TopologicalCoordinate)> = None;
@@ -2823,43 +3142,25 @@ pub fn block_plan_from_anchor_path(
 fn compact_candidate_sets_for_mutation(
     candidate_sets: Vec<AnchorCandidateSet>,
     anchor_path: &AnchorPath,
-) -> Vec<MutationCandidateSet> {
-    candidate_sets
-        .into_iter()
-        .zip(anchor_path.decisions.iter())
-        .map(|(candidate_set, decision)| MutationCandidateSet {
-            candidates: match decision {
-                AnchorDecision::Matched(_) => Vec::new(),
-                AnchorDecision::Unmatched(_) => candidate_set
-                    .candidates
-                    .into_iter()
-                    .filter_map(|candidate| {
-                        candidate.coordinate.map(|coordinate| MutationCandidate {
-                            node: candidate.node,
-                            coordinate,
-                            weight: candidate.weight,
-                        })
+) -> MutationCandidateStorage {
+    let mut storage = MutationCandidateStorage::with_position_capacity(candidate_sets.len());
+    for (candidate_set, decision) in candidate_sets.into_iter().zip(anchor_path.decisions.iter()) {
+        match decision {
+            AnchorDecision::Matched(_) => storage.push_position(std::iter::empty::<
+                MutationCandidate,
+            >()),
+            AnchorDecision::Unmatched(_) => storage.push_position(
+                candidate_set.candidates.into_iter().filter_map(|candidate| {
+                    candidate.coordinate.map(|coordinate| MutationCandidate {
+                        node: candidate.node,
+                        coordinate,
+                        weight: candidate.weight,
                     })
-                    .collect(),
-            },
-        })
-        .collect()
-}
-
-fn next_matched_anchors_after(
-    anchor_path: &AnchorPath,
-    _candidate_sets: &[AnchorCandidateSet],
-) -> Vec<Option<(NodeId, TopologicalCoordinate)>> {
-    let mut next = vec![None; anchor_path.decisions.len()];
-    let mut current = None;
-    for index in (0..anchor_path.decisions.len()).rev() {
-        next[index] = current;
-        if let AnchorDecision::Matched(node_id) = anchor_path.decisions[index] {
-            current = selected_coordinate(anchor_path, index, node_id)
-                .map(|coordinate| (node_id, coordinate));
+                }),
+            ),
         }
     }
-    next
+    storage
 }
 
 fn reuse_score_for_node(
@@ -2893,10 +3194,11 @@ fn selected_anchor(
     node_id: NodeId,
 ) -> Option<SelectedAnchor> {
     anchor_path
-        .selected_anchors
-        .get(index)
-        .copied()
-        .flatten()
+        .matched_anchors
+        .binary_search_by_key(&index, |entry| entry.index)
+        .ok()
+        .and_then(|matched_index| anchor_path.matched_anchors.get(matched_index))
+        .map(|entry| entry.selected)
         .filter(|selected| selected.node == node_id)
 }
 
