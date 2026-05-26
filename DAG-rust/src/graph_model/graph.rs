@@ -937,6 +937,12 @@ impl FragmentIndex {
         self.packed_inline_entries.compact()?;
         Ok(())
     }
+
+    pub(crate) fn for_each_bucket(&self, mut f: impl FnMut(NodeKind, &[NodeId])) {
+        self.entries.for_each(|(kind, _fragment), nodes| f(*kind, nodes));
+        self.packed_inline_entries
+            .for_each(|key, nodes| f(key.kind, nodes));
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -984,6 +990,23 @@ where
 
     fn clear(&mut self) {
         *self = Self::Ragged(HashMap::new());
+    }
+
+    fn for_each(&self, mut f: impl FnMut(&K, &[NodeId])) {
+        match self {
+            Self::Ragged(entries) => {
+                for (key, ids) in entries {
+                    f(key, ids.as_slice());
+                }
+            }
+            Self::Packed { ranges, nodes } => {
+                for (key, range) in ranges {
+                    let start = range.start as usize;
+                    let end = start + range.len as usize;
+                    f(key, nodes.get(start..end).unwrap_or(&[]));
+                }
+            }
+        }
     }
 
     fn compact(&mut self) -> Result<()> {
@@ -1375,6 +1398,48 @@ impl SequenceTraceStore {
                 let store = self.ensure_unique_external_backing()?;
                 store.append_node(node_id)?;
                 self.offsets[sequence_index + 1] += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn append_path(&mut self, sequence_id: SequenceId, node_ids: &[NodeId]) -> Result<()> {
+        let sequence_index = sequence_id.to_usize();
+        let current_len = self.offsets.last().copied().unwrap_or(0);
+        while self.path_count() < sequence_index + 1 {
+            self.offsets.push(current_len);
+        }
+        if sequence_index + 1 != self.path_count() {
+            return Err(DagError::InvalidRange {
+                start: sequence_index,
+                end: sequence_index.saturating_add(1),
+                len: self.path_count(),
+            });
+        }
+        let expected_position = self
+            .path_bounds(sequence_index)
+            .map(|(start, end)| end - start)
+            .ok_or(DagError::InvalidRange {
+                start: sequence_index,
+                end: sequence_index.saturating_add(1),
+                len: self.path_count(),
+            })?;
+        if expected_position != 0 {
+            return Err(DagError::InvalidRange {
+                start: expected_position,
+                end: expected_position.saturating_add(1),
+                len: expected_position,
+            });
+        }
+        match &mut self.backing {
+            SequenceTraceBacking::InMemory(nodes) => {
+                nodes.extend_from_slice(node_ids);
+                self.offsets[sequence_index + 1] = nodes.len() as u64;
+            }
+            SequenceTraceBacking::DeferredExternal | SequenceTraceBacking::External(_) => {
+                let store = self.ensure_unique_external_backing()?;
+                store.append_nodes(node_ids)?;
+                self.offsets[sequence_index + 1] += node_ids.len() as u64;
             }
         }
         Ok(())
@@ -2149,6 +2214,45 @@ impl FtoDag {
         }
         self.sequence_trace_paths
             .append_node(record.sequence_id, record.position, node_id)
+    }
+
+    pub(crate) fn add_trace_path_provenance(
+        &mut self,
+        sequence_id: SequenceId,
+        node_path: &[NodeId],
+    ) -> Result<()> {
+        if !self.retains_sequence_trace_paths() {
+            for (position, node_id) in node_path.iter().copied().enumerate() {
+                self.add_provenance_record(
+                    node_id,
+                    ProvenanceRecord {
+                        sequence_id,
+                        position: ProvenancePosition::new(position as u64),
+                    },
+                )?;
+            }
+            return Ok(());
+        }
+
+        for node_id in node_path.iter().copied() {
+            let node_index = node_id.to_usize();
+            let _ = self
+                .nodes
+                .get(node_index)
+                .ok_or(DagError::MissingNode { node: node_index })?;
+        }
+        self.sequence_trace_paths
+            .append_path(sequence_id, node_path)?;
+        for node_id in node_path.iter().copied() {
+            let node_index = node_id.to_usize();
+            let last_sequence = &mut self.node_last_sequences[node_index];
+            if sequence_id_from_marker(*last_sequence).is_none_or(|last| last < sequence_id) {
+                *last_sequence = sequence_id.raw();
+            }
+            let node = &mut self.nodes[node_index];
+            node.weight = Weight::new(node.weight.raw() + 1);
+        }
+        Ok(())
     }
 
     pub fn add_or_increment_edge(

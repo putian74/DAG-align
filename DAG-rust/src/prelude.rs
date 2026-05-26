@@ -1,26 +1,25 @@
 //! Common public imports for users of `dag_rust`.
 
 pub use crate::algorithms::build::{
-    AnchorBlock, AnchorCandidate, AnchorCandidateSet, AnchorDecision, AnchorPath,
-    AnchorRejectReason, BlockPlan, BuildConfig, BuildOrderingPolicy, BuildReport,
-    BuildSequenceResult, BuildSequenceSummary, BuildTimingBreakdown, CoordinateInterval,
-    FtoDagBuilder, IntegrationDecision, PathRange, ProfiledSequenceBuildOutcome,
-    ProfiledSequenceBuildSummaryOutcome, RejectedSequence, RejectionPolicy, SequenceBuildOutcome,
-    SequenceBuildSummaryOutcome, SimilarityThreshold, TopologyUpdateCounters,
-    TopologyUpdateStrategy, UnanchoredBlock, block_plan_from_anchor_path,
-    node_kind_for_path_position, select_bounded_reuse_candidate, select_monotone_anchor_path,
-    select_monotone_anchor_path_with_graph,
+    block_plan_from_anchor_path, node_kind_for_path_position, select_bounded_reuse_candidate,
+    select_monotone_anchor_path, select_monotone_anchor_path_with_graph, AnchorBlock,
+    AnchorCandidate, AnchorCandidateSet, AnchorDecision, AnchorPath, AnchorRejectReason, BlockPlan,
+    BuildConfig, BuildOrderingPolicy, BuildReport, BuildSequenceResult, BuildSequenceSummary,
+    BuildTimingBreakdown, CoordinateInterval, FtoDagBuilder, IntegrationDecision, PathRange,
+    ProfiledSequenceBuildOutcome, ProfiledSequenceBuildSummaryOutcome, RejectedSequence,
+    RejectionPolicy, SequenceBuildOutcome, SequenceBuildSummaryOutcome, SimilarityThreshold,
+    TopologyUpdateCounters, TopologyUpdateStrategy, UnanchoredBlock,
 };
 pub use crate::algorithms::merge::{
-    AnchorMap, MergeConfig, MergeDecision, MergeOrderingPolicy, MergeOrientation, MergePlan,
-    MergeStats, NodeRemap, RejectedMerge, merge_graphs, merge_trace_path_graphs_as_count_only,
+    merge_graphs, merge_trace_path_graphs_as_count_only, AnchorMap, MergeConfig, MergeDecision,
+    MergeOrderingPolicy, MergeOrientation, MergePlan, MergeStats, NodeRemap, RejectedMerge,
 };
 pub use crate::algorithms::ordering::{
     GraphSketch, OrderingPolicy, PairingPlan, SequenceSketch, SimilarityBucket, SimilaritySketch,
     SketchConfig,
 };
 pub use crate::algorithms::postprocess::{
-    PostprocessStats, ResolutionConfig, SecondaryMergeConfig, secondary_merge_graph,
+    secondary_merge_graph, PostprocessStats, ResolutionConfig, SecondaryMergeConfig,
 };
 pub use crate::algorithms::scheduler::{
     BuildScheduler, ChunkPlan, MemoryBudget, MergeRoundPlan, ProgressEvent, ProgressSink,
@@ -40,8 +39,8 @@ pub use crate::graph_model::provenance::{
     ProvenanceTable,
 };
 pub use crate::graph_model::reference::{
-    ExportProfile, InsertionRegion, ReferencePath, ReferencePathStrategy, StateInterval,
-    SubgraphProjection, TensorExportLayout,
+    ExportProfile, InsertionRegion, ReferencePath, ReferencePathStrategy, ReferencePathWeighting,
+    StateInterval, SubgraphProjection, TensorExportLayout,
 };
 pub use crate::graph_model::topology::{
     Children, DagTopology, Parents, ReverseTopologicalOrder, TopologicalOrder, TraversalDirection,

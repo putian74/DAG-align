@@ -21,6 +21,13 @@ pub struct DagTopology {
     reverse_coordinates: Vec<TopologicalCoordinate>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphCoordinateSnapshot {
+    topological_order: Vec<NodeId>,
+    forward_coordinates: Vec<TopologicalCoordinate>,
+    reverse_coordinates: Vec<TopologicalCoordinate>,
+}
+
 impl DagTopology {
     pub fn from_graph(graph: &FtoDag) -> Result<Self> {
         Self::try_from_graph(graph)
@@ -32,8 +39,8 @@ impl DagTopology {
         let children = PackedAdjacency::from_graph_edges(graph, true)?;
 
         let topological_order = topological_sort(node_count, &parents, &children)?;
-        let forward_coordinates = forward_coordinates(&topological_order, &parents);
-        let reverse_coordinates = reverse_coordinates(&topological_order, &children);
+        let forward_coordinates = forward_coordinates_from_adjacency(&topological_order, &parents);
+        let reverse_coordinates = reverse_coordinates_from_adjacency(&topological_order, &children);
 
         Ok(Self {
             node_count,
@@ -72,6 +79,14 @@ impl DagTopology {
         &self.topological_order
     }
 
+    pub fn forward_coordinates(&self) -> &[TopologicalCoordinate] {
+        &self.forward_coordinates
+    }
+
+    pub fn reverse_coordinates(&self) -> &[TopologicalCoordinate] {
+        &self.reverse_coordinates
+    }
+
     pub fn reverse_topological_order(&self) -> ReverseTopologicalOrder<'_> {
         ReverseTopologicalOrder::new(&self.topological_order)
     }
@@ -92,6 +107,84 @@ impl DagTopology {
             .ok_or(DagError::MissingNode {
                 node: node.to_usize(),
             })
+    }
+}
+
+impl GraphCoordinateSnapshot {
+    pub fn from_graph(graph: &FtoDag) -> Result<Self> {
+        let topological_order = topological_order_from_graph(graph)?;
+        let forward_coordinates = forward_coordinates_from_graph(graph, &topological_order)?;
+        let reverse_coordinates = reverse_coordinates_from_graph(graph, &topological_order)?;
+        Ok(Self {
+            topological_order,
+            forward_coordinates,
+            reverse_coordinates,
+        })
+    }
+
+    pub fn topological_order(&self) -> &[NodeId] {
+        &self.topological_order
+    }
+
+    pub fn forward_coordinates(&self) -> &[TopologicalCoordinate] {
+        &self.forward_coordinates
+    }
+
+    pub fn reverse_coordinates(&self) -> &[TopologicalCoordinate] {
+        &self.reverse_coordinates
+    }
+
+    pub fn forward_coordinate(&self, node: NodeId) -> Result<TopologicalCoordinate> {
+        self.forward_coordinates
+            .get(node.to_usize())
+            .copied()
+            .ok_or(DagError::MissingNode {
+                node: node.to_usize(),
+            })
+    }
+
+    pub fn reverse_coordinate(&self, node: NodeId) -> Result<TopologicalCoordinate> {
+        self.reverse_coordinates
+            .get(node.to_usize())
+            .copied()
+            .ok_or(DagError::MissingNode {
+                node: node.to_usize(),
+            })
+    }
+
+    pub fn into_topological_order(self) -> Vec<NodeId> {
+        self.topological_order
+    }
+}
+
+pub fn topological_order_from_graph(graph: &FtoDag) -> Result<Vec<NodeId>> {
+    let mut indegree = Vec::with_capacity(graph.node_count());
+    let mut queue = VecDeque::new();
+    for index in 0..graph.node_count() {
+        let node = NodeId::try_from(index)?;
+        let degree = graph.parents(node)?.len();
+        indegree.push(degree);
+        if degree == 0 {
+            queue.push_back(node);
+        }
+    }
+
+    let mut order = Vec::with_capacity(graph.node_count());
+    while let Some(node) = queue.pop_front() {
+        order.push(node);
+        for child in graph.children(node)? {
+            let degree = &mut indegree[child.to_usize()];
+            *degree -= 1;
+            if *degree == 0 {
+                queue.push_back(*child);
+            }
+        }
+    }
+
+    if order.len() == graph.node_count() {
+        Ok(order)
+    } else {
+        Err(DagError::CycleDetected)
     }
 }
 
@@ -129,7 +222,10 @@ fn topological_sort(
     }
 }
 
-fn forward_coordinates(order: &[NodeId], parents: &PackedAdjacency) -> Vec<TopologicalCoordinate> {
+fn forward_coordinates_from_adjacency(
+    order: &[NodeId],
+    parents: &PackedAdjacency,
+) -> Vec<TopologicalCoordinate> {
     let mut coordinates = vec![TopologicalCoordinate::new(0); parents.node_count()];
     for node in order {
         let coordinate = parents
@@ -145,7 +241,10 @@ fn forward_coordinates(order: &[NodeId], parents: &PackedAdjacency) -> Vec<Topol
     coordinates
 }
 
-fn reverse_coordinates(order: &[NodeId], children: &PackedAdjacency) -> Vec<TopologicalCoordinate> {
+fn reverse_coordinates_from_adjacency(
+    order: &[NodeId],
+    children: &PackedAdjacency,
+) -> Vec<TopologicalCoordinate> {
     let mut coordinates = vec![TopologicalCoordinate::new(0); children.node_count()];
     for node in order.iter().rev() {
         let coordinate = children
@@ -159,6 +258,42 @@ fn reverse_coordinates(order: &[NodeId], children: &PackedAdjacency) -> Vec<Topo
         coordinates[node.to_usize()] = TopologicalCoordinate::new(coordinate);
     }
     coordinates
+}
+
+fn forward_coordinates_from_graph(
+    graph: &FtoDag,
+    order: &[NodeId],
+) -> Result<Vec<TopologicalCoordinate>> {
+    let mut coordinates = vec![TopologicalCoordinate::new(0); graph.node_count()];
+    for node in order.iter().copied() {
+        let coordinate = graph
+            .parents(node)?
+            .iter()
+            .map(|parent| coordinates[parent.to_usize()].raw())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        coordinates[node.to_usize()] = TopologicalCoordinate::new(coordinate);
+    }
+    Ok(coordinates)
+}
+
+fn reverse_coordinates_from_graph(
+    graph: &FtoDag,
+    order: &[NodeId],
+) -> Result<Vec<TopologicalCoordinate>> {
+    let mut coordinates = vec![TopologicalCoordinate::new(0); graph.node_count()];
+    for node in order.iter().rev().copied() {
+        let coordinate = graph
+            .children(node)?
+            .iter()
+            .map(|child| coordinates[child.to_usize()].raw())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        coordinates[node.to_usize()] = TopologicalCoordinate::new(coordinate);
+    }
+    Ok(coordinates)
 }
 
 pub struct TopologicalOrder<'a> {

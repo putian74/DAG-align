@@ -216,13 +216,13 @@ impl MutationCandidateStorage {
     }
 }
 
-trait CandidateLike {
+pub(crate) trait CandidateLike {
     fn node(&self) -> NodeId;
     fn coordinate(&self) -> Option<TopologicalCoordinate>;
     fn weight(&self) -> Weight;
 }
 
-trait CandidateSetLike<C: CandidateLike> {
+pub(crate) trait CandidateSetLike<C: CandidateLike> {
     fn candidates(&self) -> &[C];
 }
 
@@ -683,6 +683,67 @@ impl FtoDagBuilder {
             .outcome)
     }
 
+    pub(crate) fn add_exact_trace_path_summary(
+        &mut self,
+        sequence_id: SequenceId,
+        source_graph: &FtoDag,
+        trace_path: &[NodeId],
+    ) -> Result<Option<Vec<NodeId>>> {
+        let mapped_path = if let Some(mapped_path) =
+            self.resolve_unique_exact_trace_path(sequence_id, source_graph, trace_path)?
+        {
+            mapped_path
+        } else if let Some(mapped_path) =
+            self.resolve_greedy_exact_trace_path(sequence_id, source_graph, trace_path)?
+        {
+            mapped_path
+        } else {
+            return Ok(None);
+        };
+
+        self.integrate_mapped_trace_path_summary(sequence_id, &mapped_path)?;
+        Ok(Some(mapped_path))
+    }
+
+    pub(crate) fn integrate_mapped_trace_path_summary(
+        &mut self,
+        sequence_id: SequenceId,
+        mapped_path: &[NodeId],
+    ) -> Result<()> {
+        self.report.attempted_sequences += 1;
+        let mut previous = None;
+        let mut inserted_edges = 0;
+        for node_id in mapped_path.iter().copied() {
+            if !self.can_node_accept_sequence(node_id, sequence_id) {
+                return Err(DagError::DuplicateSequenceProvenance {
+                    node: node_id.to_usize(),
+                    sequence: sequence_id.raw(),
+                });
+            }
+            if let Some(previous) = previous {
+                let update = self
+                    .graph
+                    .add_or_increment_edge(previous, node_id, Weight::new(1))?;
+                inserted_edges += usize::from(update.inserted);
+            }
+            previous = Some(node_id);
+        }
+        self.graph
+            .add_trace_path_provenance(sequence_id, mapped_path)?;
+
+        let result = IntegratedSequenceBuildData {
+            sequence_id,
+            node_path: None,
+            inserted_edges,
+            provenance_records_added: mapped_path.len(),
+            block_plan: None,
+            new_nodes_created: 0,
+            reused_nodes: mapped_path.len(),
+        };
+        self.record_integrated_sequence_data(&result);
+        Ok(())
+    }
+
     pub fn add_sequence_from_encoded_profiled<E: FragmentEncoder>(
         &mut self,
         sequence_id: SequenceId,
@@ -907,7 +968,11 @@ impl FtoDagBuilder {
                     .get(matched_anchor_cursor + usize::from(current_selected.is_some()))
                     .map(|entry| (entry.selected.node, entry.selected.coordinate));
                 let node_id = if let Some(selected) = current_selected {
-                    self.add_source_to_existing_node(selected.node, sequence_id, occurrence.position)?;
+                    self.add_source_to_existing_node(
+                        selected.node,
+                        sequence_id,
+                        occurrence.position,
+                    )?;
                     self.existing_node_marks.mark(selected.node);
                     last_existing_coordinate = Some(selected.coordinate);
                     selected.node
@@ -942,9 +1007,9 @@ impl FtoDagBuilder {
                 };
                 provenance_records_added += 1;
                 if let Some(previous) = previous {
-                    let update = self
-                        .graph
-                        .add_or_increment_edge(previous, node_id, Weight::new(1))?;
+                    let update =
+                        self.graph
+                            .add_or_increment_edge(previous, node_id, Weight::new(1))?;
                     inserted_edges += usize::from(update.inserted);
                     if update.inserted {
                         inserted_edge_keys.push(update.key);
@@ -1043,10 +1108,8 @@ impl FtoDagBuilder {
         let mut reused_nodes = 0;
 
         let start = Instant::now();
-        for (index, (occurrence, decision)) in occurrences
-            .into_iter()
-            .zip(decisions.iter())
-            .enumerate()
+        for (index, (occurrence, decision)) in
+            occurrences.into_iter().zip(decisions.iter()).enumerate()
         {
             let candidate_set = candidate_sets.candidates_for(index);
             while matched_anchor_cursor < matched_anchors.len()
@@ -1065,8 +1128,9 @@ impl FtoDagBuilder {
                 AnchorDecision::Matched(node_id) => {
                     self.add_source_to_existing_node(*node_id, sequence_id, occurrence.position)?;
                     self.existing_node_marks.mark(*node_id);
-                    last_existing_coordinate =
-                        current_selected.map(|selected| selected.coordinate).or(last_existing_coordinate);
+                    last_existing_coordinate = current_selected
+                        .map(|selected| selected.coordinate)
+                        .or(last_existing_coordinate);
                     *node_id
                 }
                 AnchorDecision::Unmatched(_) => {
@@ -1332,7 +1396,8 @@ impl FtoDagBuilder {
         occurrences: &[FragmentOccurrence],
         cache: &TopologyCache,
     ) -> Result<(MutationCandidateStorage, AnchorPath)> {
-        let mut candidate_sets = MutationCandidateStorage::with_position_capacity(occurrences.len());
+        let mut candidate_sets =
+            MutationCandidateStorage::with_position_capacity(occurrences.len());
         let mut decisions = Vec::with_capacity(occurrences.len());
         let mut matched_anchors = Vec::new();
         let mut used_nodes =
@@ -1461,7 +1526,8 @@ impl FtoDagBuilder {
         occurrences: &[FragmentOccurrence],
         cache: &TopologyCache,
     ) -> Result<(MutationCandidateStorage, SparseMatchedPath)> {
-        let mut candidate_sets = MutationCandidateStorage::with_position_capacity(occurrences.len());
+        let mut candidate_sets =
+            MutationCandidateStorage::with_position_capacity(occurrences.len());
         let mut matched_anchors = Vec::new();
         let mut used_nodes =
             UsedNodeTracker::new_for_path(Some(self.graph.node_count()), occurrences.len());
@@ -1560,10 +1626,7 @@ impl FtoDagBuilder {
             candidate_sets.push_position(mutation_candidates);
         }
 
-        Ok((
-            candidate_sets,
-            SparseMatchedPath { matched_anchors },
-        ))
+        Ok((candidate_sets, SparseMatchedPath { matched_anchors }))
     }
 
     fn direct_child_extension_for_occurrence(
@@ -1593,6 +1656,55 @@ impl FtoDagBuilder {
                 continue;
             }
             let candidate = self.anchor_candidate_from_cache(*child, kind, cache)?;
+            if candidate.coordinate != Some(next_coordinate) {
+                continue;
+            }
+            let score = self
+                .graph
+                .edge_weight(EdgeKey {
+                    parent: previous,
+                    child: candidate.node,
+                })
+                .unwrap_or_default();
+            if score == Weight::new(0) {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(best_candidate, best_score)| {
+                better_greedy_candidate(&candidate, score, best_candidate, *best_score)
+            }) {
+                best = Some((candidate, score));
+            }
+        }
+        Ok(best.map(|(candidate, _)| candidate))
+    }
+
+    fn direct_child_extension_for_stored_fragment(
+        &self,
+        sequence_id: SequenceId,
+        kind: NodeKind,
+        fragment: &crate::graph_model::graph::StoredFragmentKey,
+        state: GreedySelectionState<'_>,
+        cache: &TopologyCache,
+    ) -> Result<Option<AnchorCandidate>> {
+        let Some(previous) = state.previous else {
+            return Ok(None);
+        };
+        let Some(last_coordinate) = state.last_coordinate else {
+            return Ok(None);
+        };
+        let next_coordinate = TopologicalCoordinate::new(last_coordinate.raw() + 1);
+        let mut best = None;
+        for child in self.graph.children(previous)?.iter().copied() {
+            if state.used_nodes.contains(child)
+                || !self.can_node_accept_sequence(child, sequence_id)
+            {
+                continue;
+            }
+            let node = self.graph.node(child)?;
+            if node.kind != kind || node.fragment != *fragment {
+                continue;
+            }
+            let candidate = self.anchor_candidate_from_cache(child, kind, cache)?;
             if candidate.coordinate != Some(next_coordinate) {
                 continue;
             }
@@ -1726,6 +1838,147 @@ impl FtoDagBuilder {
         self.graph
             .can_node_accept_sequence(node_id, sequence_id)
             .unwrap_or(false)
+    }
+
+    fn resolve_unique_exact_trace_path(
+        &self,
+        sequence_id: SequenceId,
+        source_graph: &FtoDag,
+        trace_path: &[NodeId],
+    ) -> Result<Option<Vec<NodeId>>> {
+        let Some((&first_source, rest)) = trace_path.split_first() else {
+            return Ok(Some(Vec::new()));
+        };
+
+        let first_source_node = source_graph.node(first_source)?;
+        let mut mapped = None;
+        for node_id in self
+            .graph
+            .fragment_index()
+            .nodes_for_stored(&first_source_node.fragment, first_source_node.kind)
+            .iter()
+            .copied()
+        {
+            if !self.can_node_accept_sequence(node_id, sequence_id) {
+                continue;
+            }
+            if mapped.is_some() {
+                return Ok(None);
+            }
+            mapped = Some(node_id);
+        }
+
+        let Some(mut current) = mapped else {
+            return Ok(None);
+        };
+        let mut mapped_path = Vec::with_capacity(trace_path.len());
+        mapped_path.push(current);
+
+        for source_node_id in rest.iter().copied() {
+            let source_node = source_graph.node(source_node_id)?;
+            let mut next_match = None;
+            for child in self.graph.children(current)?.iter().copied() {
+                if !self.can_node_accept_sequence(child, sequence_id) {
+                    continue;
+                }
+                let child_node = self.graph.node(child)?;
+                if child_node.kind != source_node.kind
+                    || child_node.fragment != source_node.fragment
+                {
+                    continue;
+                }
+                if next_match.is_some() {
+                    return Ok(None);
+                }
+                next_match = Some(child);
+            }
+            let Some(next) = next_match else {
+                return Ok(None);
+            };
+            mapped_path.push(next);
+            current = next;
+        }
+
+        Ok(Some(mapped_path))
+    }
+
+    fn resolve_greedy_exact_trace_path(
+        &mut self,
+        sequence_id: SequenceId,
+        source_graph: &FtoDag,
+        trace_path: &[NodeId],
+    ) -> Result<Option<Vec<NodeId>>> {
+        if trace_path.len() <= GREEDY_ANCHOR_SET_LIMIT {
+            return Ok(None);
+        }
+        let Some((&first_source, rest)) = trace_path.split_first() else {
+            return Ok(Some(Vec::new()));
+        };
+
+        self.ensure_topology_cache()?;
+        let cache = self
+            .topology_cache
+            .as_ref()
+            .expect("incremental topology cache is initialized");
+        let first_source_node = source_graph.node(first_source)?;
+        let edge_score = |key| self.graph.edge_weight(key).unwrap_or_default();
+        let mut best: Option<(AnchorCandidate, Weight)> = None;
+        for node_id in self
+            .graph
+            .fragment_index()
+            .nodes_for_stored(&first_source_node.fragment, first_source_node.kind)
+            .iter()
+            .copied()
+        {
+            if !self.can_node_accept_sequence(node_id, sequence_id) {
+                continue;
+            }
+            let candidate =
+                self.anchor_candidate_from_cache(node_id, first_source_node.kind, cache)?;
+            let score = greedy_candidate_score(&candidate, None, &edge_score);
+            if best.as_ref().is_none_or(|(best_candidate, best_score)| {
+                better_greedy_candidate(&candidate, score, best_candidate, *best_score)
+            }) {
+                best = Some((candidate, score));
+            }
+        }
+
+        let Some((first_candidate, _)) = best else {
+            return Ok(None);
+        };
+
+        let mut used_nodes =
+            UsedNodeTracker::new_for_path(Some(self.graph.node_count()), trace_path.len());
+        used_nodes.insert(first_candidate.node);
+        let mut mapped_path = Vec::with_capacity(trace_path.len());
+        mapped_path.push(first_candidate.node);
+        let mut previous = Some(first_candidate.node);
+        let mut last_coordinate = first_candidate.coordinate;
+
+        for source_node_id in rest.iter().copied() {
+            let source_node = source_graph.node(source_node_id)?;
+            let state = GreedySelectionState {
+                previous,
+                last_coordinate,
+                used_nodes: &used_nodes,
+            };
+            let Some(candidate) = self.direct_child_extension_for_stored_fragment(
+                sequence_id,
+                source_node.kind,
+                &source_node.fragment,
+                state,
+                cache,
+            )?
+            else {
+                return Ok(None);
+            };
+            used_nodes.insert(candidate.node);
+            previous = Some(candidate.node);
+            last_coordinate = candidate.coordinate;
+            mapped_path.push(candidate.node);
+        }
+
+        Ok(Some(mapped_path))
     }
 
     fn record_integrated_sequence_data(&mut self, result: &IntegratedSequenceBuildData) {
@@ -2290,6 +2543,9 @@ impl CoordinateProvider for TopologyCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foundations::id::ProvenancePosition;
+    use crate::graph_model::provenance::ProvenanceRecord;
+    use crate::graph_model::provenance::ProvenanceStorageStrategy;
     use crate::sequence_model::alphabet::SymbolId;
     use crate::sequence_model::fragment::FragmentKey;
 
@@ -2303,6 +2559,20 @@ mod tests {
             .expect("edge insertion succeeds");
         assert!(update.inserted);
         update.key
+    }
+
+    fn add_trace_path(graph: &mut FtoDag, sequence_id: u32, path: &[NodeId]) {
+        for (position, node_id) in path.iter().copied().enumerate() {
+            graph
+                .add_provenance_record(
+                    node_id,
+                    ProvenanceRecord {
+                        sequence_id: SequenceId::new(sequence_id),
+                        position: ProvenancePosition::new(position as u64),
+                    },
+                )
+                .expect("trace-path provenance insertion succeeds");
+        }
     }
 
     fn assert_forward_cache_matches_full(graph: &FtoDag, cache: &TopologyCache) {
@@ -2469,6 +2739,114 @@ mod tests {
         assert_forward_cache_matches_full(&graph, &cache);
     }
 
+    #[test]
+    fn exact_trace_path_summary_reuses_unique_existing_path() {
+        let mut base = FtoDag::with_provenance_storage(1, ProvenanceStorageStrategy::TracePaths);
+        let start = base.add_node(key(0), NodeKind::Start).unwrap();
+        let middle = base.add_node(key(1), NodeKind::Internal).unwrap();
+        let end = base.add_node(key(2), NodeKind::End).unwrap();
+        add_edge(&mut base, start, middle);
+        add_edge(&mut base, middle, end);
+        add_trace_path(&mut base, 0, &[start, middle, end]);
+
+        let mut add = FtoDag::with_provenance_storage(1, ProvenanceStorageStrategy::TracePaths);
+        let add_start = add.add_node(key(0), NodeKind::Start).unwrap();
+        let add_middle = add.add_node(key(1), NodeKind::Internal).unwrap();
+        let add_end = add.add_node(key(2), NodeKind::End).unwrap();
+        add_edge(&mut add, add_start, add_middle);
+        add_edge(&mut add, add_middle, add_end);
+        add_trace_path(&mut add, 0, &[add_start, add_middle, add_end]);
+
+        let mut config = BuildConfig::new(1);
+        config.provenance_storage_strategy = ProvenanceStorageStrategy::TracePaths;
+        let mut builder = FtoDagBuilder::from_graph(base, config).unwrap();
+        let trace_path = add.sequence_trace_path(SequenceId::new(0)).unwrap();
+
+        assert_eq!(
+            builder
+                .add_exact_trace_path_summary(SequenceId::new(1), &add, &trace_path)
+                .unwrap(),
+            Some(vec![start, middle, end])
+        );
+        assert_eq!(builder.report().attempted_sequences, 1);
+        assert_eq!(
+            builder.report().integrated_sequences,
+            vec![SequenceId::new(1)]
+        );
+        assert_eq!(builder.report().total_nodes_created, 0);
+        assert_eq!(builder.report().total_edges_inserted, 0);
+        assert_eq!(builder.report().total_provenance_records_added, 3);
+        assert_eq!(builder.graph().provenance_record_count(start).unwrap(), 2);
+        assert_eq!(builder.graph().provenance_record_count(middle).unwrap(), 2);
+        assert_eq!(builder.graph().provenance_record_count(end).unwrap(), 2);
+        assert_eq!(
+            builder.graph().edge_weight(EdgeKey {
+                parent: start,
+                child: middle,
+            }),
+            Some(Weight::new(2))
+        );
+        assert_eq!(
+            builder.graph().edge_weight(EdgeKey {
+                parent: middle,
+                child: end,
+            }),
+            Some(Weight::new(2))
+        );
+        assert_eq!(
+            builder
+                .graph()
+                .sequence_trace_path(SequenceId::new(1))
+                .unwrap(),
+            vec![start, middle, end]
+        );
+    }
+
+    #[test]
+    fn exact_trace_path_summary_skips_ambiguous_existing_paths() {
+        let mut base = FtoDag::with_provenance_storage(1, ProvenanceStorageStrategy::TracePaths);
+        let left_start = base.add_node(key(0), NodeKind::Start).unwrap();
+        let left_mid = base.add_node(key(1), NodeKind::Internal).unwrap();
+        let left_end = base.add_node(key(2), NodeKind::End).unwrap();
+        add_edge(&mut base, left_start, left_mid);
+        add_edge(&mut base, left_mid, left_end);
+        add_trace_path(&mut base, 0, &[left_start, left_mid, left_end]);
+
+        let right_start = base.add_node(key(0), NodeKind::Start).unwrap();
+        let right_mid = base.add_node(key(1), NodeKind::Internal).unwrap();
+        let right_end = base.add_node(key(2), NodeKind::End).unwrap();
+        add_edge(&mut base, right_start, right_mid);
+        add_edge(&mut base, right_mid, right_end);
+        add_trace_path(&mut base, 1, &[right_start, right_mid, right_end]);
+
+        let mut add = FtoDag::with_provenance_storage(1, ProvenanceStorageStrategy::TracePaths);
+        let add_start = add.add_node(key(0), NodeKind::Start).unwrap();
+        let add_mid = add.add_node(key(1), NodeKind::Internal).unwrap();
+        let add_end = add.add_node(key(2), NodeKind::End).unwrap();
+        add_edge(&mut add, add_start, add_mid);
+        add_edge(&mut add, add_mid, add_end);
+        add_trace_path(&mut add, 0, &[add_start, add_mid, add_end]);
+
+        let mut config = BuildConfig::new(1);
+        config.provenance_storage_strategy = ProvenanceStorageStrategy::TracePaths;
+        let mut builder = FtoDagBuilder::from_graph(base, config).unwrap();
+        let trace_path = add.sequence_trace_path(SequenceId::new(0)).unwrap();
+
+        assert_eq!(
+            builder
+                .add_exact_trace_path_summary(SequenceId::new(2), &add, &trace_path)
+                .unwrap(),
+            None
+        );
+        assert_eq!(builder.report().attempted_sequences, 0);
+        assert!(builder.report().integrated_sequences.is_empty());
+        assert!(
+            builder
+                .graph()
+                .sequence_trace_path(SequenceId::new(2))
+                .is_err()
+        );
+    }
 }
 
 pub const fn node_kind_for_path_position(kind: PathPositionKind) -> NodeKind {
@@ -2502,6 +2880,17 @@ pub fn select_monotone_anchor_path_with_graph(
     candidate_sets: &[AnchorCandidateSet],
     graph: &FtoDag,
 ) -> AnchorPath {
+    select_monotone_anchor_path_with_graph_view(candidate_sets, graph)
+}
+
+pub(crate) fn select_monotone_anchor_path_with_graph_view<C, S>(
+    candidate_sets: &[S],
+    graph: &FtoDag,
+) -> AnchorPath
+where
+    C: CandidateLike,
+    S: CandidateSetLike<C>,
+{
     if candidate_sets.len() > GREEDY_ANCHOR_SET_LIMIT {
         return select_greedy_monotone_anchor_path_with_graph(candidate_sets, graph);
     }
@@ -2739,7 +3128,8 @@ where
 {
     let mut decisions = Vec::with_capacity(candidate_sets.len());
     let mut matched_anchors = Vec::new();
-    let mut used_nodes = UsedNodeTracker::new_for_path(Some(graph.node_count()), candidate_sets.len());
+    let mut used_nodes =
+        UsedNodeTracker::new_for_path(Some(graph.node_count()), candidate_sets.len());
     let mut previous: Option<NodeId> = None;
     let mut last_coordinate: Option<TopologicalCoordinate> = None;
 
@@ -2933,7 +3323,10 @@ impl UsedNodeTracker {
         const DENSE_MARK_LIMIT_FACTOR: usize = 64;
         match node_count {
             Some(node_count)
-                if node_count <= expected_used.saturating_mul(DENSE_MARK_LIMIT_FACTOR).max(4096) =>
+                if node_count
+                    <= expected_used
+                        .saturating_mul(DENSE_MARK_LIMIT_FACTOR)
+                        .max(4096) =>
             {
                 Self::Marks(vec![false; node_count])
             }
@@ -3146,18 +3539,20 @@ fn compact_candidate_sets_for_mutation(
     let mut storage = MutationCandidateStorage::with_position_capacity(candidate_sets.len());
     for (candidate_set, decision) in candidate_sets.into_iter().zip(anchor_path.decisions.iter()) {
         match decision {
-            AnchorDecision::Matched(_) => storage.push_position(std::iter::empty::<
-                MutationCandidate,
-            >()),
-            AnchorDecision::Unmatched(_) => storage.push_position(
-                candidate_set.candidates.into_iter().filter_map(|candidate| {
-                    candidate.coordinate.map(|coordinate| MutationCandidate {
-                        node: candidate.node,
-                        coordinate,
-                        weight: candidate.weight,
-                    })
-                }),
-            ),
+            AnchorDecision::Matched(_) => {
+                storage.push_position(std::iter::empty::<MutationCandidate>())
+            }
+            AnchorDecision::Unmatched(_) => {
+                storage.push_position(candidate_set.candidates.into_iter().filter_map(
+                    |candidate| {
+                        candidate.coordinate.map(|coordinate| MutationCandidate {
+                            node: candidate.node,
+                            coordinate,
+                            weight: candidate.weight,
+                        })
+                    },
+                ))
+            }
         }
     }
     storage

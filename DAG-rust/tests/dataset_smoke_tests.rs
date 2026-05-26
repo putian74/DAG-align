@@ -609,7 +609,9 @@ fn local_trace_path_and_count_only_merge_difference_reports() {
     assert_graph_structure_eq(&right_trace, &right_count);
     assert_graph_structure_eq(&scratch_trace, &scratch_count);
 
-    let native_plan = simulate_count_only_merge_plan(left_count.clone(), right_count.clone());
+    let native_plan_single =
+        simulate_count_only_merge_plan_single_paths(left_count.clone(), right_count.clone());
+    let native_plan_dual = simulate_count_only_merge_plan(left_count.clone(), right_count.clone());
     let merged_trace = merge_graphs(
         left_trace.clone(),
         right_trace.clone(),
@@ -619,9 +621,14 @@ fn local_trace_path_and_count_only_merge_difference_reports() {
     let merged_trace_as_count =
         merge_trace_path_graphs_as_count_only(left_trace, right_trace, optimized_merge_config())
             .unwrap();
+    let merged_count_pre_secondary_single = simulate_count_only_merge_without_secondary_with_mode(
+        left_count.clone(),
+        right_count.clone(),
+        CountOnlyBackboneModeForTest::Single,
+    );
     let merged_count_pre_secondary =
         simulate_count_only_merge_without_secondary(left_count.clone(), right_count.clone());
-    let merged_count = merge_graphs(left_count, right_count, optimized_merge_config()).unwrap();
+    let merged_count_result = merge_graphs(left_count, right_count, optimized_merge_config());
     assert_graph_structure_eq(&merged_trace, &scratch_trace);
     assert_graph_structure_eq(&merged_trace_as_count, &scratch_count);
     let (trace_secondary, trace_secondary_stats) =
@@ -630,33 +637,97 @@ fn local_trace_path_and_count_only_merge_difference_reports() {
             SecondaryMergeConfig::default(),
         )
         .unwrap();
-
-    let diff = graph_structure_difference(&merged_count, &merged_trace);
-    let detailed = analyze_count_vs_trace_merge_difference(&merged_count, &merged_trace);
     let secondary_risk = analyze_trace_secondary_merge_risk(&merged_trace);
-    let trace_branch_loss = analyze_branch_constraint_delta(&merged_trace, &merged_count);
-    let count_secondary_branch_loss =
-        analyze_branch_constraint_delta(&merged_count_pre_secondary, &merged_count);
     println!(
-        "trace_count_native_plan orientation={:?} main_path_len={} main_path_weight={} anchored_nodes={} anchored_weight={} total_add_nodes={} total_add_weight={} anchored_start={} anchored_internal={} anchored_end={} add_roots={} add_sinks={} anchored_roots={} anchored_sinks={} fresh_nodes={}",
-        native_plan.plan.orientation,
-        native_plan.main_path_len,
-        native_plan.main_path_weight,
-        native_plan.plan.matched_nodes,
-        native_plan.anchored_add_weight,
-        native_plan.add_graph.node_count(),
-        native_plan.total_add_weight,
-        native_plan.anchored_start_count,
-        native_plan.anchored_internal_count,
-        native_plan.anchored_end_count,
-        native_plan.add_graph.endpoints().structural_roots().len(),
-        native_plan.add_graph.endpoints().structural_sinks().len(),
-        native_plan.anchored_root_count,
-        native_plan.anchored_sink_count,
-        native_plan
+        "trace_count_single_plan mode={} orientation={:?} path_pair={} add_path_role={} base_path_role={} add_path_len={} add_path_weight={} base_path_len={} base_path_weight={} anchored_nodes={} anchored_weight={} total_add_nodes={} total_add_weight={} add_paths={} base_paths={} evaluated_pairs={} anchored_start={} anchored_internal={} anchored_end={} add_roots={} add_sinks={} anchored_roots={} anchored_sinks={} fresh_nodes={}",
+        native_plan_single.plan.backbone_mode.label(),
+        native_plan_single.plan.orientation,
+        count_only_path_pair_label_for_test(
+            native_plan_single.plan.add_path_role,
+            native_plan_single.plan.base_path_role,
+        ),
+        native_plan_single.plan.add_path_role.label(),
+        native_plan_single.plan.base_path_role.label(),
+        native_plan_single.add_path_len,
+        native_plan_single.add_path_weight,
+        native_plan_single.base_path_len,
+        native_plan_single.base_path_weight,
+        native_plan_single.plan.matched_nodes,
+        native_plan_single.anchored_add_weight,
+        native_plan_single.add_graph.node_count(),
+        native_plan_single.total_add_weight,
+        native_plan_single.plan.add_available_paths,
+        native_plan_single.plan.base_available_paths,
+        native_plan_single.plan.evaluated_path_pairs,
+        native_plan_single.anchored_start_count,
+        native_plan_single.anchored_internal_count,
+        native_plan_single.anchored_end_count,
+        native_plan_single.add_graph.endpoints().structural_roots().len(),
+        native_plan_single.add_graph.endpoints().structural_sinks().len(),
+        native_plan_single.anchored_root_count,
+        native_plan_single.anchored_sink_count,
+        native_plan_single
             .add_graph
             .node_count()
-            .saturating_sub(native_plan.plan.matched_nodes),
+            .saturating_sub(native_plan_single.plan.matched_nodes),
+    );
+    println!(
+        "trace_count_dual_plan mode={} orientation={:?} path_pair={} add_path_role={} base_path_role={} add_path_len={} add_path_weight={} base_path_len={} base_path_weight={} anchored_nodes={} anchored_weight={} total_add_nodes={} total_add_weight={} add_paths={} base_paths={} evaluated_pairs={} anchored_start={} anchored_internal={} anchored_end={} add_roots={} add_sinks={} anchored_roots={} anchored_sinks={} fresh_nodes={}",
+        native_plan_dual.plan.backbone_mode.label(),
+        native_plan_dual.plan.orientation,
+        count_only_path_pair_label_for_test(
+            native_plan_dual.plan.add_path_role,
+            native_plan_dual.plan.base_path_role,
+        ),
+        native_plan_dual.plan.add_path_role.label(),
+        native_plan_dual.plan.base_path_role.label(),
+        native_plan_dual.add_path_len,
+        native_plan_dual.add_path_weight,
+        native_plan_dual.base_path_len,
+        native_plan_dual.base_path_weight,
+        native_plan_dual.plan.matched_nodes,
+        native_plan_dual.anchored_add_weight,
+        native_plan_dual.add_graph.node_count(),
+        native_plan_dual.total_add_weight,
+        native_plan_dual.plan.add_available_paths,
+        native_plan_dual.plan.base_available_paths,
+        native_plan_dual.plan.evaluated_path_pairs,
+        native_plan_dual.anchored_start_count,
+        native_plan_dual.anchored_internal_count,
+        native_plan_dual.anchored_end_count,
+        native_plan_dual.add_graph.endpoints().structural_roots().len(),
+        native_plan_dual.add_graph.endpoints().structural_sinks().len(),
+        native_plan_dual.anchored_root_count,
+        native_plan_dual.anchored_sink_count,
+        native_plan_dual
+            .add_graph
+            .node_count()
+            .saturating_sub(native_plan_dual.plan.matched_nodes),
+    );
+    println!(
+        "trace_count_backbone_comparison single_pair={} dual_pair={} single_anchored_nodes={} dual_anchored_nodes={} single_anchored_weight={} dual_anchored_weight={} single_pre_secondary_nodes={} dual_pre_secondary_nodes={} single_pre_secondary_edges={} dual_pre_secondary_edges={} single_pre_secondary_diff={} dual_pre_secondary_diff={} single_vs_dual_diff={}",
+        count_only_path_pair_label_for_test(
+            native_plan_single.plan.add_path_role,
+            native_plan_single.plan.base_path_role,
+        ),
+        count_only_path_pair_label_for_test(
+            native_plan_dual.plan.add_path_role,
+            native_plan_dual.plan.base_path_role,
+        ),
+        native_plan_single.plan.matched_nodes,
+        native_plan_dual.plan.matched_nodes,
+        native_plan_single.anchored_add_weight,
+        native_plan_dual.anchored_add_weight,
+        merged_count_pre_secondary_single.node_count(),
+        merged_count_pre_secondary.node_count(),
+        merged_count_pre_secondary_single.edge_count(),
+        merged_count_pre_secondary.edge_count(),
+        graph_structure_difference(&merged_count_pre_secondary_single, &merged_trace)
+            .unwrap_or_else(|| "none".to_string()),
+        graph_structure_difference(&merged_count_pre_secondary, &merged_trace)
+            .unwrap_or_else(|| "none".to_string()),
+        graph_structure_difference(&merged_count_pre_secondary_single, &merged_count_pre_secondary)
+            .unwrap_or_else(|| "none".to_string()),
     );
     println!(
         "trace_replay_count_control identical_to_trace={} identical_to_scratch_count={} count_nodes={} count_edges={}",
@@ -665,6 +736,19 @@ fn local_trace_path_and_count_only_merge_difference_reports() {
         merged_trace_as_count.node_count(),
         merged_trace_as_count.edge_count(),
     );
+    let merged_count = match merged_count_result {
+        Ok(graph) => graph,
+        Err(DagError::UnsupportedOperation(message)) => {
+            println!("trace_count_final_native_merge status=stub detail={message}");
+            return;
+        }
+        Err(err) => panic!("count-only merge comparison failed: {err}"),
+    };
+    let diff = graph_structure_difference(&merged_count, &merged_trace);
+    let detailed = analyze_count_vs_trace_merge_difference(&merged_count, &merged_trace);
+    let trace_branch_loss = analyze_branch_constraint_delta(&merged_trace, &merged_count);
+    let count_secondary_branch_loss =
+        analyze_branch_constraint_delta(&merged_count_pre_secondary, &merged_count);
     println!(
         "trace_count_merge_difference identical={} count_nodes={} trace_nodes={} count_edges={} trace_edges={} detail={}",
         diff.is_none(),
@@ -675,18 +759,23 @@ fn local_trace_path_and_count_only_merge_difference_reports() {
         diff.unwrap_or_else(|| "none".to_string()),
     );
     println!(
-        "trace_count_merge_phase_summary pre_secondary_nodes={} pre_secondary_edges={} final_count_nodes={} final_count_edges={} pre_secondary_diff={} final_diff={}",
+        "trace_count_merge_phase_summary single_pre_secondary_nodes={} single_pre_secondary_edges={} dual_pre_secondary_nodes={} dual_pre_secondary_edges={} final_count_nodes={} final_count_edges={} single_pre_secondary_diff={} dual_pre_secondary_diff={} final_diff={}",
+        merged_count_pre_secondary_single.node_count(),
+        merged_count_pre_secondary_single.edge_count(),
         merged_count_pre_secondary.node_count(),
         merged_count_pre_secondary.edge_count(),
         merged_count.node_count(),
         merged_count.edge_count(),
+        graph_structure_difference(&merged_count_pre_secondary_single, &merged_trace)
+            .unwrap_or_else(|| "none".to_string()),
         graph_structure_difference(&merged_count_pre_secondary, &merged_trace)
             .unwrap_or_else(|| "none".to_string()),
         graph_structure_difference(&merged_count, &merged_trace)
             .unwrap_or_else(|| "none".to_string()),
     );
     println!(
-        "trace_count_merge_phase_kinds pre_secondary={} final_count={} trace={}",
+        "trace_count_merge_phase_kinds single_pre_secondary={} dual_pre_secondary={} final_count={} trace={}",
+        graph_kind_summary(&merged_count_pre_secondary_single),
         graph_kind_summary(&merged_count_pre_secondary),
         graph_kind_summary(&merged_count),
         graph_kind_summary(&merged_trace),
@@ -1900,8 +1989,125 @@ fn count_fan_out_nodes(graph: &FtoDag) -> usize {
         .count()
 }
 
+fn path_merge_test_key(raw: u16) -> FragmentKey {
+    FragmentKey::symbols(vec![SymbolId::new(raw)])
+}
+
+fn build_dual_backbone_preference_graphs() -> (FtoDag, FtoDag) {
+    let mut base = FtoDag::with_provenance_storage(1, ProvenanceStorageStrategy::CountOnly);
+    let base_start = base
+        .add_node(path_merge_test_key(0), NodeKind::Start)
+        .unwrap();
+    let base_primary = base
+        .add_node(path_merge_test_key(1), NodeKind::Internal)
+        .unwrap();
+    let base_secondary = base
+        .add_node(path_merge_test_key(2), NodeKind::Internal)
+        .unwrap();
+    let base_end = base
+        .add_node(path_merge_test_key(9), NodeKind::End)
+        .unwrap();
+    base.add_provenance_count(base_start, 1).unwrap();
+    base.add_provenance_count(base_primary, 10).unwrap();
+    base.add_provenance_count(base_secondary, 4).unwrap();
+    base.add_provenance_count(base_end, 1).unwrap();
+    base.add_or_increment_edge(base_start, base_primary, Weight::new(10))
+        .unwrap();
+    base.add_or_increment_edge(base_primary, base_end, Weight::new(10))
+        .unwrap();
+    base.add_or_increment_edge(base_start, base_secondary, Weight::new(4))
+        .unwrap();
+    base.add_or_increment_edge(base_secondary, base_end, Weight::new(4))
+        .unwrap();
+
+    let mut add = FtoDag::with_provenance_storage(1, ProvenanceStorageStrategy::CountOnly);
+    let add_start = add
+        .add_node(path_merge_test_key(0), NodeKind::Start)
+        .unwrap();
+    let add_primary = add
+        .add_node(path_merge_test_key(3), NodeKind::Internal)
+        .unwrap();
+    let add_secondary = add
+        .add_node(path_merge_test_key(1), NodeKind::Internal)
+        .unwrap();
+    let add_end = add.add_node(path_merge_test_key(9), NodeKind::End).unwrap();
+    add.add_provenance_count(add_start, 1).unwrap();
+    add.add_provenance_count(add_primary, 12).unwrap();
+    add.add_provenance_count(add_secondary, 5).unwrap();
+    add.add_provenance_count(add_end, 1).unwrap();
+    add.add_or_increment_edge(add_start, add_primary, Weight::new(12))
+        .unwrap();
+    add.add_or_increment_edge(add_primary, add_end, Weight::new(12))
+        .unwrap();
+    add.add_or_increment_edge(add_start, add_secondary, Weight::new(5))
+        .unwrap();
+    add.add_or_increment_edge(add_secondary, add_end, Weight::new(5))
+        .unwrap();
+
+    (base, add)
+}
+
+#[test]
+fn dual_backbone_planner_can_choose_secondary_primary_pairing() {
+    let (base, add) = build_dual_backbone_preference_graphs();
+
+    let single = plan_count_only_merge_for_test(
+        &base,
+        &add,
+        MergeOrientation::RightIntoLeft,
+        CountOnlyBackboneModeForTest::Single,
+    );
+    let dual = plan_count_only_merge_for_test(
+        &base,
+        &add,
+        MergeOrientation::RightIntoLeft,
+        CountOnlyBackboneModeForTest::Dual,
+    );
+
+    assert_eq!(
+        count_only_path_pair_label_for_test(single.add_path_role, single.base_path_role),
+        "primary-primary"
+    );
+    assert_eq!(
+        count_only_path_pair_label_for_test(dual.add_path_role, dual.base_path_role),
+        "secondary-primary"
+    );
+    assert!(dual.matched_nodes > single.matched_nodes);
+    assert!(dual.score > single.score);
+}
+
+#[test]
+fn dual_backbone_planner_can_choose_primary_secondary_pairing() {
+    let (base_as_add, add_as_base) = build_dual_backbone_preference_graphs();
+
+    let single = plan_count_only_merge_for_test(
+        &add_as_base,
+        &base_as_add,
+        MergeOrientation::RightIntoLeft,
+        CountOnlyBackboneModeForTest::Single,
+    );
+    let dual = plan_count_only_merge_for_test(
+        &add_as_base,
+        &base_as_add,
+        MergeOrientation::RightIntoLeft,
+        CountOnlyBackboneModeForTest::Dual,
+    );
+
+    assert_eq!(
+        count_only_path_pair_label_for_test(single.add_path_role, single.base_path_role),
+        "primary-primary"
+    );
+    assert_eq!(
+        count_only_path_pair_label_for_test(dual.add_path_role, dual.base_path_role),
+        "primary-secondary"
+    );
+    assert!(dual.matched_nodes > single.matched_nodes);
+    assert!(dual.score > single.score);
+}
+
 fn simulate_count_only_merge_without_secondary(left: FtoDag, right: FtoDag) -> FtoDag {
-    let selected = simulate_count_only_merge_plan(left, right);
+    let selected =
+        simulate_count_only_merge_plan_with_mode(left, right, CountOnlyBackboneModeForTest::Dual);
     apply_count_only_merge_plan_without_secondary(
         selected.base_graph,
         selected.add_graph,
@@ -1909,13 +2115,72 @@ fn simulate_count_only_merge_without_secondary(left: FtoDag, right: FtoDag) -> F
     )
 }
 
+fn simulate_count_only_merge_without_secondary_with_mode(
+    left: FtoDag,
+    right: FtoDag,
+    backbone_mode: CountOnlyBackboneModeForTest,
+) -> FtoDag {
+    let selected = simulate_count_only_merge_plan_with_mode(left, right, backbone_mode);
+    apply_count_only_merge_plan_without_secondary(
+        selected.base_graph,
+        selected.add_graph,
+        &selected.plan,
+    )
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum CountOnlyBackboneModeForTest {
+    Single,
+    Dual,
+}
+
+impl CountOnlyBackboneModeForTest {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Dual => "dual",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BackbonePathRoleForTest {
+    Primary,
+    Secondary,
+}
+
+impl BackbonePathRoleForTest {
+    fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::Primary,
+            1 => Self::Secondary,
+            other => panic!("unsupported backbone path index {other}"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RankedReferencePathForTest {
+    role: BackbonePathRoleForTest,
+    path: ReferencePath,
+}
+
 #[derive(Clone, Debug)]
 struct SelectedCountOnlyMergePlan {
     base_graph: FtoDag,
     add_graph: FtoDag,
     plan: PlannedCountOnlyMergeForTest,
-    main_path_len: usize,
-    main_path_weight: u64,
+    add_path_len: usize,
+    add_path_weight: u64,
+    base_path_len: usize,
+    base_path_weight: u64,
     total_add_weight: u64,
     anchored_add_weight: u64,
     anchored_start_count: usize,
@@ -1926,10 +2191,33 @@ struct SelectedCountOnlyMergePlan {
 }
 
 fn simulate_count_only_merge_plan(left: FtoDag, right: FtoDag) -> SelectedCountOnlyMergePlan {
-    let right_into_left =
-        plan_count_only_merge_for_test(&left, &right, MergeOrientation::RightIntoLeft);
-    let left_into_right =
-        plan_count_only_merge_for_test(&right, &left, MergeOrientation::LeftIntoRight);
+    simulate_count_only_merge_plan_with_mode(left, right, CountOnlyBackboneModeForTest::Dual)
+}
+
+fn simulate_count_only_merge_plan_single_paths(
+    left: FtoDag,
+    right: FtoDag,
+) -> SelectedCountOnlyMergePlan {
+    simulate_count_only_merge_plan_with_mode(left, right, CountOnlyBackboneModeForTest::Single)
+}
+
+fn simulate_count_only_merge_plan_with_mode(
+    left: FtoDag,
+    right: FtoDag,
+    backbone_mode: CountOnlyBackboneModeForTest,
+) -> SelectedCountOnlyMergePlan {
+    let right_into_left = plan_count_only_merge_for_test(
+        &left,
+        &right,
+        MergeOrientation::RightIntoLeft,
+        backbone_mode,
+    );
+    let left_into_right = plan_count_only_merge_for_test(
+        &right,
+        &left,
+        MergeOrientation::LeftIntoRight,
+        backbone_mode,
+    );
     if prefer_count_only_plan_for_test(&left_into_right, &right_into_left) {
         build_selected_count_only_plan(right, left, left_into_right)
     } else {
@@ -1940,32 +2228,69 @@ fn simulate_count_only_merge_plan(left: FtoDag, right: FtoDag) -> SelectedCountO
 #[derive(Clone, Debug)]
 struct PlannedCountOnlyMergeForTest {
     orientation: MergeOrientation,
+    backbone_mode: CountOnlyBackboneModeForTest,
+    add_path_role: BackbonePathRoleForTest,
+    base_path_role: BackbonePathRoleForTest,
+    add_available_paths: usize,
+    base_available_paths: usize,
+    evaluated_path_pairs: usize,
     anchors: AnchorMap,
     score: u64,
     matched_nodes: usize,
-    main_path: Vec<NodeId>,
+    add_path: Vec<NodeId>,
+    base_path: Vec<NodeId>,
 }
 
 fn plan_count_only_merge_for_test(
     base: &FtoDag,
     add: &FtoDag,
     orientation: MergeOrientation,
+    backbone_mode: CountOnlyBackboneModeForTest,
 ) -> PlannedCountOnlyMergeForTest {
     let base_topology = DagTopology::try_from_graph(base).unwrap();
     let add_topology = DagTopology::try_from_graph(add).unwrap();
-    let add_main_path = max_weight_path_for_test(add, &add_topology);
-    let candidate_sets =
-        base_main_path_candidate_sets_for_test(base, &base_topology, add, &add_main_path);
-    let anchor_path = select_monotone_anchor_path_with_graph(&candidate_sets, base);
-    let anchors = anchor_map_from_main_path_for_test(&add_main_path, &anchor_path);
-    let score = anchor_score_for_test(base, add, &anchors);
-    PlannedCountOnlyMergeForTest {
-        orientation,
-        matched_nodes: anchors.pairs.len(),
-        anchors,
-        score,
-        main_path: add_main_path,
+    let base_paths = reference_paths_for_test(base, &base_topology, backbone_mode);
+    let add_paths = reference_paths_for_test(add, &add_topology, backbone_mode);
+    let mut evaluated_path_pairs = 0;
+    let mut best_plan = None;
+    for add_path in &add_paths {
+        for base_path in eligible_base_paths_for_test(&base_paths, add_path.role) {
+            evaluated_path_pairs += 1;
+            let candidate_sets = base_reference_path_candidate_sets_for_test(
+                base,
+                &base_topology,
+                add,
+                &add_path.path.nodes,
+                &base_path.path.nodes,
+            );
+            let anchor_path = select_monotone_anchor_path_with_graph(&candidate_sets, base);
+            let anchors = anchor_map_from_main_path_for_test(&add_path.path.nodes, &anchor_path);
+            let score = anchor_score_for_test(base, add, &anchors);
+            let candidate = PlannedCountOnlyMergeForTest {
+                orientation,
+                backbone_mode,
+                add_path_role: add_path.role,
+                base_path_role: base_path.role,
+                add_available_paths: add_paths.len(),
+                base_available_paths: base_paths.len(),
+                evaluated_path_pairs: 0,
+                matched_nodes: anchors.pairs.len(),
+                anchors,
+                score,
+                add_path: add_path.path.nodes.clone(),
+                base_path: base_path.path.nodes.clone(),
+            };
+            if best_plan
+                .as_ref()
+                .is_none_or(|current| prefer_count_only_plan_for_test(&candidate, current))
+            {
+                best_plan = Some(candidate);
+            }
+        }
     }
+    let mut best_plan = best_plan.expect("at least one backbone path pair exists");
+    best_plan.evaluated_path_pairs = evaluated_path_pairs;
+    best_plan
 }
 
 fn prefer_count_only_plan_for_test(
@@ -1976,6 +2301,12 @@ fn prefer_count_only_plan_for_test(
         || (candidate.score == current.score && candidate.matched_nodes > current.matched_nodes)
         || (candidate.score == current.score
             && candidate.matched_nodes == current.matched_nodes
+            && count_only_path_pair_priority_for_test(candidate)
+                < count_only_path_pair_priority_for_test(current))
+        || (candidate.score == current.score
+            && candidate.matched_nodes == current.matched_nodes
+            && count_only_path_pair_priority_for_test(candidate)
+                == count_only_path_pair_priority_for_test(current)
             && matches!(candidate.orientation, MergeOrientation::RightIntoLeft)
             && matches!(current.orientation, MergeOrientation::LeftIntoRight))
 }
@@ -1986,10 +2317,15 @@ fn build_selected_count_only_plan(
     plan: PlannedCountOnlyMergeForTest,
 ) -> SelectedCountOnlyMergePlan {
     let total_add_weight = add_graph.nodes().iter().map(|node| node.weight.raw()).sum();
-    let main_path_weight = plan
-        .main_path
+    let add_path_weight = plan
+        .add_path
         .iter()
         .map(|node_id| add_graph.node(*node_id).unwrap().weight.raw())
+        .sum();
+    let base_path_weight = plan
+        .base_path
+        .iter()
+        .map(|node_id| base_graph.node(*node_id).unwrap().weight.raw())
         .sum();
     let anchored_add_weight = plan
         .anchors
@@ -2033,8 +2369,10 @@ fn build_selected_count_only_plan(
     SelectedCountOnlyMergePlan {
         base_graph,
         add_graph,
-        main_path_len: plan.main_path.len(),
-        main_path_weight,
+        add_path_len: plan.add_path.len(),
+        add_path_weight,
+        base_path_len: plan.base_path.len(),
+        base_path_weight,
         total_add_weight,
         anchored_add_weight,
         anchored_start_count,
@@ -2085,63 +2423,96 @@ fn apply_count_only_merge_plan_without_secondary(
     base
 }
 
-fn max_weight_path_for_test(graph: &FtoDag, topology: &DagTopology) -> Vec<NodeId> {
-    let mut scores = vec![0_u64; graph.node_count()];
-    let mut previous = vec![None; graph.node_count()];
-
-    for node_id in topology.topological_order().iter().copied() {
-        let node_score = graph.node(node_id).unwrap().weight.raw();
-        let mut best_parent_score = 0_u64;
-        let mut best_parent = None;
-        for parent in graph.parents(node_id).unwrap().iter().copied() {
-            let candidate_score = scores[parent.to_usize()];
-            if candidate_score > best_parent_score
-                || (candidate_score == best_parent_score
-                    && best_parent.is_none_or(|current| parent < current))
-            {
-                best_parent_score = candidate_score;
-                best_parent = Some(parent);
-            }
+fn reference_paths_for_test(
+    graph: &FtoDag,
+    topology: &DagTopology,
+    backbone_mode: CountOnlyBackboneModeForTest,
+) -> Vec<RankedReferencePathForTest> {
+    let paths = match backbone_mode {
+        CountOnlyBackboneModeForTest::Single => {
+            vec![ReferencePath::max_weight(graph, topology).unwrap()]
         }
-        scores[node_id.to_usize()] = best_parent_score + node_score;
-        previous[node_id.to_usize()] = best_parent;
-    }
-
-    let mut best_end = None;
-    for node_id in graph.endpoints().structural_sinks().iter().copied() {
-        let score = scores[node_id.to_usize()];
-        if best_end.is_none_or(|current: NodeId| {
-            score > scores[current.to_usize()]
-                || (score == scores[current.to_usize()] && node_id < current)
-        }) {
-            best_end = Some(node_id);
+        CountOnlyBackboneModeForTest::Dual => {
+            ReferencePath::max_weight_pair(graph, topology).unwrap()
         }
-    }
-    let mut cursor = best_end.or_else(|| topology.topological_order().last().copied());
-    let mut path = Vec::new();
-    while let Some(node_id) = cursor {
-        path.push(node_id);
-        cursor = previous[node_id.to_usize()];
-    }
-    path.reverse();
-    path
+    };
+    paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| RankedReferencePathForTest {
+            role: BackbonePathRoleForTest::from_index(index),
+            path,
+        })
+        .collect()
 }
 
-fn base_main_path_candidate_sets_for_test(
+fn eligible_base_paths_for_test(
+    base_paths: &[RankedReferencePathForTest],
+    add_role: BackbonePathRoleForTest,
+) -> impl Iterator<Item = &RankedReferencePathForTest> {
+    base_paths.iter().filter(move |base_path| {
+        !matches!(
+            (add_role, base_path.role),
+            (
+                BackbonePathRoleForTest::Secondary,
+                BackbonePathRoleForTest::Secondary
+            )
+        )
+    })
+}
+
+fn count_only_path_pair_priority_for_test(plan: &PlannedCountOnlyMergeForTest) -> u8 {
+    match (plan.add_path_role, plan.base_path_role) {
+        (BackbonePathRoleForTest::Primary, BackbonePathRoleForTest::Primary) => 0,
+        (BackbonePathRoleForTest::Primary, BackbonePathRoleForTest::Secondary) => 1,
+        (BackbonePathRoleForTest::Secondary, BackbonePathRoleForTest::Primary) => 2,
+        (BackbonePathRoleForTest::Secondary, BackbonePathRoleForTest::Secondary) => 3,
+    }
+}
+
+fn count_only_path_pair_label_for_test(
+    add_role: BackbonePathRoleForTest,
+    base_role: BackbonePathRoleForTest,
+) -> &'static str {
+    match (add_role, base_role) {
+        (BackbonePathRoleForTest::Primary, BackbonePathRoleForTest::Primary) => "primary-primary",
+        (BackbonePathRoleForTest::Primary, BackbonePathRoleForTest::Secondary) => {
+            "primary-secondary"
+        }
+        (BackbonePathRoleForTest::Secondary, BackbonePathRoleForTest::Primary) => {
+            "secondary-primary"
+        }
+        (BackbonePathRoleForTest::Secondary, BackbonePathRoleForTest::Secondary) => {
+            "secondary-secondary"
+        }
+    }
+}
+
+fn base_reference_path_candidate_sets_for_test(
     base: &FtoDag,
     base_topology: &DagTopology,
     add: &FtoDag,
-    add_main_path: &[NodeId],
+    add_path: &[NodeId],
+    base_path: &[NodeId],
 ) -> Vec<AnchorCandidateSet> {
-    let mut sets = Vec::with_capacity(add_main_path.len());
-    for (position, add_node_id) in add_main_path.iter().copied().enumerate() {
+    let mut path_index: HashMap<(StoredFragmentKey, NodeKind), Vec<NodeId>> = HashMap::new();
+    for base_node_id in base_path.iter().copied() {
+        let base_node = base.node(base_node_id).unwrap();
+        path_index
+            .entry((base_node.fragment.clone(), base_node.kind))
+            .or_default()
+            .push(base_node_id);
+    }
+
+    let mut sets = Vec::with_capacity(add_path.len());
+    for (position, add_node_id) in add_path.iter().copied().enumerate() {
         let add_node = add.node(add_node_id).unwrap();
         let mut candidates = Vec::new();
-        for base_node_id in base
-            .fragment_index()
-            .nodes_for_stored(&add_node.fragment, add_node.kind)
-            .iter()
-            .copied()
+        let path_key = (add_node.fragment.clone(), add_node.kind);
+        for base_node_id in path_index
+            .get(&path_key)
+            .into_iter()
+            .flat_map(|node_ids| node_ids.iter().copied())
         {
             let base_node = base.node(base_node_id).unwrap();
             candidates.push(AnchorCandidate {

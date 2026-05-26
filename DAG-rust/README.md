@@ -23,3 +23,8 @@ cargo test
 cargo clippy --all-targets --all-features
 ```
 
+Documentation:
+
+- `docs/dag-merge-literature-survey.md` — literature survey and implementation
+  priorities for DAG merge optimization, with structural hashing and transitive
+  reduction as the first branch targets.
