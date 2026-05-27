@@ -666,7 +666,7 @@ fn topology_update_strategies_match_on_small_build() {
         relaxation_builder
             .report()
             .topology_counters
-            .forward_relax_attempts
+            .forward_parent_scans
             > 0
     );
     assert_eq!(
@@ -683,6 +683,64 @@ fn topology_update_strategies_match_on_small_build() {
             .forward_relax_attempts,
         0
     );
+}
+
+#[test]
+fn incremental_integration_repairs_affected_coordinates_without_extra_full_rebuilds() {
+    let alphabet = BuiltinAlphabet::dna_canonical();
+    let encoder =
+        DefaultFragmentEncoder::packed(BitWidth::new(alphabet.bits_per_symbol()).unwrap());
+    let sequences = ["ACGTACGT", "ACGTTCGT"];
+
+    let mut full_config = BuildConfig::new(3);
+    full_config.topology_update_strategy = TopologyUpdateStrategy::FullRebuild;
+    let mut incremental_config = full_config;
+    incremental_config.topology_update_strategy =
+        TopologyUpdateStrategy::IncrementalForwardRelaxation;
+    incremental_config.collect_topology_counters = true;
+
+    let mut full_builder = FtoDagBuilder::new(full_config);
+    let mut incremental_builder = FtoDagBuilder::new(incremental_config);
+
+    for (index, sequence) in sequences.iter().enumerate() {
+        let encoded = EncodedSequence::encode(
+            SequenceRecord::new(format!("s{index}"), *sequence),
+            &alphabet,
+        )
+        .unwrap();
+        full_builder
+            .add_sequence_from_encoded(SequenceId::try_from(index).unwrap(), &encoded, &encoder)
+            .unwrap();
+        incremental_builder
+            .add_sequence_from_encoded(SequenceId::try_from(index).unwrap(), &encoded, &encoder)
+            .unwrap();
+    }
+
+    assert_eq!(
+        full_builder.graph().stats(),
+        incremental_builder.graph().stats()
+    );
+    assert_eq!(
+        incremental_builder.report().topology_counters.full_rebuilds,
+        1
+    );
+    assert_eq!(
+        incremental_builder
+            .report()
+            .topology_counters
+            .full_rebuild_fallbacks,
+        0
+    );
+    assert!(
+        incremental_builder
+            .report()
+            .topology_counters
+            .forward_parent_scans
+            > 0,
+        "incremental path should rescan affected parents without extra full rebuilds"
+    );
+    assert!(full_builder.graph().validate().is_valid());
+    assert!(incremental_builder.graph().validate().is_valid());
 }
 
 #[test]

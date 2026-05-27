@@ -256,6 +256,17 @@ impl NpyElement for u16 {
     }
 }
 
+impl NpyElement for u32 {
+    fn descr() -> &'static str {
+        "<u4"
+    }
+
+    fn write_one<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_all(&self.to_le_bytes())?;
+        Ok(())
+    }
+}
+
 impl NpyElement for u64 {
     fn descr() -> &'static str {
         "<u8"

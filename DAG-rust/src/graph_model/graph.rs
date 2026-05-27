@@ -939,7 +939,8 @@ impl FragmentIndex {
     }
 
     pub(crate) fn for_each_bucket(&self, mut f: impl FnMut(NodeKind, &[NodeId])) {
-        self.entries.for_each(|(kind, _fragment), nodes| f(*kind, nodes));
+        self.entries
+            .for_each(|(kind, _fragment), nodes| f(*kind, nodes));
         self.packed_inline_entries
             .for_each(|key, nodes| f(key.kind, nodes));
     }

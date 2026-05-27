@@ -77,7 +77,11 @@ impl ReferencePath {
         topology: &DagTopology,
         weighting: ReferencePathWeighting,
     ) -> Result<Vec<Self>> {
-        Self::max_weight_pair_with_weighting_and_order(graph, topology.topological_order(), weighting)
+        Self::max_weight_pair_with_weighting_and_order(
+            graph,
+            topology.topological_order(),
+            weighting,
+        )
     }
 
     fn max_weight_pair_with_weighting_and_order(
@@ -103,8 +107,12 @@ impl ReferencePath {
         if !should_compute_secondary_path(graph, &primary.nodes)? {
             return Ok(vec![primary]);
         }
-        let secondary_nodes =
-            max_weight_path_nodes_with_order_and_exclusions(graph, order, weighting, &excluded_nodes)?;
+        let secondary_nodes = max_weight_path_nodes_with_order_and_exclusions(
+            graph,
+            order,
+            weighting,
+            &excluded_nodes,
+        )?;
         if secondary_nodes.len() < 2 || secondary_nodes == primary.nodes {
             return Ok(vec![primary]);
         }
@@ -299,10 +307,8 @@ fn should_compute_secondary_path(graph: &FtoDag, primary_nodes: &[NodeId]) -> Re
     let primary_weight = primary_nodes.iter().try_fold(0_u128, |sum, node_id| {
         Ok::<_, DagError>(sum + u128::from(graph.node(*node_id)?.weight.raw()))
     })?;
-    Ok(
-        primary_weight * SECONDARY_PATH_PRIMARY_WEIGHT_DENOMINATOR
-            < total_weight * SECONDARY_PATH_PRIMARY_WEIGHT_NUMERATOR,
-    )
+    Ok(primary_weight * SECONDARY_PATH_PRIMARY_WEIGHT_DENOMINATOR
+        < total_weight * SECONDARY_PATH_PRIMARY_WEIGHT_NUMERATOR)
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]

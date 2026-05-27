@@ -1,5 +1,6 @@
 """Training configuration and orchestration."""
 
+from .checkpoints import load_checkpoint, save_checkpoint
 from .config import (
     AnchorReleaseConfig,
     AnnealingConfig,
@@ -36,11 +37,13 @@ __all__ = [
     "OptimizerConfig",
     "HardInferenceSummary",
     "InferenceSummary",
+    "load_checkpoint",
     "PreparedTrainingBatch",
     "ProfilingConfig",
     "ProfilingResult",
     "ProfilingTimer",
     "RegularizationConfig",
+    "save_checkpoint",
     "SoftInferenceSummary",
     "SubgraphSamplingConfig",
     "SupportExpansionConfig",

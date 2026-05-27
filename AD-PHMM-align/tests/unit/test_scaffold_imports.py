@@ -298,9 +298,10 @@ def test_artifact_loader_and_initialization_loader(tmp_path) -> None:
     ).fit()
     assert fit_result.steps_completed == 2
     assert fit_result.final_loss is not None
-    assert fit_result.metrics["optimization_ready"] is False
+    assert fit_result.metrics["optimization_ready"] is True
     assert fit_result.metrics["cpu_reference_ready"] is True
     assert fit_result.metrics["hard_decode_status"] == "viterbi_only"
+    assert fit_result.checkpoint_path is not None
     assert fit_result.metadata["initialization_track"] == "legacy_current"
     assert fit_result.metadata["replica_ids"] == ("replica-0", "replica-1")
 

@@ -34,6 +34,7 @@ from ad_phmm_align.phmm.soft_path import (
     soft_viterbi_score,
 )
 from ad_phmm_align.sampling import SubgraphSampler
+from ad_phmm_align.train.checkpoints import save_checkpoint
 from ad_phmm_align.train.config import LossWeights, TrainingConfig
 from ad_phmm_align.train.dataset import PreparedTrainingBatch, TensorGraphArtifact
 from ad_phmm_align.train.inference import (
@@ -144,7 +145,7 @@ class Trainer:
         )
 
     def fit(self) -> FitResult:
-        """Run baseline trainer orchestration over configured replicas/steps."""
+        """Run training orchestration over configured replicas/steps."""
 
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -868,6 +869,7 @@ class Trainer:
             transition_tensor = self._perturb_array(transition_tensor, transition_std, rng)
         if emission_std != 0.0:
             match_emission = self._perturb_array(match_emission, emission_std, rng)
+            insert_emission = self._perturb_array(insert_emission, emission_std, rng)
         return PhmmParameterSet(
             match_emission=match_emission,
             insert_emission=insert_emission,
@@ -888,29 +890,121 @@ class Trainer:
         if steps_target < 0:
             raise ValueError("max_steps must be non-negative")
 
+        device = self._resolve_training_device()
         steps_completed = 0
         last_result: Optional[TrainingStepResult] = None
+        best_loss: Optional[float] = None
+        best_checkpoint_state: Optional[Mapping[str, Any]] = None
+        best_replica_id: Optional[str] = None
         for replica in replicas:
+            trainable_parameters = self._make_trainable_parameters(
+                replica.parameters,
+                device=device,
+            )
+            optimizer = (
+                None
+                if steps_target == 0
+                else self._build_optimizer(trainable_parameters)
+            )
             for step_index in range(steps_target):
-                step_input = self.build_step_input(runtime, replica, step_index)
-                last_result = self.training_step(step_input)
+                step_input = self.build_step_input(
+                    runtime,
+                    _TrainerReplica(
+                        replica_id=replica.replica_id,
+                        parameters=trainable_parameters,
+                        temperature_multiplier=replica.temperature_multiplier,
+                        metadata=replica.metadata,
+                    ),
+                    step_index,
+                )
+                autograd_result = self._autograd_training_step(
+                    step_input,
+                    runtime.parameters,
+                    optimizer=optimizer,
+                    device=device,
+                )
+                detached_parameters = self._detach_parameters(trainable_parameters)
+                metrics_input = TrainingStepInput(
+                    batch=step_input.batch,
+                    parameters=detached_parameters,
+                    step_index=step_input.step_index,
+                    active_state_mask=step_input.active_state_mask,
+                    metadata=step_input.metadata,
+                )
+                reference_result = self.training_step(metrics_input)
+                last_result = TrainingStepResult(
+                    step_index=reference_result.step_index,
+                    batch_id=reference_result.batch_id,
+                    loss=autograd_result["loss"],
+                    loss_components=autograd_result["loss_components"],
+                    metrics={
+                        **reference_result.metrics,
+                        **autograd_result["metrics"],
+                        "optimization_ready": True,
+                        "cpu_reference_ready": True,
+                    },
+                    profiling=reference_result.profiling,
+                    metadata={
+                        **reference_result.metadata,
+                        "implementation": "torch_autograd_reference",
+                        "optimizer": self.config.optimizer.name,
+                    },
+                )
                 steps_completed += 1
+                if best_loss is None or float(autograd_result["loss"]) < best_loss:
+                    best_loss = float(autograd_result["loss"])
+                    best_replica_id = replica.replica_id
+                    best_checkpoint_state = self._checkpoint_state(
+                        trainable_parameters,
+                        replica_id=replica.replica_id,
+                        step_index=step_index,
+                        loss=float(autograd_result["loss"]),
+                        metrics=last_result.metrics,
+                    )
+
+            if steps_target == 0:
+                detached_parameters = self._detach_parameters(trainable_parameters)
+                last_result = TrainingStepResult(
+                    step_index=0,
+                    batch_id=f"{runtime.graph_artifact.graph.metadata.graph_id}:full_graph",
+                    loss=None,
+                    loss_components={},
+                    metrics={
+                        "optimization_ready": True,
+                        "cpu_reference_ready": True,
+                    },
+                    metadata={
+                        "replica_id": replica.replica_id,
+                        "implementation": "torch_autograd_reference",
+                    },
+                )
+
+        checkpoint_path = None
+        if best_checkpoint_state is not None:
+            checkpoint_path = str(Path(self.config.output_dir) / "checkpoints" / "final.pt")
+            save_checkpoint(checkpoint_path, dict(best_checkpoint_state))
 
         summary_metrics = {
-            "optimization_ready": False,
+            "optimization_ready": True,
             "cpu_reference_ready": True,
             "graph_id": runtime.graph_artifact.graph.metadata.graph_id,
             "replica_count": len(replicas),
             "configured_steps_per_replica": steps_target,
             "executed_steps": steps_completed,
+            "training_device": str(device),
         }
         if last_result is not None:
             summary_metrics = {**summary_metrics, **last_result.metrics}
+        if best_loss is not None:
+            summary_metrics["best_loss"] = best_loss
+        if best_replica_id is not None:
+            summary_metrics["best_replica_id"] = best_replica_id
 
         return FitResult(
             steps_completed=steps_completed,
             final_loss=None if last_result is None else last_result.loss,
             metrics=summary_metrics,
+            checkpoint_path=checkpoint_path,
             metadata={
                 "initialization_track": runtime.initial_parameters.track.value,
                 "active_escape_mechanisms": self.active_escape_mechanisms(),
@@ -919,6 +1013,7 @@ class Trainer:
                     max(0, steps_target - 1) if steps_target else 0
                 ),
                 "replica_ids": tuple(replica.replica_id for replica in replicas),
+                "best_replica_id": best_replica_id,
                 "scheduled_loss_weights": self.scheduled_loss_weights(
                     max(0, steps_target - 1) if steps_target else 0
                 ).as_mapping(),
@@ -955,6 +1050,187 @@ class Trainer:
     def _clone_array(value: Any) -> Any:
         array = np.asarray(value)
         return np.array(array, copy=True)
+
+    def _autograd_training_step(
+        self,
+        step_input: TrainingStepInput,
+        reference_parameters: PhmmParameterSet,
+        *,
+        optimizer: Any,
+        device: Any,
+    ) -> Mapping[str, Any]:
+        import torch
+
+        from ad_phmm_align.train import torch_autograd
+
+        graph = step_input.metadata.get("_graph")
+        if not isinstance(graph, TensorDag):
+            raise ArtifactValidationError(
+                "training step metadata must include a TensorDag under '_graph'"
+            )
+        scheduled = step_input.metadata.get("scheduled_loss_weights")
+        if not isinstance(scheduled, _ScheduledLossWeights):
+            raise ArtifactValidationError(
+                "training step metadata must include scheduled loss weights"
+            )
+        if optimizer is None:
+            raise ArtifactValidationError("optimizer must be initialized for autograd training")
+
+        optimizer.zero_grad(set_to_none=True)
+        summary = torch_autograd.compute_loss(
+            graph,
+            step_input.parameters,
+            self._make_trainable_parameters(
+                reference_parameters,
+                device=device,
+                requires_grad=False,
+            ),
+            scheduled_loss_weights=scheduled.as_mapping(),
+            temperature=float(step_input.metadata.get("scheduled_temperature", 1.0)),
+            effective_support=step_input.active_state_mask,
+            device=device,
+        )
+        summary.loss.backward()
+        gradient_norm = self._gradient_norm(step_input.parameters)
+        optimizer.step()
+        return {
+            "loss": float(summary.loss.detach().cpu().item()),
+            "loss_components": dict(summary.loss_components),
+            "metrics": {
+                **dict(summary.metrics),
+                "gradient_norm": gradient_norm,
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            },
+        }
+
+    def _resolve_training_device(self) -> Any:
+        import torch
+
+        requested = str(self.config.device).strip().lower()
+        device = torch.device(requested)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            return torch.device("cpu")
+        return device
+
+    def _make_trainable_parameters(
+        self,
+        parameters: PhmmParameterSet,
+        *,
+        device: Any,
+        requires_grad: bool = True,
+    ) -> PhmmParameterSet:
+        import torch
+
+        def _tensor(value: Any) -> Any:
+            tensor = torch.tensor(
+                np.asarray(value),
+                dtype=torch.float64,
+                device=device,
+            )
+            if requires_grad:
+                return torch.nn.Parameter(tensor)
+            return tensor
+
+        return PhmmParameterSet(
+            match_emission=_tensor(parameters.match_emission),
+            insert_emission=_tensor(parameters.insert_emission),
+            transition_logits=TransitionLogitView(
+                tensor=_tensor(parameters.transition_logits.tensor),
+                order=tuple(parameters.transition_logits.order),
+            ),
+            metadata=dict(parameters.metadata),
+        )
+
+    def _detach_parameters(
+        self,
+        parameters: PhmmParameterSet,
+        *,
+        normalize_emissions: bool = True,
+    ) -> PhmmParameterSet:
+        import torch
+
+        match = parameters.match_emission
+        insert = parameters.insert_emission
+        if normalize_emissions:
+            match = torch.log_softmax(match.detach(), dim=1)
+            insert = torch.log_softmax(insert.detach(), dim=1)
+        else:
+            match = match.detach()
+            insert = insert.detach()
+        return PhmmParameterSet(
+            match_emission=match.cpu().numpy(),
+            insert_emission=insert.cpu().numpy(),
+            transition_logits=TransitionLogitView(
+                tensor=parameters.transition_logits.tensor.detach().cpu().numpy(),
+                order=tuple(parameters.transition_logits.order),
+            ),
+            metadata=dict(parameters.metadata),
+        )
+
+    def _build_optimizer(self, parameters: PhmmParameterSet) -> Any:
+        import torch
+
+        tensors = [
+            parameters.match_emission,
+            parameters.insert_emission,
+            parameters.transition_logits.tensor,
+        ]
+        name = str(self.config.optimizer.name).strip().lower()
+        kwargs = {
+            "lr": float(self.config.optimizer.learning_rate),
+            "weight_decay": float(self.config.optimizer.weight_decay),
+        }
+        if name == "adamw":
+            kwargs["betas"] = tuple(float(value) for value in self.config.optimizer.betas)
+            return torch.optim.AdamW(tensors, **kwargs)
+        if name == "adam":
+            kwargs["betas"] = tuple(float(value) for value in self.config.optimizer.betas)
+            return torch.optim.Adam(tensors, **kwargs)
+        if name == "sgd":
+            return torch.optim.SGD(tensors, **kwargs)
+        raise ValueError(f"unsupported optimizer name: {self.config.optimizer.name}")
+
+    def _gradient_norm(self, parameters: PhmmParameterSet) -> float:
+        import torch
+
+        total = torch.zeros((), dtype=torch.float64, device=parameters.match_emission.device)
+        for tensor in (
+            parameters.match_emission,
+            parameters.insert_emission,
+            parameters.transition_logits.tensor,
+        ):
+            if tensor.grad is None:
+                continue
+            total = total + torch.sum(tensor.grad.detach() ** 2)
+        return float(torch.sqrt(total).detach().cpu().item())
+
+    def _checkpoint_state(
+        self,
+        parameters: PhmmParameterSet,
+        *,
+        replica_id: str,
+        step_index: int,
+        loss: float,
+        metrics: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        detached = self._detach_parameters(parameters)
+        return {
+            "graph_path": str(self.config.graph_path),
+            "initialization_path": str(self.config.initialization_path),
+            "replica_id": replica_id,
+            "step_index": step_index,
+            "loss": loss,
+            "metrics": dict(metrics),
+            "parameters": {
+                "match_emission": np.asarray(detached.match_emission, dtype=np.float64),
+                "insert_emission": np.asarray(detached.insert_emission, dtype=np.float64),
+                "transition_logits": np.asarray(
+                    detached.transition_logits.tensor, dtype=np.float64
+                ),
+                "transition_order": tuple(detached.transition_logits.order),
+                "metadata": dict(detached.metadata),
+            },
+        }
 
     @staticmethod
     def _perturb_array(

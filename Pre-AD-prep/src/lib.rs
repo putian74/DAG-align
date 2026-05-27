@@ -11,6 +11,7 @@ pub mod graph;
 pub mod init;
 pub mod legacy;
 pub mod reference_msa;
+pub mod representative_graph;
 pub mod source;
 pub mod validate;
 
@@ -37,6 +38,11 @@ pub use reference_msa::{
     PathAlignmentOp, PathToReferenceAlignment, ReferenceMsaColumn, ReferenceMsaColumnKind,
     ReferenceMsaConfig, ReferenceMsaResult, ReferenceMsaScoring, ReferenceStateBands,
     StateSelection, WeightedSequencePath, build_reference_msa, select_max_weight_reference_path,
+};
+pub use representative_graph::{
+    RepresentativeGlobalGraphBuild, RepresentativeGlobalGraphConfig,
+    RepresentativeGlobalGraphExport, build_representative_global_graph,
+    write_representative_global_graph_artifact,
 };
 pub use source::{
     NodeSourceRanges, SequenceTable, SourceDecodeStatus, SourceRecordTable, SourceTables,

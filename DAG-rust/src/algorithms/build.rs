@@ -577,7 +577,13 @@ impl FtoDagBuilder {
         self.graph
     }
 
-    pub fn finalize_graph(self) -> Result<FtoDag> {
+    pub fn finalize_graph(mut self) -> Result<FtoDag> {
+        if self.config.topology_update_strategy.is_incremental()
+            && self.graph.provenance_storage_strategy() == ProvenanceStorageStrategy::CountOnly
+        {
+            self.graph.compact_storage()?;
+            return Ok(self.graph);
+        }
         secondary_merge_graph(self.graph, SecondaryMergeConfig::default())
     }
 
@@ -713,6 +719,7 @@ impl FtoDagBuilder {
         self.report.attempted_sequences += 1;
         let mut previous = None;
         let mut inserted_edges = 0;
+        let mut inserted_edge_keys = Vec::new();
         for node_id in mapped_path.iter().copied() {
             if !self.can_node_accept_sequence(node_id, sequence_id) {
                 return Err(DagError::DuplicateSequenceProvenance {
@@ -725,11 +732,15 @@ impl FtoDagBuilder {
                     .graph
                     .add_or_increment_edge(previous, node_id, Weight::new(1))?;
                 inserted_edges += usize::from(update.inserted);
+                if update.inserted {
+                    inserted_edge_keys.push(update.key);
+                }
             }
             previous = Some(node_id);
         }
         self.graph
             .add_trace_path_provenance(sequence_id, mapped_path)?;
+        self.refresh_topology_after_sequence_integration(&inserted_edge_keys, 0)?;
 
         let result = IntegratedSequenceBuildData {
             sequence_id,
@@ -1021,7 +1032,10 @@ impl FtoDagBuilder {
 
             if self.config.topology_update_strategy.is_incremental() {
                 let start = Instant::now();
-                self.apply_topology_delta(&inserted_edge_keys)?;
+                self.refresh_topology_after_sequence_integration(
+                    &inserted_edge_keys,
+                    new_nodes_created,
+                )?;
                 timing.topology += start.elapsed();
             }
 
@@ -1188,7 +1202,10 @@ impl FtoDagBuilder {
 
         if self.config.topology_update_strategy.is_incremental() {
             let start = Instant::now();
-            self.apply_topology_delta(&inserted_edge_keys)?;
+            self.refresh_topology_after_sequence_integration(
+                &inserted_edge_keys,
+                new_nodes_created,
+            )?;
             timing.topology += start.elapsed();
         }
 
@@ -2012,6 +2029,21 @@ impl FtoDagBuilder {
         Ok(())
     }
 
+    fn refresh_topology_after_sequence_integration(
+        &mut self,
+        inserted_edges: &[EdgeKey],
+        new_nodes_created: usize,
+    ) -> Result<()> {
+        if !self.config.topology_update_strategy.is_incremental() {
+            return Ok(());
+        }
+        if new_nodes_created == 0 && inserted_edges.is_empty() {
+            return Ok(());
+        }
+        self.apply_topology_delta(inserted_edges)?;
+        Ok(())
+    }
+
     fn apply_topology_delta(&mut self, inserted_edges: &[EdgeKey]) -> Result<()> {
         if self.topology_cache.is_none() {
             self.rebuild_topology_cache()?;
@@ -2073,10 +2105,6 @@ impl TopologyUpdateStrategy {
 
     const fn maintains_reverse_coordinates(self) -> bool {
         matches!(self, Self::FullRebuild | Self::IncrementalAffectedRegion)
-    }
-
-    const fn uses_forward_relaxation(self) -> bool {
-        matches!(self, Self::IncrementalForwardRelaxation)
     }
 }
 
@@ -2240,25 +2268,14 @@ impl TopologyCache {
                 reverse_coordinates.push(TopologicalCoordinate::new(reverse));
             }
         }
-        let propagation_completed = if strategy.uses_forward_relaxation() {
-            self.propagate_forward_by_relaxation(
-                graph,
-                inserted_edges,
-                previous_node_count,
-                &mut counters,
-                collect_counters,
-                rebuild_queue_threshold,
-            )?
-        } else {
-            self.propagate_forward_by_parent_scan(
-                graph,
-                inserted_edges,
-                previous_node_count,
-                &mut counters,
-                collect_counters,
-                rebuild_queue_threshold,
-            )?
-        };
+        let propagation_completed = self.propagate_forward_by_parent_scan(
+            graph,
+            inserted_edges,
+            previous_node_count,
+            &mut counters,
+            collect_counters,
+            rebuild_queue_threshold,
+        )?;
         if !propagation_completed {
             *self = Self::from_graph(graph, strategy.maintains_reverse_coordinates())?;
             if collect_counters {
@@ -2322,54 +2339,6 @@ impl TopologyCache {
         Ok(true)
     }
 
-    fn propagate_forward_by_relaxation(
-        &mut self,
-        graph: &FtoDag,
-        inserted_edges: &[EdgeKey],
-        previous_node_count: usize,
-        counters: &mut TopologyUpdateCounters,
-        collect_counters: bool,
-        rebuild_queue_threshold: Option<usize>,
-    ) -> Result<bool> {
-        let mut queue = VecDeque::new();
-        let mut queued = vec![false; graph.node_count()];
-        let mut queue_pops = 0_usize;
-        for edge in inserted_edges {
-            if edge.child.to_usize() >= previous_node_count {
-                continue;
-            }
-            self.relax_forward_edge(
-                edge.parent,
-                edge.child,
-                counters,
-                collect_counters,
-                &mut queue,
-                &mut queued,
-            )?;
-        }
-        while let Some(node) = queue.pop_front() {
-            queue_pops += 1;
-            if rebuild_queue_threshold.is_some_and(|threshold| queue_pops > threshold) {
-                return Ok(false);
-            }
-            queued[node.to_usize()] = false;
-            if collect_counters {
-                counters.forward_queue_pops += 1;
-            }
-            for child in graph.children(node)? {
-                self.relax_forward_edge(
-                    node,
-                    *child,
-                    counters,
-                    collect_counters,
-                    &mut queue,
-                    &mut queued,
-                )?;
-            }
-        }
-        Ok(true)
-    }
-
     fn propagate_reverse(
         &mut self,
         graph: &FtoDag,
@@ -2403,53 +2372,6 @@ impl TopologyCache {
             }
         }
         Ok(true)
-    }
-
-    fn relax_forward_edge(
-        &mut self,
-        parent: NodeId,
-        child: NodeId,
-        counters: &mut TopologyUpdateCounters,
-        collect_counters: bool,
-        queue: &mut VecDeque<NodeId>,
-        queued: &mut [bool],
-    ) -> Result<bool> {
-        if collect_counters {
-            counters.forward_relax_attempts += 1;
-        }
-        let parent_coordinate = self
-            .forward_coordinates
-            .get(parent.to_usize())
-            .copied()
-            .ok_or(DagError::InvalidEdge {
-                parent: parent.to_usize(),
-                child: child.to_usize(),
-            })?;
-        let child_coordinate =
-            self.forward_coordinates
-                .get_mut(child.to_usize())
-                .ok_or(DagError::InvalidEdge {
-                    parent: parent.to_usize(),
-                    child: child.to_usize(),
-                })?;
-        let candidate = parent_coordinate.raw() + 1;
-        if candidate > child_coordinate.raw() {
-            *child_coordinate = TopologicalCoordinate::new(candidate);
-            if collect_counters {
-                counters.forward_coordinate_updates += 1;
-            }
-            let child_index = child.to_usize();
-            if !queued[child_index] {
-                queued[child_index] = true;
-                queue.push_back(child);
-            }
-            Ok(true)
-        } else {
-            if collect_counters {
-                counters.safe_forward_edges += 1;
-            }
-            Ok(false)
-        }
     }
 
     fn refresh_forward_node(
@@ -2656,9 +2578,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(counters.inserted_edges_to_existing_children, 1);
-        assert!(counters.forward_relax_attempts > 0);
         assert!(counters.forward_coordinate_updates >= 2);
-        assert_eq!(counters.forward_parent_scans, 2);
+        assert!(counters.forward_parent_scans >= 2);
         assert_forward_cache_matches_full(&graph, &cache);
     }
 

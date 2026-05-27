@@ -332,9 +332,15 @@ def posterior_occupancy(
     delete_log = np.asarray(forward_result.delete_log_probs, dtype=np.float64) + np.asarray(
         backward_result.delete_log_probs, dtype=np.float64
     )
-    match_posterior = np.exp(np.where(np.isfinite(match_log), match_log - log_likelihood, -np.inf))
-    insert_posterior = np.exp(np.where(np.isfinite(insert_log), insert_log - log_likelihood, -np.inf))
-    delete_posterior = np.exp(np.where(np.isfinite(delete_log), delete_log - log_likelihood, -np.inf))
+    match_posterior = np.zeros_like(match_log)
+    insert_posterior = np.zeros_like(insert_log)
+    delete_posterior = np.zeros_like(delete_log)
+    match_mask = np.isfinite(match_log)
+    insert_mask = np.isfinite(insert_log)
+    delete_mask = np.isfinite(delete_log)
+    match_posterior[match_mask] = np.exp(match_log[match_mask] - log_likelihood)
+    insert_posterior[insert_mask] = np.exp(insert_log[insert_mask] - log_likelihood)
+    delete_posterior[delete_mask] = np.exp(delete_log[delete_mask] - log_likelihood)
     return PosteriorOccupancy(
         posterior_support=posterior_support,
         match_posterior=match_posterior,

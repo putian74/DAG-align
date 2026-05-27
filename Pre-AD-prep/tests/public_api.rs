@@ -4,14 +4,16 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pre_ad_prep::{
-    ArraySpec, ArtifactValidationLevel, CoordinateMode, DataType, InitializationTrack,
-    LegacyAdapter, LegacyConversionOptions, LegacyDagAlignAdapter, LegacyDagAlignInput,
-    PackedStateWindows, PathAlignmentOp, PreAdPrepError, ReferenceMsaColumnKind,
-    ReferenceMsaConfig, ReferencePath, SequenceTable, SourceFormat, SourceRecordTable,
-    StateInterval, StateIntervalSemantics, TensorGraph, TensorGraphArtifact, TensorGraphManifest,
-    Validate, WeightedSequencePath, WindowBuildConfig, build_edge_window_overlaps,
-    build_global_coordinates, build_packed_windows, build_reference_msa, read_npy_2d_f64,
+    ArraySpec, ArtifactValidationLevel, CoordinateMode, DataType, InitializationBundle,
+    InitializationTrack, LegacyAdapter, LegacyConversionOptions, LegacyDagAlignAdapter,
+    LegacyDagAlignInput, PackedStateWindows, PathAlignmentOp, PreAdPrepError,
+    ReferenceMsaColumnKind, ReferenceMsaConfig, ReferencePath, RepresentativeGlobalGraphConfig,
+    SequenceTable, SourceFormat, SourceRecordTable, StateInterval, StateIntervalSemantics,
+    TensorGraph, TensorGraphArtifact, TensorGraphManifest, Validate, WeightedSequencePath,
+    WindowBuildConfig, build_edge_window_overlaps, build_global_coordinates, build_packed_windows,
+    build_reference_msa, build_representative_global_graph, read_npy_2d_f64,
     select_max_weight_reference_path, validate_tensor_graph_artifact,
+    write_representative_global_graph_artifact,
 };
 
 #[test]
@@ -287,6 +289,80 @@ fn reference_msa_reference_path_feeds_coordinate_builder() {
     assert_eq!(coordinates.reference_path, result.reference_path);
     assert_eq!(coordinates.node_intervals[0], StateInterval::new(0, 1));
     assert_eq!(coordinates.node_intervals[3], StateInterval::new(3, 3));
+}
+
+#[test]
+fn representative_global_graph_exports_reference_msa_initialization() {
+    let paths = vec![
+        WeightedSequencePath {
+            representative_sequence_id: 0,
+            sequence_ids: vec![0, 1, 2, 3, 4],
+            node_ids: vec![10, 11, 12],
+            symbols: vec![0, 1, 2],
+            weight: 5,
+        },
+        WeightedSequencePath {
+            representative_sequence_id: 5,
+            sequence_ids: vec![5, 6],
+            node_ids: vec![20, 21, 22],
+            symbols: vec![0, 3, 2],
+            weight: 2,
+        },
+    ];
+    let config = RepresentativeGlobalGraphConfig {
+        source_format: SourceFormat::Synthetic,
+        alphabet: vec!['A', 'B', 'C', 'D'],
+        symbol_encoding: vec![
+            ("A".into(), 0),
+            ("B".into(), 1),
+            ("C".into(), 2),
+            ("D".into(), 3),
+        ],
+        ..RepresentativeGlobalGraphConfig::default()
+    };
+
+    let build = build_representative_global_graph(&paths, &config).unwrap();
+
+    assert_eq!(build.graph.node_symbol, vec![0, 1, 2, 3, 2]);
+    assert_eq!(build.graph.node_weight, vec![7.0, 5.0, 5.0, 2.0, 2.0]);
+    assert_eq!(build.coordinates.global_state_count, 3);
+    assert_eq!(
+        build.reference_msa.reference_path.node_ids,
+        vec![Some(0), Some(1), Some(2)]
+    );
+
+    let root = unique_temp_dir("pre_ad_prep_representative_graph");
+    let output_dir = root.join("tensor_graph.v1");
+    fs::create_dir_all(&output_dir).unwrap();
+    let exported =
+        write_representative_global_graph_artifact(&output_dir, &build, &config).unwrap();
+
+    assert_eq!(
+        exported.initialization.track,
+        InitializationTrack::ReferenceMsa
+    );
+    assert!(output_dir.join("manifest.json").exists());
+    assert!(
+        output_dir
+            .join("initialization/reference_msa/manifest.json")
+            .exists()
+    );
+
+    let artifact = TensorGraphArtifact::read_manifest(&output_dir).unwrap();
+    assert_eq!(artifact.manifest.sequence_count, 7);
+    validate_tensor_graph_artifact(&artifact, ArtifactValidationLevel::TrainingReady)
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let bundle = InitializationBundle::load_from_root(&output_dir).unwrap();
+    let reference_msa = bundle.get(InitializationTrack::ReferenceMsa).unwrap();
+    assert_eq!(reference_msa.global_state_count, 3);
+    assert_eq!(reference_msa.alphabet_size, 4);
+    assert!(reference_msa.metadata.iter().any(
+        |(key, value)| key == "source" && value == "representative_global_graph_reference_msa"
+    ));
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

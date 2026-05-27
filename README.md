@@ -4,6 +4,11 @@
 
 This software is the official implementation for the research paper: *"Accurate Multiple Sequence Alignment of Ultramassive Genome Sets"*.
 
+The repository now also contains the new split alignment pipeline under active development:
+
+- **Pre-AD-prep** for typed preprocessing, representative-global-graph construction/export, reference-path coarse MSA, PHMM initialization artifacts, and projected state windows.
+- **AD-PHMM-align** for PHMM runtime loading, baseline training orchestration, hard decoding, and alignment evaluation on top of those typed artifacts.
+
 ## **Features**
 
 * **High Accuracy**: Achieves alignment accuracy comparable to the gold-standard aligner, Muscle.  
