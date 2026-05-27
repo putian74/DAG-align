@@ -1,28 +1,30 @@
 //! Common public imports for users of `dag_rust`.
 
 pub use crate::algorithms::build::{
-    block_plan_from_anchor_path, node_kind_for_path_position, select_bounded_reuse_candidate,
-    select_monotone_anchor_path, select_monotone_anchor_path_with_graph, AnchorBlock,
-    AnchorCandidate, AnchorCandidateSet, AnchorDecision, AnchorPath, AnchorRejectReason, BlockPlan,
-    BuildConfig, BuildOrderingPolicy, BuildReport, BuildSequenceResult, BuildSequenceSummary,
-    BuildTimingBreakdown, CoordinateInterval, FtoDagBuilder, IntegrationDecision, PathRange,
-    ProfiledSequenceBuildOutcome, ProfiledSequenceBuildSummaryOutcome, RejectedSequence,
-    RejectionPolicy, SequenceBuildOutcome, SequenceBuildSummaryOutcome, SimilarityThreshold,
-    TopologyUpdateCounters, TopologyUpdateStrategy, UnanchoredBlock,
+    AnchorBlock, AnchorCandidate, AnchorCandidateSet, AnchorDecision, AnchorPath,
+    AnchorRejectReason, BlockPlan, BuildConfig, BuildOrderingPolicy, BuildReport,
+    BuildSequenceResult, BuildSequenceSummary, BuildTimingBreakdown, CoordinateInterval,
+    FtoDagBuilder, IntegrationDecision, PathRange, ProfiledSequenceBuildOutcome,
+    ProfiledSequenceBuildSummaryOutcome, RejectedSequence, RejectionPolicy, SequenceBuildOutcome,
+    SequenceBuildSummaryOutcome, SimilarityThreshold, TopologyUpdateCounters,
+    TopologyUpdateStrategy, UnanchoredBlock, block_plan_from_anchor_path,
+    node_kind_for_path_position, select_bounded_reuse_candidate, select_monotone_anchor_path,
+    select_monotone_anchor_path_with_graph,
 };
 pub use crate::algorithms::merge::{
-    merge_graphs, merge_trace_path_graphs_as_count_only, AnchorMap, MergeConfig, MergeDecision,
-    MergeOrderingPolicy, MergeOrientation, MergePlan, MergeStats, NodeRemap, RejectedMerge,
+    AnchorMap, MergeConfig, MergeDecision, MergeOrderingPolicy, MergeOrientation, MergePlan,
+    MergeStats, NodeRemap, RejectedMerge, merge_graphs, merge_trace_path_graphs_as_count_only,
 };
 pub use crate::algorithms::ordering::{
     GraphSketch, OrderingPolicy, PairingPlan, SequenceSketch, SimilarityBucket, SimilaritySketch,
     SketchConfig,
 };
 pub use crate::algorithms::postprocess::{
-    secondary_merge_graph, PostprocessStats, ResolutionConfig, SecondaryMergeConfig,
+    PostprocessStats, ResolutionConfig, SecondaryMergeConfig, secondary_merge_graph,
 };
 pub use crate::algorithms::scheduler::{
-    BuildScheduler, ChunkPlan, MemoryBudget, MergeRoundPlan, ProgressEvent, ProgressSink,
+    BuildScheduler, ChunkPlan, ChunkRange, MemoryBudget, MergeRoundPlan, ParallelScratchConfig,
+    ProgressEvent, ProgressSink, SubgraphScratchSummary,
 };
 pub use crate::foundations::bit_encoding::{BitWidth, NodeFlags, PackedPair, PackedWindow};
 pub use crate::foundations::error::{DagError, Result};

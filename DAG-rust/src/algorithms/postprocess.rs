@@ -2,9 +2,9 @@
 
 use crate::foundations::error::{DagError, Result};
 use crate::foundations::id::{NodeId, ProvenancePosition, SequenceId, TopologicalCoordinate};
-use crate::graph_model::graph::FtoDag;
+use crate::graph_model::graph::{FtoDag, NodeKind, StoredFragmentKey};
 use crate::graph_model::provenance::{ProvenanceRecord, ProvenanceStorageStrategy};
-use crate::graph_model::topology::GraphCoordinateSnapshot;
+use crate::graph_model::topology::{DagTopology, GraphCoordinateSnapshot};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
@@ -36,6 +36,14 @@ pub struct PostprocessStats {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 struct SecondaryCoordinateKey {
+    forward_coordinate: Option<u64>,
+    reverse_coordinate: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct LegacySecondaryMergeKey {
+    fragment: StoredFragmentKey,
+    kind: NodeKind,
     forward_coordinate: Option<u64>,
     reverse_coordinate: Option<u64>,
 }
@@ -84,6 +92,9 @@ fn secondary_merge_graph_with_stats_and_seed(
     config: SecondaryMergeConfig,
     coordinate_seed: Option<SecondaryMergeCoordinateSeed>,
 ) -> Result<(FtoDag, PostprocessStats)> {
+    if graph.provenance_storage_strategy() != ProvenanceStorageStrategy::CountOnly {
+        return secondary_merge_graph_legacy(graph, config);
+    }
     let pass_configs = secondary_merge_pass_configs(config);
     if pass_configs.is_empty() {
         graph.compact_storage()?;
@@ -94,35 +105,34 @@ fn secondary_merge_graph_with_stats_and_seed(
     let mut reusable_seed = coordinate_seed;
     let mut reusable_snapshot: Option<GraphCoordinateSnapshot> = None;
     for pass_config in pass_configs.iter() {
-        let (order, forward_coordinates, reverse_coordinates) = if let Some(seed) =
-            reusable_seed.as_ref()
-        {
-            (
-                seed.order.as_slice(),
-                pass_config
-                    .use_forward_coordinates
-                    .then_some(seed.forward_coordinates.as_slice()),
-                pass_config
-                    .use_reverse_coordinates
-                    .then_some(seed.reverse_coordinates.as_slice()),
-            )
-        } else {
-            if reusable_snapshot.is_none() {
-                reusable_snapshot = Some(GraphCoordinateSnapshot::from_graph(&graph)?);
-            }
-            let coordinates = reusable_snapshot
-                .as_ref()
-                .expect("snapshot should exist after construction");
-            (
-                coordinates.topological_order(),
-                pass_config
-                    .use_forward_coordinates
-                    .then_some(coordinates.forward_coordinates()),
-                pass_config
-                    .use_reverse_coordinates
-                    .then_some(coordinates.reverse_coordinates()),
-            )
-        };
+        let (order, forward_coordinates, reverse_coordinates) =
+            if let Some(seed) = reusable_seed.as_ref() {
+                (
+                    seed.order.as_slice(),
+                    pass_config
+                        .use_forward_coordinates
+                        .then_some(seed.forward_coordinates.as_slice()),
+                    pass_config
+                        .use_reverse_coordinates
+                        .then_some(seed.reverse_coordinates.as_slice()),
+                )
+            } else {
+                if reusable_snapshot.is_none() {
+                    reusable_snapshot = Some(GraphCoordinateSnapshot::from_graph(&graph)?);
+                }
+                let coordinates = reusable_snapshot
+                    .as_ref()
+                    .expect("snapshot should exist after construction");
+                (
+                    coordinates.topological_order(),
+                    pass_config
+                        .use_forward_coordinates
+                        .then_some(coordinates.forward_coordinates()),
+                    pass_config
+                        .use_reverse_coordinates
+                        .then_some(coordinates.reverse_coordinates()),
+                )
+            };
         let Some(remap) =
             build_secondary_merge_remap(&graph, order, forward_coordinates, reverse_coordinates)?
         else {
@@ -142,6 +152,73 @@ fn secondary_merge_graph_with_stats_and_seed(
     }
     graph.compact_storage()?;
     Ok((graph, total_stats))
+}
+
+fn secondary_merge_graph_legacy(
+    mut graph: FtoDag,
+    config: SecondaryMergeConfig,
+) -> Result<(FtoDag, PostprocessStats)> {
+    if !config.use_forward_coordinates && !config.use_reverse_coordinates {
+        graph.compact_storage()?;
+        return Ok((graph, PostprocessStats::default()));
+    }
+    if graph.provenance_storage_strategy() == ProvenanceStorageStrategy::CountOnly {
+        graph.compact_storage()?;
+        return Ok((graph, PostprocessStats::default()));
+    }
+
+    let mut total_stats = PostprocessStats::default();
+    loop {
+        let topology = DagTopology::try_from_graph(&graph)?;
+        let Some(remap) = build_legacy_secondary_merge_remap(&graph, &topology, config)? else {
+            graph.compact_storage()?;
+            return Ok((graph, total_stats));
+        };
+        let merged_nodes = remap
+            .iter()
+            .enumerate()
+            .filter(|(index, representative)| representative.to_usize() != *index)
+            .count();
+        let removed_nodes = merged_nodes;
+        graph = rebuild_graph_with_remap(&graph, topology.topological_order(), &remap)?;
+        total_stats.merged_nodes += merged_nodes;
+        total_stats.removed_nodes += removed_nodes;
+    }
+}
+
+fn build_legacy_secondary_merge_remap(
+    graph: &FtoDag,
+    topology: &DagTopology,
+    config: SecondaryMergeConfig,
+) -> Result<Option<Vec<NodeId>>> {
+    let mut remap = vec![NodeId::new(0); graph.node_count()];
+    let mut representatives = HashMap::<LegacySecondaryMergeKey, NodeId>::new();
+
+    for node_id in topology.topological_order().iter().copied() {
+        let node = graph.node(node_id)?;
+        let key = LegacySecondaryMergeKey {
+            fragment: node.fragment.clone(),
+            kind: node.kind,
+            forward_coordinate: if config.use_forward_coordinates {
+                Some(u64::from(topology.forward_coordinate(node_id)?.raw()))
+            } else {
+                None
+            },
+            reverse_coordinate: if config.use_reverse_coordinates {
+                Some(u64::from(topology.reverse_coordinate(node_id)?.raw()))
+            } else {
+                None
+            },
+        };
+        let representative = representatives.entry(key).or_insert(node_id);
+        remap[node_id.to_usize()] = *representative;
+    }
+
+    let merged_any = remap
+        .iter()
+        .enumerate()
+        .any(|(index, representative)| representative.to_usize() != index);
+    Ok(merged_any.then_some(remap))
 }
 
 fn secondary_merge_pass_configs(config: SecondaryMergeConfig) -> Vec<SecondaryMergeConfig> {
@@ -228,7 +305,10 @@ fn validate_secondary_merge_coordinates(
     forward_coordinates: Option<&[TopologicalCoordinate]>,
     reverse_coordinates: Option<&[TopologicalCoordinate]>,
 ) -> Result<()> {
-    for coordinates in [forward_coordinates, reverse_coordinates].into_iter().flatten() {
+    for coordinates in [forward_coordinates, reverse_coordinates]
+        .into_iter()
+        .flatten()
+    {
         if coordinates.len() != graph.node_count() {
             return Err(DagError::InvalidStorage(format!(
                 "secondary merge coordinate vector length {} did not match node count {}",
@@ -251,12 +331,8 @@ fn secondary_coordinate_key(
     }
 }
 
-fn coordinate_value(
-    coordinates: Option<&[TopologicalCoordinate]>,
-    node_id: NodeId,
-) -> Option<u64> {
-    coordinates
-        .map(|coordinates| u64::from(coordinates[node_id.to_usize()].raw()))
+fn coordinate_value(coordinates: Option<&[TopologicalCoordinate]>, node_id: NodeId) -> Option<u64> {
+    coordinates.map(|coordinates| u64::from(coordinates[node_id.to_usize()].raw()))
 }
 
 fn rebuild_graph_with_remap(graph: &FtoDag, order: &[NodeId], remap: &[NodeId]) -> Result<FtoDag> {
